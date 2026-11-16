@@ -31,20 +31,6 @@ bool parseClassName(const std::string& name, PostureClass& out)
     return false;
 }
 
-static PostureClass touchPrimaryClass(int diagonalMm)
-{
-    if (!diagonalPlausible(diagonalMm)) {
-        return PostureClass::Tablet;
-    }
-    if (diagonalMm <= kPhoneMaxDiagonalMm) {
-        return PostureClass::Phone;
-    }
-    if (diagonalMm <= kHandheldMaxDiagonalMm) {
-        return PostureClass::Handheld;
-    }
-    return PostureClass::Tablet;
-}
-
 Result classify(const Signals& s)
 {
     Result r;
@@ -70,7 +56,7 @@ Result classify(const Signals& s)
 
     if (trustedTablet) {
         if (*s.osTabletMode) {
-            r.cls = touchPrimaryClass(s.diagonalMm);
+            r.cls = PostureClass::Tablet;
         }
         else {
             r.cls = PostureClass::Laptop;
@@ -81,7 +67,7 @@ Result classify(const Signals& s)
 
     // No usable OS tablet signal: touchscreen presence plus input devices
     if (!s.hasKeyboard && !s.hasPointer) {
-        r.cls = touchPrimaryClass(s.diagonalMm);
+        r.cls = PostureClass::Tablet;
         r.confidence = Confidence::Medium;
     }
     else {
@@ -120,8 +106,6 @@ Payload makePayload(const Signals& sig, Mode mode, bool runtimeUpdate)
     p.valid = true;
     p.cls = r.cls;
     p.touch = r.touch;
-    p.diagonalMm = diagonalPlausible(sig.diagonalMm) ? sig.diagonalMm : 0;
-    p.dpi = dpiPlausible(sig.dpi) ? sig.dpi : 0;
     return p;
 }
 
@@ -134,12 +118,6 @@ std::string buildQuery(const Payload& p)
     std::string q = "clientPosture=";
     q += className(p.cls);
     q += p.touch ? "&clientTouch=1" : "&clientTouch=0";
-    if (diagonalPlausible(p.diagonalMm)) {
-        q += "&clientDiagonalMm=" + std::to_string(p.diagonalMm);
-    }
-    if (dpiPlausible(p.dpi)) {
-        q += "&clientDpi=" + std::to_string(p.dpi);
-    }
     return q;
 }
 
@@ -183,6 +161,40 @@ std::optional<Payload> UpdateGate::observe(const Payload& current, Clock::time_p
     m_Sent = cur;
     m_Candidate.reset();
     return cur;
+}
+
+RestartGate::RestartGate(bool enabled,
+                         const Payload& displayBaseline,
+                         Clock::time_point sessionStart,
+                         std::optional<Clock::time_point> lastRestart,
+                         std::chrono::milliseconds cooldown,
+                         std::chrono::milliseconds armDelay)
+    : m_Enabled(enabled),
+      m_BaselineTouch(touchPrimary(displayBaseline)),
+      m_LatestTouch(m_BaselineTouch),
+      m_ArmedAt(sessionStart + armDelay),
+      m_LastRestart(lastRestart),
+      m_Cooldown(cooldown)
+{
+}
+
+bool RestartGate::touchPrimary(const Payload& p)
+{
+    // An omitted payload (launch from a plain desktop) means not touch-primary
+    return p.valid && isTouchPrimary(p.cls);
+}
+
+void RestartGate::accepted(const Payload& sent)
+{
+    m_LatestTouch = touchPrimary(sent);
+}
+
+bool RestartGate::due(Clock::time_point now) const
+{
+    if (!m_Enabled || m_LatestTouch == m_BaselineTouch || now < m_ArmedAt) {
+        return false;
+    }
+    return !m_LastRestart || now - *m_LastRestart >= m_Cooldown;
 }
 
 } // namespace posture

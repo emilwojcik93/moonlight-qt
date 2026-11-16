@@ -7,11 +7,10 @@ using std::chrono::milliseconds;
 
 namespace {
 
-Signals touchOnly(int diagonalMm = 0)
+Signals touchOnly()
 {
     Signals s;
     s.hasTouchscreen = true;
-    s.diagonalMm = diagonalMm;
     return s;
 }
 
@@ -75,7 +74,6 @@ private slots:
         Signals s = touchLaptop();
         s.osTabletMode = true;
         s.osTabletModeAvailable = true;
-        s.diagonalMm = 305;
         Result r = classify(s);
         QCOMPARE(r.cls, PostureClass::Tablet);
         QCOMPARE(r.confidence, Confidence::High);
@@ -119,7 +117,7 @@ private slots:
 
     void kwinQuirkWithKeyboardDetachedIsTablet()
     {
-        Signals s = touchOnly(305);
+        Signals s = touchOnly();
         s.portable = true;
         s.osTabletMode = true;
         s.osTabletModeAvailable = false;
@@ -128,15 +126,32 @@ private slots:
         QCOMPARE(r.confidence, Confidence::Medium);
     }
 
-    void touchOnlyFallbackBySize()
+    // Contract v2: no signal may depend on size, DPI or aspect. A touch-only
+    // device is a tablet whatever it is; the classifier has no size input.
+    void touchOnlyIsTabletWithoutSizeInput()
     {
         QCOMPARE(classify(touchOnly()).cls, PostureClass::Tablet);
-        QCOMPARE(classify(touchOnly(150)).cls, PostureClass::Phone);
-        QCOMPARE(classify(touchOnly(kPhoneMaxDiagonalMm)).cls, PostureClass::Phone);
-        QCOMPARE(classify(touchOnly(kPhoneMaxDiagonalMm + 1)).cls, PostureClass::Handheld);
-        QCOMPARE(classify(touchOnly(kHandheldMaxDiagonalMm)).cls, PostureClass::Handheld);
-        QCOMPARE(classify(touchOnly(kHandheldMaxDiagonalMm + 1)).cls, PostureClass::Tablet);
-        QCOMPARE(classify(touchOnly(9999)).cls, PostureClass::Tablet);  // implausible size
+        QCOMPARE(classify(touchOnly()).confidence, Confidence::Medium);
+        Signals s = touchOnly();
+        s.osTabletMode = true;
+        s.osTabletModeAvailable = true;
+        QCOMPARE(classify(s).cls, PostureClass::Tablet);
+    }
+
+    // Only tablet is ever produced; phone and handheld are parse-only here
+    void neverProducesPhoneOrHandheld()
+    {
+        for (int bits = 0; bits < 64; ++bits) {
+            Signals s;
+            s.hasTouchscreen = bits & 1;
+            s.hasKeyboard = bits & 2;
+            s.hasPointer = bits & 4;
+            if (bits & 8) s.portable = true;
+            if (bits & 16) s.osTabletMode = true;
+            if (bits & 32) s.osTabletModeAvailable = false;
+            const PostureClass c = classify(s).cls;
+            QVERIFY(c != PostureClass::Phone && c != PostureClass::Handheld);
+        }
     }
 
     void touchMonitorIsDesktopWhenNotPortable()
@@ -160,7 +175,7 @@ private slots:
 
     void overrideNeverSendsNothing()
     {
-        Signals s = touchOnly(305);
+        Signals s = touchOnly();
         QVERIFY(!makePayload(s, Mode::Never, false).valid);
         QVERIFY(!makePayload(s, Mode::Never, true).valid);
         QVERIFY(buildQuery(makePayload(s, Mode::Never, false)).empty());
@@ -190,23 +205,14 @@ private slots:
 
     void queryBuilding()
     {
+        // No size or DPI hints on the wire, whatever the screen is
         Signals s = touchOnly();
         s.osTabletMode = true;
         s.osTabletModeAvailable = true;
-        s.diagonalMm = 305;
-        s.dpi = 160;
-        QCOMPARE(QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, false))),
-                 QString("clientPosture=tablet&clientTouch=1&clientDiagonalMm=305&clientDpi=160"));
-
-        // Out-of-range hints are dropped, not clamped
-        s.diagonalMm = 49;
-        s.dpi = 801;
         QCOMPARE(QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, false))),
                  QString("clientPosture=tablet&clientTouch=1"));
-        s.diagonalMm = 800;
-        s.dpi = 72;
-        QCOMPARE(QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, false))),
-                 QString("clientPosture=tablet&clientTouch=1&clientDiagonalMm=800&clientDpi=72"));
+        QVERIFY(!QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, true))).contains("Diagonal"));
+        QVERIFY(!QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, true))).contains("Dpi"));
 
         // Laptop is sent (host ignores it); touch=1 only when a touchscreen exists
         Signals l;
@@ -221,8 +227,8 @@ private slots:
     void gateIgnoresUnchangedAndSameBoundaryChanges()
     {
         const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
-        Payload tablet{true, PostureClass::Tablet, true, 0, 0};
-        Payload phone{true, PostureClass::Phone, true, 0, 0};
+        Payload tablet{true, PostureClass::Tablet, true};
+        Payload phone{true, PostureClass::Phone, true};
         UpdateGate gate(tablet, milliseconds(3000));
         QVERIFY(!gate.observe(tablet, t0));
         // Touch class to touch class never crosses the boundary
@@ -234,17 +240,17 @@ private slots:
     {
         const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
         UpdateGate gate(Payload{}, milliseconds(3000));
-        Payload desktop{true, PostureClass::Desktop, false, 0, 0};
+        Payload desktop{true, PostureClass::Desktop, false};
         QVERIFY(!gate.observe(desktop, t0));
-        Payload laptop{true, PostureClass::Laptop, false, 0, 0};
+        Payload laptop{true, PostureClass::Laptop, false};
         QVERIFY(!gate.observe(laptop, t0 + std::chrono::seconds(10)));
     }
 
     void gateDebouncesAndSendsOnceOnBoundary()
     {
         const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
-        Payload laptop{true, PostureClass::Laptop, true, 0, 0};
-        Payload tablet{true, PostureClass::Tablet, true, 305, 160};
+        Payload laptop{true, PostureClass::Laptop, true};
+        Payload tablet{true, PostureClass::Tablet, true};
         UpdateGate gate(laptop, milliseconds(3000));
 
         QVERIFY(!gate.observe(tablet, t0));
@@ -252,7 +258,6 @@ private slots:
         auto sent = gate.observe(tablet, t0 + milliseconds(3000));
         QVERIFY(sent.has_value());
         QCOMPARE(sent->cls, PostureClass::Tablet);
-        QCOMPARE(sent->diagonalMm, 305);
         // Now sent: staying tablet sends nothing more
         QVERIFY(!gate.observe(tablet, t0 + milliseconds(9000)));
         // And flipping back is a new change that needs its own debounce
@@ -263,8 +268,8 @@ private slots:
     void gateFlappingSendsOnlyFinalState()
     {
         const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
-        Payload laptop{true, PostureClass::Laptop, true, 0, 0};
-        Payload tablet{true, PostureClass::Tablet, true, 0, 0};
+        Payload laptop{true, PostureClass::Laptop, true};
+        Payload tablet{true, PostureClass::Tablet, true};
         UpdateGate gate(laptop, milliseconds(3000));
 
         // Flip back and forth inside the window: nothing is sent, even once
@@ -283,11 +288,123 @@ private slots:
     void gateTouchnessChangeCounts()
     {
         const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
-        Payload noTouch{true, PostureClass::Laptop, false, 0, 0};
-        Payload touch{true, PostureClass::Laptop, true, 0, 0};
+        Payload noTouch{true, PostureClass::Laptop, false};
+        Payload touch{true, PostureClass::Laptop, true};
         UpdateGate gate(noTouch, milliseconds(3000));
         QVERIFY(!gate.observe(touch, t0));
         QVERIFY(gate.observe(touch, t0 + milliseconds(3000)).has_value());
+    }
+
+    // --- RestartGate -----------------------------------------------------
+
+    void restartGateNeedsAcceptedBoundaryCrossing()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        Payload laptop{true, PostureClass::Laptop, true};
+        Payload tablet{true, PostureClass::Tablet, true};
+        RestartGate gate(true, laptop, t0);
+        const auto later = t0 + std::chrono::seconds(30);
+        QVERIFY(!gate.due(later));          // nothing accepted yet
+        gate.accepted(tablet);
+        QVERIFY(gate.due(later));
+    }
+
+    void restartGateIgnoresTouchToTouchAndTouchnessOnly()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        const auto later = t0 + std::chrono::seconds(30);
+        Payload tablet{true, PostureClass::Tablet, true};
+        Payload phone{true, PostureClass::Phone, true};
+        RestartGate touch(true, tablet, t0);
+        touch.accepted(phone);
+        QVERIFY(!touch.due(later));
+
+        // laptop with touch <-> laptop without: the host sees no size boundary
+        Payload laptopNoTouch{true, PostureClass::Laptop, false};
+        Payload laptopTouch{true, PostureClass::Laptop, true};
+        RestartGate lap(true, laptopNoTouch, t0);
+        lap.accepted(laptopTouch);
+        QVERIFY(!lap.due(later));
+    }
+
+    void restartGateOmittedLaunchPayloadIsDesktop()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        RestartGate gate(true, Payload{}, t0);
+        gate.accepted(Payload{true, PostureClass::Tablet, true});
+        QVERIFY(gate.due(t0 + std::chrono::seconds(10)));
+    }
+
+    void restartGateSettingOffNeverRestarts()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        RestartGate gate(false, Payload{true, PostureClass::Laptop, false}, t0);
+        gate.accepted(Payload{true, PostureClass::Tablet, true});
+        QVERIFY(!gate.due(t0 + std::chrono::hours(1)));
+    }
+
+    void restartGateNotWhileConnecting()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        RestartGate gate(true, Payload{true, PostureClass::Laptop, false}, t0);
+        gate.accepted(Payload{true, PostureClass::Tablet, true});
+        QVERIFY(!gate.due(t0));
+        QVERIFY(!gate.due(t0 + RestartGate::kDefaultArmDelay - milliseconds(1)));
+        QVERIFY(gate.due(t0 + RestartGate::kDefaultArmDelay));
+    }
+
+    void restartGateCooldownAcrossSessions()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        Payload laptop{true, PostureClass::Laptop, false};
+        Payload tablet{true, PostureClass::Tablet, true};
+        // A restart happened at t0; the next session starts 8 s later
+        const auto start = t0 + std::chrono::seconds(8);
+        RestartGate gate(true, tablet, start, t0);
+        gate.accepted(laptop);  // flipped straight back
+        QVERIFY(!gate.due(start + std::chrono::seconds(10)));
+        QVERIFY(!gate.due(t0 + milliseconds(59999)));
+        QVERIFY(gate.due(t0 + milliseconds(60000)));  // deferred, not lost
+    }
+
+    // Baseline reset: the new session starts in the posture the user is in, so
+    // the restart cannot immediately trigger another one (no loop).
+    void restartGateBaselineResetPreventsLoop()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        Payload laptop{true, PostureClass::Laptop, false};
+        Payload tablet{true, PostureClass::Tablet, true};
+        RestartGate first(true, laptop, t0);
+        first.accepted(tablet);
+        const auto restartAt = t0 + std::chrono::seconds(20);
+        QVERIFY(first.due(restartAt));
+
+        // The restarted session launches as tablet; its gate is fresh
+        RestartGate second(true, tablet, restartAt + std::chrono::seconds(2), restartAt);
+        for (int i = 0; i < 200; ++i)
+            QVERIFY(!second.due(restartAt + std::chrono::seconds(2 + i)));
+        // Same posture re-reported (host accepted again): still nothing
+        second.accepted(tablet);
+        QVERIFY(!second.due(restartAt + std::chrono::minutes(10)));
+    }
+
+    // Flap during the cooldown: laptop -> tablet (restart) -> laptop -> tablet.
+    // Only the state at cooldown end matters.
+    void restartGateFlapDuringCooldown()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        Payload laptop{true, PostureClass::Laptop, false};
+        Payload tablet{true, PostureClass::Tablet, true};
+        const auto restartAt = t0;
+        RestartGate gate(true, tablet, restartAt + std::chrono::seconds(2), restartAt);
+
+        gate.accepted(laptop);
+        QVERIFY(!gate.due(restartAt + std::chrono::seconds(20)));   // cooldown
+        gate.accepted(tablet);                                     // flapped back
+        QVERIFY(!gate.due(restartAt + std::chrono::seconds(61)));  // baseline again
+
+        gate.accepted(laptop);
+        QVERIFY(gate.due(restartAt + std::chrono::seconds(61)));   // genuinely differs
     }
 };
 

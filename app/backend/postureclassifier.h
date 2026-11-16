@@ -7,11 +7,13 @@
 // goes on the wire and when a runtime change is worth reporting. Detection of
 // the signals lives in posturedetector.*; this file never touches the OS.
 //
-// Wire contract (all optional, ignored by stock hosts):
+// Wire contract v2 (all optional, ignored by stock hosts):
 //   clientPosture=desktop|laptop|tablet|handheld|phone
 //   clientTouch=0|1
-//   clientDiagonalMm=50..800
-//   clientDpi=72..800
+// The class never depends on the screen size, DPI or aspect: only the device
+// type and keyboard state matter. Touch-primary means "docked touch keyboard
+// wanted". This client sends tablet for every touch-primary state; handheld and
+// phone exist for other clients and are only parsed here.
 
 #include <chrono>
 #include <optional>
@@ -40,15 +42,6 @@ enum class Mode {
     Never,
 };
 
-constexpr int kMinDiagonalMm = 50;
-constexpr int kMaxDiagonalMm = 800;
-constexpr int kMinDpi = 72;
-constexpr int kMaxDpi = 800;
-
-// Screen diagonal thresholds used to split touch-primary devices
-constexpr int kPhoneMaxDiagonalMm = 190;     // ~7.5 in
-constexpr int kHandheldMaxDiagonalMm = 240;  // ~9.5 in
-
 struct Signals {
     // OS says the device is in tablet/slate mode (KWin tabletMode, Windows
     // SM_CONVERTIBLESLATEMODE == 0). Unset when the OS has no such notion.
@@ -64,10 +57,6 @@ struct Signals {
 
     // Chassis says portable (laptop, convertible, detachable). Unset = unknown.
     std::optional<bool> portable;
-
-    // Only set when the OS reported them; never guessed. 0 = unknown.
-    int diagonalMm = 0;
-    int dpi = 0;
 };
 
 struct Result {
@@ -81,8 +70,6 @@ struct Payload {
     bool valid = false;
     PostureClass cls = PostureClass::Desktop;
     bool touch = false;
-    int diagonalMm = 0;  // 0 = omit
-    int dpi = 0;         // 0 = omit
 };
 
 const char* className(PostureClass cls);
@@ -93,9 +80,6 @@ inline bool isTouchPrimary(PostureClass cls)
 {
     return cls == PostureClass::Tablet || cls == PostureClass::Handheld || cls == PostureClass::Phone;
 }
-
-inline bool diagonalPlausible(int mm) { return mm >= kMinDiagonalMm && mm <= kMaxDiagonalMm; }
-inline bool dpiPlausible(int dpi) { return dpi >= kMinDpi && dpi <= kMaxDpi; }
 
 // Classify from signals alone (the Auto path).
 Result classify(const Signals& sig);
@@ -114,7 +98,7 @@ Payload makePayload(const Signals& sig, Mode mode, bool runtimeUpdate);
 Result resolve(const Signals& sig, Mode mode);
 
 // Query string without leading '&', e.g.
-// "clientPosture=tablet&clientTouch=1&clientDiagonalMm=305&clientDpi=160".
+// "clientPosture=tablet&clientTouch=1".
 // Empty for an invalid payload.
 std::string buildQuery(const Payload& payload);
 
@@ -139,6 +123,54 @@ private:
     std::chrono::milliseconds m_Debounce;
     std::optional<Payload> m_Candidate;
     Clock::time_point m_CandidateSince{};
+};
+
+// Decides when an accepted runtime update should be followed by an automatic
+// resume of the stream. The host only rebuilds its virtual display on a
+// resume, so after /posture succeeded the client reconnects once, when the
+// touch-primary boundary was crossed relative to the posture the running
+// display was created for (the "baseline", i.e. the launch payload of the
+// current session).
+//
+// Safety rules, all pure logic so they can be tested:
+//   - setting off: never
+//   - nothing before the stream has run for armDelay (never while connecting)
+//   - at most one restart per cooldown, across sessions (lastRestart is carried
+//     into the next session's gate)
+//   - a flip that was blocked by the cooldown is not lost: due() turns true when
+//     the cooldown ends, but only if the latest accepted posture still differs
+//     from the baseline, so a flap back to the baseline needs no restart
+//   - never loops: the new session builds its gate from its own launch payload,
+//     so the posture it started in is the baseline and nothing is due
+class RestartGate {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    static constexpr std::chrono::milliseconds kDefaultCooldown{60000};
+    static constexpr std::chrono::milliseconds kDefaultArmDelay{5000};
+
+    RestartGate(bool enabled,
+                const Payload& displayBaseline,
+                Clock::time_point sessionStart,
+                std::optional<Clock::time_point> lastRestart = std::nullopt,
+                std::chrono::milliseconds cooldown = kDefaultCooldown,
+                std::chrono::milliseconds armDelay = kDefaultArmDelay);
+
+    // The host accepted this posture update.
+    void accepted(const Payload& sent);
+
+    // True when the session should be resumed now.
+    bool due(Clock::time_point now) const;
+
+private:
+    static bool touchPrimary(const Payload& p);
+
+    bool m_Enabled;
+    bool m_BaselineTouch;
+    bool m_LatestTouch;
+    Clock::time_point m_ArmedAt;
+    std::optional<Clock::time_point> m_LastRestart;
+    std::chrono::milliseconds m_Cooldown;
 };
 
 } // namespace posture

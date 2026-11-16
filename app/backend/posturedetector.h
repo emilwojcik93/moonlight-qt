@@ -3,12 +3,11 @@
 #include "postureclassifier.h"
 
 // Gathers the local signals that posture::classify() consumes. No monitor
-// model, EDID or host data is read; every value comes from the OS or Qt.
+// model, EDID, size or host data is read; every value comes from the OS or Qt.
 namespace posture {
 
-// Non-blocking: Qt input devices, primary screen metrics, chassis type.
-// Call from the GUI thread (Qt's device list is not thread safe). Never
-// reports a diagonal/DPI unless the screen gave a plausible physical size.
+// Non-blocking: Qt input devices and chassis type. Call from the GUI thread
+// (Qt's device list is not thread safe). Screen size and DPI are never read.
 Signals collectLocalSignals();
 
 // OS tablet/slate-mode state. May block briefly (KWin D-Bus, 500 ms cap), so

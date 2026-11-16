@@ -3,12 +3,8 @@
 #include <QtGlobal>
 #include <QString>
 
-#include <cmath>
-
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-#include <QGuiApplication>
 #include <QInputDevice>
-#include <QScreen>
 #endif
 
 #ifdef Q_OS_LINUX
@@ -90,25 +86,6 @@ Signals collectLocalSignals()
             break;
         default:
             break;
-        }
-    }
-
-    // Physical size as reported by the platform, only when it looks real.
-    // Virtual and headless outputs report 0 or nonsense; the payload builder
-    // drops anything outside the wire ranges as well.
-    if (const QScreen* screen = QGuiApplication::primaryScreen()) {
-        const QSizeF mm = screen->physicalSize();
-        const QSize px = screen->size();
-        if (mm.width() > 0 && mm.height() > 0 && px.width() > 0 && px.height() > 0) {
-            const int diagonalMm = qRound(std::hypot(mm.width(), mm.height()));
-            const double nativeWidthPx = px.width() * screen->devicePixelRatio();
-            const int dpi = qRound(nativeWidthPx / (mm.width() / 25.4));
-            if (diagonalPlausible(diagonalMm)) {
-                s.diagonalMm = diagonalMm;
-                if (dpiPlausible(dpi)) {
-                    s.dpi = dpi;
-                }
-            }
         }
     }
 #endif

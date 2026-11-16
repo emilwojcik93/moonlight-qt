@@ -390,7 +390,7 @@ NvHTTP::startApp(QString verb,
                                    // Other hosts ignore unknown launch parameters.
                                    (clientVrrRequested ? "&clientVrrRequested=1" : "")+
                                    // Posture hint for hosts that adapt their virtual display to touch
-                                   // clients: clientPosture, clientTouch, clientDiagonalMm, clientDpi.
+                                   // clients: clientPosture and clientTouch (never the screen size).
                                    // Built and validated by posture::buildQuery(); empty means none.
                                    // Other hosts ignore unknown launch parameters.
                                    (postureQuery.isEmpty() ? QString() : "&" + postureQuery)+
