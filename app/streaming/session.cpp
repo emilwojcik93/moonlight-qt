@@ -12,6 +12,7 @@
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
 #include "backend/posturedetector.h"
+#include "streaming/posturemonitor.h"
 #include "streaming/gpuperformancehold.h"
 #include "backend/networkbuffers.h"
 
@@ -2351,7 +2352,23 @@ void Session::exec()
         m_HostLaunchWarning.clear();
     }
 
+    // Report posture changes (2-in-1 flipped to tablet, ...) to a posture-aware
+    // host. With an explicit setting nothing can change, and GFE has no endpoint.
+    std::unique_ptr<PostureMonitor> postureMonitor;
+    if (toPostureMode(m_Preferences->clientPostureMode) == posture::Mode::Auto &&
+            !m_Computer->isNvidiaServerSoftware) {
+        postureMonitor = std::make_unique<PostureMonitor>(posture::Mode::Auto,
+                                                          m_PostureLaunchPayload,
+                                                          m_Computer->activeAddress,
+                                                          m_Computer->activeHttpsPort,
+                                                          m_Computer->serverCert,
+                                                          !m_Computer->isNvidiaServerSoftware);
+    }
+
     for (;;) {
+        if (postureMonitor) {
+            postureMonitor->tick();
+        }
         if (hostWarningVisible && std::chrono::steady_clock::now() >= hostWarningExpiresAt) {
             m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
             hostWarningVisible = false;
@@ -2760,6 +2777,7 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
+    postureMonitor.reset();
     m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
     m_HostLaunchWarning.clear();
     // Switch back to synchronous logging mode

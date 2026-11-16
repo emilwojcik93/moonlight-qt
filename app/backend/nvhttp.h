@@ -193,6 +193,13 @@ public:
              QString& rtspSessionUrl,
              LaunchWarning::Warning& launchWarning);
 
+    // Tells a posture-aware host that the client's posture changed while
+    // streaming (GET /posture over paired HTTPS, same args as launch). Throws
+    // on any failure, including a stock host that has no such endpoint; the
+    // caller is expected to ignore that.
+    void
+    updatePosture(const QString& postureQuery);
+
     QVector<NvApp>
     getAppList();
 

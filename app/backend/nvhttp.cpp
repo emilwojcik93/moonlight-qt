@@ -407,6 +407,23 @@ NvHTTP::startApp(QString verb,
 }
 
 void
+NvHTTP::updatePosture(const QString& postureQuery)
+{
+    // Fire-and-forget: keep the timeout short and the logging quiet, since a
+    // stock host answers 404 and that is expected.
+    QString response =
+            openConnectionToString(m_BaseUrlHttps,
+                                   "posture",
+                                   postureQuery,
+                                   FAST_FAIL_TIMEOUT_MS,
+                                   NvLogLevel::NVLL_NONE);
+
+    qDebug() << "Posture update response:" << response;
+
+    verifyResponseStatus(response);
+}
+
+void
 NvHTTP::quitApp()
 {
     QString response =

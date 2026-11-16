@@ -16,6 +16,6 @@ Signals collectLocalSignals();
 // no such signal or the build lacks the feature.
 //   Linux/KDE: org.kde.KWin /org/kde/KWin org.kde.KWin.TabletModeManager
 //   Windows:   GetSystemMetrics(SM_CONVERTIBLESLATEMODE), 0 == slate
-void collectOsTabletSignals(Signals& signals);
+void collectOsTabletSignals(Signals& out);
 
 } // namespace posture
