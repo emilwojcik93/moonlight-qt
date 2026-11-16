@@ -11,6 +11,7 @@
 #endif
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
+#include "backend/posturedetector.h"
 #include "streaming/gpuperformancehold.h"
 #include "backend/networkbuffers.h"
 
@@ -1790,6 +1791,19 @@ void Session::notifyMouseEmulationMode(bool enabled)
     }
 }
 
+static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
+{
+    switch (mode) {
+    case StreamingPreferences::POSTURE_ALWAYS_TABLET:
+        return posture::Mode::AlwaysTablet;
+    case StreamingPreferences::POSTURE_NEVER:
+        return posture::Mode::Never;
+    case StreamingPreferences::POSTURE_AUTO:
+    default:
+        return posture::Mode::Auto;
+    }
+}
+
 class AsyncConnectionStartThread : public QThread
 {
 public:
@@ -1843,6 +1857,23 @@ bool Session::startConnectionAsync()
     QString rtspSessionUrl;
     LaunchWarning::Warning launchWarning;
 
+    // Posture hint. An explicit setting overrides detection, Never sends
+    // nothing, and a desktop without touch sends nothing.
+    const posture::Mode postureMode = toPostureMode(m_Preferences->clientPostureMode);
+    posture::Signals postureSignals = m_PostureLocalSignals;
+    if (postureMode == posture::Mode::Auto) {
+        posture::collectOsTabletSignals(postureSignals);
+    }
+    m_PostureLaunchPayload = posture::makePayload(postureSignals, postureMode, false);
+    const QString postureQuery = QString::fromStdString(posture::buildQuery(m_PostureLaunchPayload));
+    if (postureMode != posture::Mode::Never) {
+        const posture::Result postureResult = posture::resolve(postureSignals, postureMode);
+        qInfo().noquote() << "Client posture:" << posture::className(postureResult.cls)
+                          << "confidence" << static_cast<int>(postureResult.confidence)
+                          << "touch" << postureResult.touch
+                          << "sending" << (postureQuery.isEmpty() ? QStringLiteral("nothing") : postureQuery);
+    }
+
     try {
         NvHTTP http(m_Computer);
         http.startApp(m_Computer->currentGameId != 0 ? "resume" : "launch",
@@ -1854,6 +1885,7 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
                       m_PresentationSettings.enableVrr,
+                      postureQuery,
                       rtspSessionUrl,
                       launchWarning);
     } catch (const GfeHttpResponseException& e) {
@@ -2070,6 +2102,10 @@ void Session::start()
             qWarning() << "Settings diagnostics not enabled:" << error;
         }
     }
+
+    // Qt's input device list must be read on the GUI thread, so do it here
+    // rather than in the async connection thread.
+    m_PostureLocalSignals = posture::collectLocalSignals();
 
     // Initialize the gamepad code with our preferences
     // NB: m_InputHandler must be initialize before starting the connection.

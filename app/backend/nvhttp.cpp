@@ -351,6 +351,7 @@ NvHTTP::startApp(QString verb,
                  int playStationGamepadMask,
                  bool persistGameControllersOnDisconnect,
                  bool clientVrrRequested,
+                 const QString& postureQuery,
                  QString& rtspSessionUrl,
                  LaunchWarning::Warning& launchWarning)
 {
@@ -388,6 +389,11 @@ NvHTTP::startApp(QString verb,
                                    // (Vibeshine: 1000 Hz virtual display in its Automatic mode).
                                    // Other hosts ignore unknown launch parameters.
                                    (clientVrrRequested ? "&clientVrrRequested=1" : "")+
+                                   // Posture hint for hosts that adapt their virtual display to touch
+                                   // clients: clientPosture, clientTouch, clientDiagonalMm, clientDpi.
+                                   // Built and validated by posture::buildQuery(); empty means none.
+                                   // Other hosts ignore unknown launch parameters.
+                                   (postureQuery.isEmpty() ? QString() : "&" + postureQuery)+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 

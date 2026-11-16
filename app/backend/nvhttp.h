@@ -189,6 +189,7 @@ public:
              int playStationGamepadMask,
              bool persistGameControllersOnDisconnect,
              bool clientVrrRequested,
+             const QString& postureQuery,
              QString& rtspSessionUrl,
              LaunchWarning::Warning& launchWarning);
 

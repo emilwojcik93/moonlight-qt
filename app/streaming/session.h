@@ -12,6 +12,7 @@
 #include "video/overlaymanager.h"
 #include "video/clientpacingwarning.h"
 #include "diagnostics/diagnosticcapture.h"
+#include "backend/postureclassifier.h"
 #ifdef HAVE_KWIN_SCANOUT_GUARD
 #include "streaming/kwinscanoutguard.h"
 #endif
@@ -318,6 +319,12 @@ private:
     bool m_ShouldExit;
 
     bool m_AsyncConnectionSuccess;
+
+    // Client posture hint (see backend/postureclassifier.h). The local signals
+    // are gathered on the GUI thread in start(); the payload is what the
+    // launch/resume request carried, and the baseline for runtime updates.
+    posture::Signals m_PostureLocalSignals;
+    posture::Payload m_PostureLaunchPayload;
     int m_PortTestResults;
 
     int m_ActiveVideoFormat;
