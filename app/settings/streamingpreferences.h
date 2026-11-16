@@ -152,6 +152,17 @@ public:
     };
     Q_ENUM(CaptureSysKeysMode);
 
+    // Whether to tell the host this is a touch-primary client (tablet posture).
+    // Auto detects from OS tablet mode and input devices; the explicit choices
+    // override detection.
+    enum PostureMode
+    {
+        POSTURE_AUTO,
+        POSTURE_ALWAYS_TABLET,
+        POSTURE_NEVER,
+    };
+    Q_ENUM(PostureMode);
+
     // What the Steam Controller (2026)'s four grip buttons become on the host
     enum SteamControllerGrips
     {
@@ -221,6 +232,7 @@ public:
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
+    Q_PROPERTY(PostureMode clientPostureMode MEMBER clientPostureMode NOTIFY clientPostureModeChanged)
     Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
@@ -297,6 +309,7 @@ public:
     bool uiControllerFullscreen = true;
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
+    PostureMode clientPostureMode = POSTURE_AUTO;
     RendererSelection rendererSelection;
     // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
     bool steamControllerDriver;
@@ -360,6 +373,7 @@ signals:
     void reverseScrollDirectionChanged();
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
+    void clientPostureModeChanged();
     void steamControllerChanged();
     void keepAwakeChanged();
     void languageChanged();
