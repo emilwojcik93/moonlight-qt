@@ -10,6 +10,7 @@ contains(CONFIG, tests) {
     launchWarning.file = $$PWD/backend/launchwarning.pro
     SUBDIRS += launchWarning
     SUBDIRS += updates
+    SUBDIRS += posture
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += steamcontroller
