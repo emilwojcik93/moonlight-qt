@@ -51,11 +51,15 @@ Result classify(const Signals& s)
     r.touch = s.hasTouchscreen;
 
     const bool tabletSignal = s.osTabletMode.has_value();
-    // KWin: tabletMode=true while tabletModeAvailable=false is inconsistent.
-    // Trust neither value of the tablet signal then; fall back to input devices.
+    // KWin can report tabletModeAvailable=false even on a detachable 2-in-1
+    // whose tabletMode property follows the real state (checked on a Dell
+    // Latitude 5290 2-in-1: tabletMode=true with the keyboard detached).
+    // So tabletMode=true is believed when a touchscreen exists, at lower
+    // confidence if the OS says it cannot report tablet mode. tabletMode=false
+    // with available=false is only 'unknown' and falls back to input devices.
     const bool conflict = tabletSignal && s.osTabletModeAvailable.has_value() &&
                           !*s.osTabletModeAvailable;
-    const bool trustedTablet = tabletSignal && !conflict;
+    const bool trustedTablet = tabletSignal && (!conflict || *s.osTabletMode);
 
     if (!s.hasTouchscreen) {
         // Nothing to touch: never a touch class, whatever the OS says
@@ -71,7 +75,7 @@ Result classify(const Signals& s)
         else {
             r.cls = PostureClass::Laptop;
         }
-        r.confidence = Confidence::High;
+        r.confidence = conflict ? Confidence::Medium : Confidence::High;
         return r;
     }
 

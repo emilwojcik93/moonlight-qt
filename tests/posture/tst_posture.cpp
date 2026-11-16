@@ -92,15 +92,28 @@ private slots:
         QCOMPARE(r.confidence, Confidence::High);
     }
 
-    // Dell 5290: tabletMode=true, tabletModeAvailable=false
-    void kwinQuirkWithKeyboardAttachedIsLowConfidenceLaptop()
+    // Dell 5290: tabletMode=true, tabletModeAvailable=false while the keyboard
+    // is detached (measured on the device): believe tabletMode, medium confidence,
+    // even though the internal keyboard/touchpad nodes stay registered.
+    void kwinQuirkTabletModeTrueIsTabletEvenWithInputNodes()
     {
         Signals s = touchLaptop();
         s.osTabletMode = true;
         s.osTabletModeAvailable = false;
         Result r = classify(s);
+        QCOMPARE(r.cls, PostureClass::Tablet);
+        QCOMPARE(r.confidence, Confidence::Medium);
+        QVERIFY(r.touch);
+    }
+
+    // tabletMode=false with available=false is 'unknown': use input devices
+    void kwinQuirkTabletModeFalseFallsBackToDevices()
+    {
+        Signals s = touchLaptop();
+        s.osTabletMode = false;
+        s.osTabletModeAvailable = false;
+        Result r = classify(s);
         QCOMPARE(r.cls, PostureClass::Laptop);
-        QCOMPARE(r.confidence, Confidence::Low);
         QVERIFY(r.touch);
     }
 
