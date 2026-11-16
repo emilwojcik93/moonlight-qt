@@ -233,6 +233,7 @@ public:
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(PostureMode clientPostureMode MEMBER clientPostureMode NOTIFY clientPostureModeChanged)
+    Q_PROPERTY(bool reconnectOnPosture MEMBER reconnectOnPosture NOTIFY reconnectOnPostureChanged)
     Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
@@ -310,6 +311,10 @@ public:
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
     PostureMode clientPostureMode = POSTURE_AUTO;
+    // Resume the stream automatically when a posture change crosses the touch
+    // boundary (see streaming/posturemonitor.h), so the host recreates its
+    // virtual display for the new posture.
+    bool reconnectOnPosture = true;
     RendererSelection rendererSelection;
     // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
     bool steamControllerDriver;
@@ -374,6 +379,7 @@ signals:
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void clientPostureModeChanged();
+    void reconnectOnPostureChanged();
     void steamControllerChanged();
     void keepAwakeChanged();
     void languageChanged();

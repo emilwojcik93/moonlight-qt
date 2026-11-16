@@ -2745,6 +2745,24 @@ FocusScope {
                 }
 
                 ConsoleCheckBox {
+                    id: reconnectOnPostureCheck
+                    objectName: "reconnectOnPostureCheck"
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Reconnect when posture changes")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.reconnectOnPosture
+                    onCheckedChanged: {
+                        StreamingPreferences.reconnectOnPosture = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("When the tablet mode changes during a stream, briefly resume the stream so the host can adapt its virtual display, for example to dock the on-screen keyboard. At most once a minute.")
+                }
+
+                ConsoleCheckBox {
                     id: absoluteTouchCheck
                     hoverEnabled: true
                     width: parent.width
