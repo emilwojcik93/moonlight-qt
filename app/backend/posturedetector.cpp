@@ -1,6 +1,7 @@
 #include "posturedetector.h"
 
 #include <QtGlobal>
+#include <utility>
 #include <QString>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -154,6 +155,29 @@ void collectOsTabletSignals(Signals& s)
 #endif
 
     Q_UNUSED(s);
+}
+
+TabletModeWatcher::TabletModeWatcher(std::function<void(bool)> onChange)
+    : m_OnChange(std::move(onChange))
+{
+#ifdef HAVE_POSTURE_DBUS
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (bus.isConnected()) {
+        m_Active = bus.connect(QStringLiteral("org.kde.KWin"),
+                               QStringLiteral("/org/kde/KWin"),
+                               QStringLiteral("org.kde.KWin.TabletModeManager"),
+                               QStringLiteral("tabletModeChanged"),
+                               this,
+                               SLOT(onTabletModeChanged(bool)));
+    }
+#endif
+}
+
+void TabletModeWatcher::onTabletModeChanged(bool tabletMode)
+{
+    if (m_OnChange) {
+        m_OnChange(tabletMode);
+    }
 }
 
 } // namespace posture

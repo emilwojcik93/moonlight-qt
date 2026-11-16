@@ -1499,13 +1499,24 @@ private:
 
     void run() override
     {
+        // A posture restart keeps the host app running and resumes it in a new
+        // session. It never applies to a failed or externally stopped session.
+        const bool restarting =
+                m_Session->m_PostureRestartRequested &&
+                !m_Session->m_UnexpectedTermination &&
+                !m_Session->m_ShouldExit;
+
         // Only quit the running app if our session terminated gracefully
         bool shouldQuit =
+                !restarting &&
                 !m_Session->m_UnexpectedTermination &&
                 m_Session->m_Preferences->quitAppAfter;
 
         // Notify the UI
-        if (shouldQuit) {
+        if (restarting) {
+            emit m_Session->restartStarting();
+        }
+        else if (shouldQuit) {
             emit m_Session->quitStarting();
         }
         else {
@@ -1792,6 +1803,9 @@ void Session::notifyMouseEmulationMode(bool enabled)
     }
 }
 
+// Time of the last automatic posture restart; the cooldown spans sessions.
+static std::optional<std::chrono::steady_clock::time_point> s_LastPostureRestart;
+
 static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
 {
     switch (mode) {
@@ -1865,7 +1879,9 @@ bool Session::startConnectionAsync()
     if (postureMode == posture::Mode::Auto) {
         posture::collectOsTabletSignals(postureSignals);
     }
-    m_PostureLaunchPayload = posture::makePayload(postureSignals, postureMode, false);
+    // A restart after a posture change must be explicit so the host rebuilds the
+    // display for exactly this state, even when it is a plain desktop.
+    m_PostureLaunchPayload = posture::makePayload(postureSignals, postureMode, m_PostureRestartSession);
     const QString postureQuery = QString::fromStdString(posture::buildQuery(m_PostureLaunchPayload));
     if (postureMode != posture::Mode::Never) {
         const posture::Result postureResult = posture::resolve(postureSignals, postureMode);
@@ -1877,7 +1893,7 @@ bool Session::startConnectionAsync()
 
     try {
         NvHTTP http(m_Computer);
-        http.startApp(m_Computer->currentGameId != 0 ? "resume" : "launch",
+        http.startApp(m_Computer->currentGameId != 0 || m_PostureRestartSession ? "resume" : "launch",
                       m_Computer->isNvidiaServerSoftware,
                       m_App.id, &m_StreamConfig,
                       enableGameOptimizations,
@@ -2063,6 +2079,13 @@ void Session::setShouldExit(bool quitHostApp)
     }
 
     m_ShouldExit = true;
+}
+
+Session* Session::createRestartSession()
+{
+    auto* next = new Session(m_Computer, m_App, m_Preferences);
+    next->m_PostureRestartSession = true;
+    return next;
 }
 
 void Session::start()
@@ -2362,12 +2385,27 @@ void Session::exec()
                                                           m_Computer->activeAddress,
                                                           m_Computer->activeHttpsPort,
                                                           m_Computer->serverCert,
-                                                          !m_Computer->isNvidiaServerSoftware);
+                                                          !m_Computer->isNvidiaServerSoftware,
+                                                          m_Preferences->reconnectOnPosture,
+                                                          s_LastPostureRestart);
     }
 
     for (;;) {
         if (postureMonitor) {
             postureMonitor->tick();
+
+            // The host accepted a posture change that needs a new virtual
+            // display, which it only builds on resume. Tear down and resume.
+            // Skipped when the stream is already ending (user quit, signal,
+            // connection loss): that path must win.
+            if (postureMonitor->restartDue() &&
+                    !m_ShouldExit && !m_UnexpectedTermination && !SDL_HasEvent(SDL_QUIT)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Restarting the stream to apply the new client posture");
+                s_LastPostureRestart = std::chrono::steady_clock::now();
+                m_PostureRestartRequested = true;
+                goto DispatchDeferredCleanup;
+            }
         }
         if (hostWarningVisible && std::chrono::steady_clock::now() >= hostWarningExpiresAt) {
             m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");

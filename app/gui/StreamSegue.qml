@@ -62,6 +62,26 @@ Item {
         window.visible = true
     }
 
+    function restartStarting()
+    {
+        // The client posture changed and the host must rebuild its virtual
+        // display, which it only does on resume. Replace this segue with one
+        // that resumes the same app in a new session. Same shape as
+        // quitStarting(): no sessionFinished() follows, so a CLI launch keeps
+        // running instead of exiting.
+        if (!session) return
+        var next = session.createRestartSession()
+        var component = Qt.createComponent("StreamSegue.qml")
+        var segue = component.createObject(stackView, {
+            "appName": appName, "artwork": artwork, "session": next,
+            "isResume": true, "quitAfter": quitAfter
+        })
+        stackView.replace(stackView.currentItem, segue, StackView.Immediate)
+
+        // The stream window is gone; show the progress while we reconnect
+        window.visible = true
+    }
+
     function sessionFinished(portTestResult)
     {
         if (portTestResult !== 0 && portTestResult !== -1 && streamSegueErrorDialog.text) {
@@ -121,6 +141,7 @@ Item {
         session.connectionStarted.connect(connectionStarted)
         session.displayLaunchError.connect(displayLaunchError)
         session.quitStarting.connect(quitStarting)
+        session.restartStarting.connect(restartStarting)
         session.sessionFinished.connect(sessionFinished)
         session.readyForDeletion.connect(sessionReadyForDeletion)
 
