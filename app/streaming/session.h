@@ -12,6 +12,7 @@
 #include "video/overlaymanager.h"
 #include "video/clientpacingwarning.h"
 #include "diagnostics/diagnosticcapture.h"
+#include "backend/postureclassifier.h"
 #ifdef HAVE_KWIN_SCANOUT_GUARD
 #include "streaming/kwinscanoutguard.h"
 #endif
@@ -113,6 +114,10 @@ public:
     Q_INVOKABLE bool initialize(QQuickWindow* qtWindow);
     Q_INVOKABLE void start();
     Q_INVOKABLE void interrupt();
+
+    // After restartStarting(): a fresh Session for the same app that resumes
+    // it. Must be called on the GUI thread; the caller owns the result.
+    Q_INVOKABLE Session* createRestartSession();
     Q_PROPERTY(QStringList launchWarnings MEMBER m_LaunchWarnings NOTIFY launchWarningsChanged);
 
     static
@@ -155,6 +160,11 @@ signals:
     void displayLaunchError(QString text);
 
     void quitStarting();
+
+    // The stream was torn down on purpose (client posture changed) and the UI
+    // should start createRestartSession() in its place. sessionFinished() is
+    // not emitted for this session, and the host app is not quit.
+    void restartStarting();
 
     void sessionFinished(int portTestResult);
 
@@ -318,6 +328,19 @@ private:
     bool m_ShouldExit;
 
     bool m_AsyncConnectionSuccess;
+
+    // Client posture hint (see backend/postureclassifier.h). The local signals
+    // are gathered on the GUI thread in start(); the payload is what the
+    // launch/resume request carried, and the baseline for runtime updates.
+    posture::Signals m_PostureLocalSignals;
+    posture::Payload m_PostureLaunchPayload;
+
+    // This session replaces one that was restarted after a posture change: it
+    // always resumes and always sends an explicit posture.
+    bool m_PostureRestartSession = false;
+    // This session ends by an automatic posture restart (set on the SDL thread
+    // before cleanup is dispatched).
+    bool m_PostureRestartRequested = false;
     int m_PortTestResults;
 
     int m_ActiveVideoFormat;

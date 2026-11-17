@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include "identitymanager.h"
 #include "nvapp.h"
 #include "nvaddress.h"
@@ -189,8 +190,18 @@ public:
              int playStationGamepadMask,
              bool persistGameControllersOnDisconnect,
              bool clientVrrRequested,
+             const QString& postureQuery,
              QString& rtspSessionUrl,
              LaunchWarning::Warning& launchWarning);
+
+    // Tells a posture-aware host that the client's posture changed while
+    // streaming (GET /posture over paired HTTPS, same args as launch). Throws
+    // on any failure, including a stock host that has no such endpoint; the
+    // caller is expected to ignore that. Returns the host's display_change
+    // answer when it sent one: true means the stream must be resumed to get a
+    // fitting host display, false means the running display is fine.
+    std::optional<bool>
+    updatePosture(const QString& postureQuery);
 
     QVector<NvApp>
     getAppList();

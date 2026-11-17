@@ -11,6 +11,8 @@
 #endif
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
+#include "backend/posturedetector.h"
+#include "streaming/posturemonitor.h"
 #include "streaming/gpuperformancehold.h"
 #include "backend/networkbuffers.h"
 
@@ -1498,13 +1500,24 @@ private:
 
     void run() override
     {
+        // A posture restart keeps the host app running and resumes it in a new
+        // session. It never applies to a failed or externally stopped session.
+        const bool restarting =
+                m_Session->m_PostureRestartRequested &&
+                !m_Session->m_UnexpectedTermination &&
+                !m_Session->m_ShouldExit;
+
         // Only quit the running app if our session terminated gracefully
         bool shouldQuit =
+                !restarting &&
                 !m_Session->m_UnexpectedTermination &&
                 m_Session->m_Preferences->quitAppAfter;
 
         // Notify the UI
-        if (shouldQuit) {
+        if (restarting) {
+            emit m_Session->restartStarting();
+        }
+        else if (shouldQuit) {
             emit m_Session->quitStarting();
         }
         else {
@@ -1791,6 +1804,26 @@ void Session::notifyMouseEmulationMode(bool enabled)
     }
 }
 
+// Time of the last automatic posture restart; the cooldown spans sessions.
+static std::optional<std::chrono::steady_clock::time_point> s_LastPostureRestart;
+
+static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
+{
+    switch (mode) {
+    case StreamingPreferences::POSTURE_ALWAYS_TABLET:
+        return posture::Mode::AlwaysTablet;
+    case StreamingPreferences::POSTURE_NEVER:
+        return posture::Mode::Never;
+    case StreamingPreferences::POSTURE_ALWAYS_HANDHELD:
+        return posture::Mode::AlwaysHandheld;
+    case StreamingPreferences::POSTURE_ALWAYS_DESKTOP:
+        return posture::Mode::AlwaysDesktop;
+    case StreamingPreferences::POSTURE_AUTO:
+    default:
+        return posture::Mode::Auto;
+    }
+}
+
 class AsyncConnectionStartThread : public QThread
 {
 public:
@@ -1844,9 +1877,28 @@ bool Session::startConnectionAsync()
     QString rtspSessionUrl;
     LaunchWarning::Warning launchWarning;
 
+    // Posture hint. An explicit setting overrides detection, Never sends
+    // nothing, and a desktop without touch sends nothing.
+    const posture::Mode postureMode = toPostureMode(m_Preferences->clientPostureMode);
+    posture::Signals postureSignals = m_PostureLocalSignals;
+    if (postureMode == posture::Mode::Auto) {
+        posture::collectOsTabletSignals(postureSignals);
+    }
+    // A restart after a posture change must be explicit so the host rebuilds the
+    // display for exactly this state, even when it is a plain desktop.
+    m_PostureLaunchPayload = posture::makePayload(postureSignals, postureMode, m_PostureRestartSession);
+    const QString postureQuery = QString::fromStdString(posture::buildQuery(m_PostureLaunchPayload));
+    if (postureMode != posture::Mode::Never) {
+        const posture::Result postureResult = posture::resolve(postureSignals, postureMode);
+        qInfo().noquote() << "Client posture:" << posture::className(postureResult.cls)
+                          << "confidence" << static_cast<int>(postureResult.confidence)
+                          << "touch" << postureResult.touch
+                          << "sending" << (postureQuery.isEmpty() ? QStringLiteral("nothing") : postureQuery);
+    }
+
     try {
         NvHTTP http(m_Computer);
-        http.startApp(m_Computer->currentGameId != 0 ? "resume" : "launch",
+        http.startApp(m_Computer->currentGameId != 0 || m_PostureRestartSession ? "resume" : "launch",
                       m_Computer->isNvidiaServerSoftware,
                       m_App.id, &m_StreamConfig,
                       enableGameOptimizations,
@@ -1855,6 +1907,7 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
                       m_PresentationSettings.enableVrr,
+                      postureQuery,
                       rtspSessionUrl,
                       launchWarning);
     } catch (const GfeHttpResponseException& e) {
@@ -2033,6 +2086,13 @@ void Session::setShouldExit(bool quitHostApp)
     m_ShouldExit = true;
 }
 
+Session* Session::createRestartSession()
+{
+    auto* next = new Session(m_Computer, m_App, m_Preferences);
+    next->m_PostureRestartSession = true;
+    return next;
+}
+
 void Session::start()
 {
     // Wait for any old session to finish cleanup
@@ -2071,6 +2131,10 @@ void Session::start()
             qWarning() << "Settings diagnostics not enabled:" << error;
         }
     }
+
+    // Qt's input device list must be read on the GUI thread, so do it here
+    // rather than in the async connection thread.
+    m_PostureLocalSignals = posture::collectLocalSignals();
 
     // Initialize the gamepad code with our preferences
     // NB: m_InputHandler must be initialize before starting the connection.
@@ -2316,7 +2380,38 @@ void Session::exec()
         m_HostLaunchWarning.clear();
     }
 
+    // Report posture changes (2-in-1 flipped to tablet, ...) to a posture-aware
+    // host. With an explicit setting nothing can change, and GFE has no endpoint.
+    std::unique_ptr<PostureMonitor> postureMonitor;
+    if (toPostureMode(m_Preferences->clientPostureMode) == posture::Mode::Auto &&
+            !m_Computer->isNvidiaServerSoftware) {
+        postureMonitor = std::make_unique<PostureMonitor>(posture::Mode::Auto,
+                                                          m_PostureLaunchPayload,
+                                                          m_Computer->activeAddress,
+                                                          m_Computer->activeHttpsPort,
+                                                          m_Computer->serverCert,
+                                                          !m_Computer->isNvidiaServerSoftware,
+                                                          m_Preferences->reconnectOnPosture,
+                                                          s_LastPostureRestart);
+    }
+
     for (;;) {
+        if (postureMonitor) {
+            postureMonitor->tick();
+
+            // The host accepted a posture change that needs a new virtual
+            // display, which it only builds on resume. Tear down and resume.
+            // Skipped when the stream is already ending (user quit, signal,
+            // connection loss): that path must win.
+            if (postureMonitor->restartDue() &&
+                    !m_ShouldExit && !m_UnexpectedTermination && !SDL_HasEvent(SDL_QUIT)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Restarting the stream to apply the new client posture");
+                s_LastPostureRestart = std::chrono::steady_clock::now();
+                m_PostureRestartRequested = true;
+                goto DispatchDeferredCleanup;
+            }
+        }
         if (hostWarningVisible && std::chrono::steady_clock::now() >= hostWarningExpiresAt) {
             m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
             hostWarningVisible = false;
@@ -2725,6 +2820,7 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
+    postureMonitor.reset();
     m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
     m_HostLaunchWarning.clear();
     // Switch back to synchronous logging mode
