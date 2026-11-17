@@ -70,6 +70,8 @@
 #define SER_REVERSESCROLL "reversescroll"
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
+#define SER_CLIENTPOSTURE "clientposture"
+#define SER_RECONNECTONPOSTURE "reconnectonposture"
 #define SER_STEAMCONTROLLERDRIVER "steamcontrollerdriver"
 #define SER_STEAMCONTROLLERMOTION "steamcontrollermotion"
 #define SER_STEAMCONTROLLERSPLITPADS "steamcontrollersplitpads"
@@ -251,6 +253,12 @@ void StreamingPreferences::reload()
     enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
+    clientPostureMode = static_cast<PostureMode>(settings.value(SER_CLIENTPOSTURE,
+                                                 static_cast<int>(PostureMode::POSTURE_AUTO)).toInt());
+    if (clientPostureMode < POSTURE_AUTO || clientPostureMode > POSTURE_ALWAYS_DESKTOP) {
+        clientPostureMode = POSTURE_AUTO;
+    }
+    reconnectOnPosture = settings.value(SER_RECONNECTONPOSTURE, true).toBool();
     steamControllerDriver = settings.value(SER_STEAMCONTROLLERDRIVER, true).toBool();
     steamControllerMotion = settings.value(SER_STEAMCONTROLLERMOTION, true).toBool();
     steamControllerSplitPads = settings.value(SER_STEAMCONTROLLERSPLITPADS, true).toBool();
@@ -498,6 +506,8 @@ void StreamingPreferences::save()
     settings.setValue(SER_REVERSESCROLL, reverseScrollDirection);
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
+    settings.setValue(SER_CLIENTPOSTURE, clientPostureMode);
+    settings.setValue(SER_RECONNECTONPOSTURE, reconnectOnPosture);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
     settings.setValue(SER_STEAMCONTROLLERDRIVER, steamControllerDriver);
     settings.setValue(SER_STEAMCONTROLLERMOTION, steamControllerMotion);

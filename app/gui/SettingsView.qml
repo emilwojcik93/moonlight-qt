@@ -2721,6 +2721,49 @@ FocusScope {
                     }
                 }
 
+                ConsoleSettingRow {
+                    width: parent.width
+                    objectName: "clientPostureRow"
+                    labelItem: ConsoleText { text: qsTr("Touch tablet posture") }
+                    description: qsTr("Tell the host this client is a touch tablet so it can adapt its virtual display, for example to dock the on-screen keyboard. Auto detects tablet mode and touch hardware. Only hosts that support it react to this.")
+                    editor: AutoResizingComboBox {
+                        id: clientPostureMode
+                        textRole: "text"
+                        model: ListModel {
+                            ListElement { text: qsTr("Auto"); val: StreamingPreferences.POSTURE_AUTO }
+                            ListElement { text: qsTr("Always tablet"); val: StreamingPreferences.POSTURE_ALWAYS_TABLET }
+                            ListElement { text: qsTr("Always handheld (gamepad)"); val: StreamingPreferences.POSTURE_ALWAYS_HANDHELD }
+                            ListElement { text: qsTr("Always desktop (keyboard)"); val: StreamingPreferences.POSTURE_ALWAYS_DESKTOP }
+                            ListElement { text: qsTr("Never"); val: StreamingPreferences.POSTURE_NEVER }
+                        }
+                        Component.onCompleted: {
+                            for (var i = 0; i < count; ++i) {
+                                if (model.get(i).val === StreamingPreferences.clientPostureMode) { currentIndex = i; break }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: StreamingPreferences.clientPostureMode = model.get(currentIndex).val
+                    }
+                }
+
+                ConsoleCheckBox {
+                    id: reconnectOnPostureCheck
+                    objectName: "reconnectOnPostureCheck"
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Reconnect when posture changes")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.reconnectOnPosture
+                    onCheckedChanged: {
+                        StreamingPreferences.reconnectOnPosture = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("When the tablet mode changes during a stream, briefly resume the stream so the host can adapt its virtual display, for example to dock the on-screen keyboard. At most once a minute.")
+                }
+
                 ConsoleCheckBox {
                     id: absoluteTouchCheck
                     hoverEnabled: true

@@ -323,6 +323,11 @@ StreamCommandLineParser::StreamCommandLineParser()
         {"fullscreen", StreamingPreferences::CSK_FULLSCREEN},
         {"always",     StreamingPreferences::CSK_ALWAYS},
     };
+    m_PostureModeMap = {
+        {"auto",   StreamingPreferences::POSTURE_AUTO},
+        {"tablet", StreamingPreferences::POSTURE_ALWAYS_TABLET},
+        {"never",  StreamingPreferences::POSTURE_NEVER},
+    };
     m_SteamControllerGripsMap = {
         {"paddles", StreamingPreferences::SCG_PADDLES},
         {"ds4",     StreamingPreferences::SCG_DS4},
@@ -388,6 +393,8 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("hdr", "HDR streaming");
     parser.addToggleOption("yuv444", "YUV 4:4:4 sampling, if supported");
     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
+    parser.addChoiceOption("client-posture", "touch tablet posture sent to the host", m_PostureModeMap.keys());
+    parser.addToggleOption("reconnect-on-posture", "resume the stream when a posture change needs a new host display");
     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
 
@@ -544,6 +551,14 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     if (parser.isSet("capture-system-keys")) {
         preferences->captureSysKeysMode = mapValue(m_CaptureSysKeysModeMap, parser.getChoiceOptionValue("capture-system-keys"));
     }
+
+    // Resolve --client-posture option
+    if (parser.isSet("client-posture")) {
+        preferences->clientPostureMode = mapValue(m_PostureModeMap, parser.getChoiceOptionValue("client-posture"));
+    }
+
+    // Resolve --reconnect-on-posture and --no-reconnect-on-posture options
+    preferences->reconnectOnPosture = parser.getToggleOptionValue("reconnect-on-posture", preferences->reconnectOnPosture);
 
     // Resolve --video-codec option
     if (parser.isSet("video-codec")) {
