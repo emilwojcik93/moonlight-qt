@@ -4,7 +4,7 @@ QT = core gui network testlib
 CONFIG += console testcase c++17
 CONFIG -= app_bundle
 INCLUDEPATH += $$PWD/../../app $$PWD/../../moonlight-common-c/moonlight-common-c/src
-SOURCES += $$PWD/tst_poweractions.cpp $$PWD/../../app/backend/nvhttp.cpp $$PWD/../../app/backend/nvaddress.cpp $$PWD/../../app/backend/identitymanager.cpp
+SOURCES += $$PWD/tst_poweractions.cpp $$PWD/../../app/backend/nvhttp.cpp $$PWD/../../app/backend/nvaddress.cpp $$PWD/../../app/backend/identitymanager.cpp $$PWD/../../app/backend/postureclassifier.cpp
 HEADERS += $$PWD/../../app/backend/nvhttp.h $$PWD/../../app/backend/poweractions.h $$PWD/tlsfixture.h
 win32 {
     INCLUDEPATH += $$PWD/../../libs/windows/include
