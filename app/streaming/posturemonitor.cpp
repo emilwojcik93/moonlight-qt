@@ -82,8 +82,11 @@ void PostureMonitor::run()
             const QString query = QString::fromStdString(posture::buildQuery(*update));
             qInfo().noquote() << "Client posture changed, notifying host:" << query;
             try {
-                http.updatePosture(query);
-                restart.accepted(*update);
+                const std::optional<bool> displayChange = http.updatePosture(query);
+                restart.accepted(*update, displayChange);
+                if (displayChange && !*displayChange) {
+                    qInfo() << "Host switched mode without a new display; no stream restart needed";
+                }
             } catch (const std::exception& e) {
                 qDebug() << "Posture update ignored:" << e.what();
             } catch (...) {

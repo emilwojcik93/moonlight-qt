@@ -327,6 +327,40 @@ private slots:
         QVERIFY(!lap.due(later));
     }
 
+    void restartGateFollowsTheHostAnswer()
+    {
+        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
+        const auto later = t0 + std::chrono::seconds(30);
+        Payload laptop{true, PostureClass::Laptop, true};
+        Payload tablet{true, PostureClass::Tablet, true};
+
+        // Keyboard flip, host keeps its display: never restart
+        RestartGate keep(true, laptop, t0);
+        keep.accepted(tablet, false);
+        QVERIFY(!keep.due(later));
+
+        // Host says the display no longer fits: restart, even touch to touch
+        RestartGate change(true, tablet, t0);
+        change.accepted(Payload{true, PostureClass::Phone, true}, true);
+        QVERIFY(change.due(later));
+
+        // The host answer of the latest update wins
+        RestartGate back(true, laptop, t0);
+        back.accepted(tablet, true);
+        back.accepted(laptop, false);
+        QVERIFY(!back.due(later));
+    }
+
+    void parseDisplayChangeReadsTheRootAttribute()
+    {
+        QCOMPARE(parseDisplayChange("<?xml version=\"1.0\"?>\n<root display_change=\"0\" status_code=\"200\"/>"), std::optional<bool>(false));
+        QCOMPARE(parseDisplayChange("<root status_code=\"200\" display_change=\"1\"/>"), std::optional<bool>(true));
+        QVERIFY(!parseDisplayChange("<root status_code=\"200\"/>"));
+        QVERIFY(!parseDisplayChange("<root display_change=\"x\"/>"));
+        QVERIFY(!parseDisplayChange("<root status_code=\"200\"><a display_change=\"1\"/></root>"));
+        QVERIFY(!parseDisplayChange(""));
+    }
+
     void restartGateOmittedLaunchPayloadIsDesktop()
     {
         const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);

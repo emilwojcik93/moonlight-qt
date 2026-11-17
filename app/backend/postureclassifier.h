@@ -142,6 +142,10 @@ private:
 //     from the baseline, so a flap back to the baseline needs no restart
 //   - never loops: the new session builds its gate from its own launch payload,
 //     so the posture it started in is the baseline and nothing is due
+// Reads display_change="0|1" from the root element of a /posture reply.
+// Empty when the host did not send it (older hosts).
+std::optional<bool> parseDisplayChange(const std::string& xml);
+
 class RestartGate {
 public:
     using Clock = std::chrono::steady_clock;
@@ -156,8 +160,11 @@ public:
                 std::chrono::milliseconds cooldown = kDefaultCooldown,
                 std::chrono::milliseconds armDelay = kDefaultArmDelay);
 
-    // The host accepted this posture update.
-    void accepted(const Payload& sent);
+    // The host accepted this posture update. hostDisplayChange is the host's own
+    // answer (display_change in the /posture reply): true when the display made
+    // at launch no longer fits, false when it still does. Hosts that do not say
+    // leave it empty and the gate falls back to comparing touch-primary states.
+    void accepted(const Payload& sent, std::optional<bool> hostDisplayChange = std::nullopt);
 
     // True when the session should be resumed now.
     bool due(Clock::time_point now) const;
@@ -168,6 +175,7 @@ private:
     bool m_Enabled;
     bool m_BaselineTouch;
     bool m_LatestTouch;
+    std::optional<bool> m_HostDisplayChange;
     Clock::time_point m_ArmedAt;
     std::optional<Clock::time_point> m_LastRestart;
     std::chrono::milliseconds m_Cooldown;

@@ -163,6 +163,27 @@ std::optional<Payload> UpdateGate::observe(const Payload& current, Clock::time_p
     return cur;
 }
 
+std::optional<bool> parseDisplayChange(const std::string& xml)
+{
+    static const std::string kAttr = "display_change=\"";
+    const auto rootEnd = xml.find('>', xml.find("<root"));
+    const auto at = xml.find(kAttr);
+    if (at == std::string::npos || rootEnd == std::string::npos || at > rootEnd) {
+        return std::nullopt;
+    }
+    const auto value = at + kAttr.size();
+    if (value + 1 >= xml.size() || xml[value + 1] != '"') {
+        return std::nullopt;
+    }
+    if (xml[value] == '1') {
+        return true;
+    }
+    if (xml[value] == '0') {
+        return false;
+    }
+    return std::nullopt;
+}
+
 RestartGate::RestartGate(bool enabled,
                          const Payload& displayBaseline,
                          Clock::time_point sessionStart,
@@ -184,14 +205,18 @@ bool RestartGate::touchPrimary(const Payload& p)
     return p.valid && isTouchPrimary(p.cls);
 }
 
-void RestartGate::accepted(const Payload& sent)
+void RestartGate::accepted(const Payload& sent, std::optional<bool> hostDisplayChange)
 {
     m_LatestTouch = touchPrimary(sent);
+    m_HostDisplayChange = hostDisplayChange;
 }
 
 bool RestartGate::due(Clock::time_point now) const
 {
-    if (!m_Enabled || m_LatestTouch == m_BaselineTouch || now < m_ArmedAt) {
+    // The host knows whether its display still fits; trust it when it says so.
+    const bool displayChange = m_HostDisplayChange ? *m_HostDisplayChange
+                                                   : m_LatestTouch != m_BaselineTouch;
+    if (!m_Enabled || !displayChange || now < m_ArmedAt) {
         return false;
     }
     return !m_LastRestart || now - *m_LastRestart >= m_Cooldown;

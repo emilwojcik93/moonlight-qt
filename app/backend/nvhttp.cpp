@@ -1,3 +1,4 @@
+#include "postureclassifier.h"
 #include "nvcomputer.h"
 #include "pyrowaveudpprobe.h"
 #include "poweractions.h"
@@ -406,7 +407,7 @@ NvHTTP::startApp(QString verb,
     launchWarning = LaunchWarning::parse(response);
 }
 
-void
+std::optional<bool>
 NvHTTP::updatePosture(const QString& postureQuery)
 {
     // Fire-and-forget: keep the timeout short and the logging quiet, since a
@@ -421,6 +422,7 @@ NvHTTP::updatePosture(const QString& postureQuery)
     qDebug() << "Posture update response:" << response;
 
     verifyResponseStatus(response);
+    return posture::parseDisplayChange(response.toStdString());
 }
 
 void
