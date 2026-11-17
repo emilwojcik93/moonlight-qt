@@ -54,9 +54,18 @@ Result classify(const Signals& s)
         return r;
     }
 
+    if (s.handheldForm) {
+        // A handheld gaming device has no keyboard to fold away; a docked keyboard
+        // cannot be told apart reliably, so that case is left to the user override.
+        r.cls = PostureClass::Handheld;
+        r.confidence = Confidence::High;
+        return r;
+    }
+
     if (trustedTablet) {
         if (*s.osTabletMode) {
-            r.cls = PostureClass::Tablet;
+            // Tablet posture with a controller in hand is used like a handheld
+            r.cls = s.hasGamepad ? PostureClass::Handheld : PostureClass::Tablet;
         }
         else {
             r.cls = PostureClass::Laptop;
@@ -67,7 +76,7 @@ Result classify(const Signals& s)
 
     // No usable OS tablet signal: touchscreen presence plus input devices
     if (!s.hasKeyboard && !s.hasPointer) {
-        r.cls = PostureClass::Tablet;
+        r.cls = s.hasGamepad ? PostureClass::Handheld : PostureClass::Tablet;
         r.confidence = Confidence::Medium;
     }
     else {
@@ -86,6 +95,21 @@ Result resolve(const Signals& sig, Mode mode)
         r.cls = PostureClass::Tablet;
         r.confidence = Confidence::High;
         r.touch = true;
+        return r;
+    }
+    if (mode == Mode::AlwaysHandheld) {
+        Result r;
+        r.cls = PostureClass::Handheld;
+        r.confidence = Confidence::High;
+        r.touch = true;
+        return r;
+    }
+    if (mode == Mode::AlwaysDesktop) {
+        // Desktop mode on the host; touch stays a capability so the host keeps
+        // the touch-sized display.
+        Result r = classify(sig);
+        r.cls = PostureClass::Laptop;
+        r.confidence = Confidence::High;
         return r;
     }
     return classify(sig);
@@ -134,7 +158,9 @@ Payload UpdateGate::normalize(Payload p)
 
 bool UpdateGate::differs(const Payload& a, const Payload& b)
 {
-    return isTouchPrimary(a.cls) != isTouchPrimary(b.cls) || a.touch != b.touch;
+    // The host mode decides: tablet <-> handheld (a controller attached or
+    // removed) matters although both are touch-primary.
+    return hostMode(a.cls) != hostMode(b.cls) || a.touch != b.touch;
 }
 
 std::optional<Payload> UpdateGate::observe(const Payload& current, Clock::time_point now)

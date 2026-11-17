@@ -22,7 +22,25 @@
 #include <windows.h>
 #endif
 
+#include "SDL_compat.h"
+
 namespace posture {
+
+// The SDL game controller subsystem is reference counted, so a short-lived
+// init here is safe whether or not the stream or the GUI already holds it.
+static bool gameControllerPresent()
+{
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+        return false;
+    }
+    bool found = false;
+    const int count = SDL_NumJoysticks();
+    for (int i = 0; i < count && !found; i++) {
+        found = SDL_IsGameController(i) == SDL_TRUE;
+    }
+    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+    return found;
+}
 
 #ifdef Q_OS_LINUX
 // SMBIOS chassis types: https://www.dmtf.org/standards/smbios (System Enclosure)
@@ -113,7 +131,23 @@ Signals collectLocalSignals()
         // 128 = no system battery
         s.portable = power.BatteryFlag != 128 && power.BatteryFlag != 255;
     }
+
+    // DeviceForm is the OEM's declaration of the device type; 0x2E is a
+    // handheld gaming PC.
+    DWORD deviceForm = 0;
+    DWORD deviceFormSize = sizeof(deviceForm);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\OEM",
+                     L"DeviceForm",
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &deviceForm,
+                     &deviceFormSize) == ERROR_SUCCESS) {
+        s.handheldForm = deviceForm == 0x2E;
+    }
 #endif
+
+    s.hasGamepad = gameControllerPresent();
 
     return s;
 }

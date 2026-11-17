@@ -255,7 +255,7 @@ void StreamingPreferences::reload()
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
     clientPostureMode = static_cast<PostureMode>(settings.value(SER_CLIENTPOSTURE,
                                                  static_cast<int>(PostureMode::POSTURE_AUTO)).toInt());
-    if (clientPostureMode < POSTURE_AUTO || clientPostureMode > POSTURE_NEVER) {
+    if (clientPostureMode < POSTURE_AUTO || clientPostureMode > POSTURE_ALWAYS_DESKTOP) {
         clientPostureMode = POSTURE_AUTO;
     }
     reconnectOnPosture = settings.value(SER_RECONNECTONPOSTURE, true).toBool();
