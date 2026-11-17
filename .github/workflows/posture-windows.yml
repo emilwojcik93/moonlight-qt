@@ -12,5 +12,5 @@ jobs:
   windows:
     uses: ./.github/workflows/build-win-mac.yml
     with:
-      ci_version: 6.2.0-daily.60001
+      ci_version: 6.2.0-daily.60002
       build_macos: false
