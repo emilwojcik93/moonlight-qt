@@ -2785,7 +2785,7 @@ FocusScope {
                     id: touchMenuCheck
                     hoverEnabled: true
                     width: parent.width
-                    text: qsTr("Touch menu (hold three fingers)")
+                    text: qsTr("Touch menu (corner handle or three-finger hold)")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                     checked: StreamingPreferences.touchMenu
                     onCheckedChanged: {
@@ -2795,7 +2795,7 @@ FocusScope {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Holding three fingers still on the stream for a moment opens a menu to disconnect or toggle statistics without a keyboard.")
+                    ToolTip.text: qsTr("Tapping the small handle that appears in the bottom-left corner when you touch the stream, or holding three fingers still for a moment, opens a menu to disconnect or toggle statistics without a keyboard.")
                 }
 
                 ConsoleCheckBox {

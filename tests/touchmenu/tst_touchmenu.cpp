@@ -82,7 +82,6 @@ private slots:
     {
         m.fingerDown(1, 0.5f, 0.2f, 0);
         m.fingerDown(2, 0.6f, 0.2f, 0);
-        QVERIFY(!m.needsTick());
         QCOMPARE(m.tick(HoldMs).type, EventType::None);
         QCOMPARE(m.tick(60000).type, EventType::None);
         QVERIFY(!m.isOpen());
@@ -93,7 +92,6 @@ private slots:
         threeDown(m, 0);
         // 3 % of 720 px = 21.6 px: 40 px is too far
         m.fingerMove(2, 0.60f, 0.20f + 40.0f / 720.0f, 100);
-        QVERIFY(!m.needsTick());
         QCOMPARE(m.tick(HoldMs).type, EventType::None);
         QVERIFY(!m.isOpen());
     }
@@ -130,7 +128,6 @@ private slots:
     {
         threeDown(m, 0);
         m.fingerUp(3, 0.70f, 0.20f, 400);
-        QVERIFY(!m.needsTick());
         QCOMPARE(m.tick(HoldMs).type, EventType::None);
         // The finger lands again: the hold restarts from that moment
         m.fingerDown(3, 0.70f, 0.20f, 1000);
@@ -168,7 +165,6 @@ private slots:
         m.fingerDown(2, 0.6f, 0.2f, 0);
         m.fingerMove(1, 0.5f, 0.5f, 100);
         m.fingerDown(3, 0.7f, 0.2f, 200);
-        QVERIFY(!m.needsTick());
         QCOMPARE(m.tick(2000).type, EventType::None);
     }
 
@@ -382,6 +378,156 @@ private slots:
         QCOMPARE(m.hitTest(0.1f, 0.05f), -1);
         // Right of the menu
         QCOMPARE(m.hitTest(0.99f, 0.95f), -1);
+    }
+
+    void activityShowsHandle()
+    {
+        QVERIFY(!m.handleVisible());
+        QVERIFY(!m.needsTick());
+        QVERIFY(!m.fingerDown(1, 0.5f, 0.2f, 0).swallow);
+        QVERIFY(m.handleVisible());
+        QVERIFY(m.needsTick());
+    }
+
+    void handleHidesAfterIdle()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 100);
+        m.fingerUp(1, 0.5f, 0.2f, 200);
+        QCOMPARE(m.tick(200 + HandleHideMs - 1).type, EventType::None);
+        QVERIFY(m.handleVisible());
+        QCOMPARE(m.tick(200 + HandleHideMs).type, EventType::None);
+        QVERIFY(!m.handleVisible());
+        QVERIFY(!m.needsTick());
+    }
+
+    void activityRestartsHandleHide()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 5000);
+        m.tick(5000 + HandleHideMs - 1);
+        QVERIFY(m.handleVisible());
+    }
+
+    void tapOnVisibleHandleOpensMenu()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 100);
+        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
+        QVERIFY(m.fingerDown(9, x, y, 200).swallow);
+        Event e = m.fingerUp(9, x, y, 300);
+        QCOMPARE(e.type, EventType::Open);
+        QVERIFY(e.swallow);
+        QVERIFY(m.isOpen());
+        QVERIFY(!m.handleVisible());
+        // The menu works as after the hold: an outside tap closes it
+        m.fingerDown(10, 0.9f, 0.1f, 400);
+        QCOMPARE(m.fingerUp(10, 0.9f, 0.1f, 450).type, EventType::Close);
+    }
+
+    void handleDownInsideLiftOutsideDoesNotOpen()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 100);
+        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
+        QVERIFY(m.fingerDown(9, x, y, 200).swallow);
+        QVERIFY(m.fingerMove(9, 0.5f, 0.5f, 250).swallow);
+        Event e = m.fingerUp(9, 0.5f, 0.5f, 300);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(e.swallow);
+        QVERIFY(!m.isOpen());
+    }
+
+    void handleDragInsideHandleDoesNotOpen()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 100);
+        // 30 px inside the 56 px handle is more than 3 % of 720
+        QVERIFY(m.fingerDown(9, 5.0f / 1280, 715.0f / 720, 200).swallow);
+        Event e = m.fingerUp(9, 35.0f / 1280, 715.0f / 720, 300);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(e.swallow);
+    }
+
+    void cornerTouchWhileHiddenIsForwarded()
+    {
+        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
+        QVERIFY(!m.handleVisible());
+        QVERIFY(!m.fingerDown(1, x, y, 0).swallow);
+        QVERIFY(m.handleVisible());
+        // That tap does not open anything
+        Event e = m.fingerUp(1, x, y, 100);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(!e.swallow);
+        QVERIFY(!m.isOpen());
+    }
+
+    void handleFingerDoesNotCountForHold()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 50);
+        m.fingerDown(9, 28.0f / 1280, 692.0f / 720, 100); // swallowed on the handle
+        m.fingerDown(2, 0.6f, 0.2f, 100);
+        m.fingerDown(3, 0.7f, 0.2f, 100);
+        QCOMPARE(m.gestureFingerCount(), 2);
+        QCOMPARE(m.tick(100 + HoldMs).type, EventType::None);
+    }
+
+    void redownOfTrackedIdReplaces()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerDown(2, 0.6f, 0.2f, 0);
+        // The compositor lost finger 1's up: the same id comes back
+        m.fingerDown(1, 0.4f, 0.4f, 500);
+        QCOMPARE(m.gestureFingerCount(), 2);
+        QCOMPARE(m.tick(500 + HoldMs).type, EventType::None);
+        // A real third finger still arms
+        m.fingerDown(3, 0.7f, 0.2f, 600);
+        QCOMPARE(m.gestureFingerCount(), 3);
+        QCOMPARE(m.tick(600 + HoldMs).type, EventType::Open);
+    }
+
+    void lostFingersAreForgottenWhenIdle()
+    {
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerDown(2, 0.6f, 0.2f, 0);
+        m.tick(HandleHideMs);
+        QCOMPARE(m.gestureFingerCount(), 0);
+        // Two stale records no longer make a phantom third finger
+        m.fingerDown(3, 0.7f, 0.2f, HandleHideMs + 100);
+        QCOMPARE(m.tick(HandleHideMs + 100 + HoldMs).type, EventType::None);
+    }
+
+    void fingerCancelActsLikeUpWithoutActivation()
+    {
+        threeDown(m, 0);
+        m.fingerCancel(3, 100);
+        QCOMPARE(m.gestureFingerCount(), 2);
+        QCOMPARE(m.tick(HoldMs).type, EventType::None);
+
+        // Cancel of the pressed finger in the open menu activates nothing
+        uint32_t t = 1000;
+        m.fingerDown(3, 0.7f, 0.2f, t);
+        QCOMPARE(m.tick(t + HoldMs).type, EventType::Open);
+        float x, y;
+        itemCenter(1280, 720, ItemDisconnect, x, y);
+        m.fingerDown(7, x, y, t + 900);
+        QCOMPARE(m.fingerCancel(7, t + 950).type, EventType::None);
+        QVERIFY(m.isOpen());
+        QCOMPARE(m.highlightedItem(), -1);
+    }
+
+    void handleRectSizes()
+    {
+        Rect r = handleRect(1920, 1280);
+        QCOMPARE(r.x, 0);
+        QCOMPARE(r.w, 77);
+        QCOMPARE(r.h, 77);
+        QCOMPARE(r.y, 1280 - 77);
+        r = handleRect(1280, 720);
+        QCOMPARE(r.w, 56); // 6 % is 43 px, the minimum wins
+        QCOMPARE(r.h, 56);
+        QCOMPARE(r.y, 720 - 56);
+        QCOMPARE(handleSize(1280, 0), 0);
     }
 
     void layoutInvalidOutput()

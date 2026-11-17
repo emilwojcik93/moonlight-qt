@@ -68,6 +68,26 @@ Layout computeLayout(int outputWidth, int outputHeight)
     return layout;
 }
 
+int handleSize(int outputWidth, int outputHeight)
+{
+    if (outputWidth <= 0 || outputHeight <= 0) {
+        return 0;
+    }
+
+    int size = std::max(HandleMinPixels, (int)std::lround(outputHeight * HandleHeightFraction));
+    return std::min(size, std::min(outputWidth, outputHeight));
+}
+
+Rect handleRect(int outputWidth, int outputHeight)
+{
+    Rect rect;
+    int size = handleSize(outputWidth, outputHeight);
+    rect.x = 0;
+    rect.y = outputHeight - size;
+    rect.w = rect.h = size;
+    return rect;
+}
+
 void TouchMenu::setOutputSize(int width, int height)
 {
     m_OutputWidth = width;
@@ -101,9 +121,39 @@ void TouchMenu::ignoreAllFingers()
     }
 }
 
+bool TouchMenu::inHandle(float x, float y) const
+{
+    if (m_OutputWidth <= 0 || m_OutputHeight <= 0) {
+        return false;
+    }
+
+    Rect r = handleRect(m_OutputWidth, m_OutputHeight);
+    int px = (int)std::floor(x * m_OutputWidth);
+    int py = (int)std::floor(y * m_OutputHeight);
+    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+}
+
+void TouchMenu::noteActivity(uint32_t nowMs)
+{
+    m_HandleVisible = true;
+    m_LastActivityMs = nowMs;
+}
+
+void TouchMenu::openMenu(uint32_t nowMs)
+{
+    m_Armed = false;
+    m_Open = true;
+    m_HandleVisible = false;
+    m_LastTouchMs = nowMs;
+    m_HaveActive = false;
+    m_PressItem = m_CurrentItem = -1;
+    ignoreAllFingers();
+}
+
 void TouchMenu::closeMenu()
 {
     m_Open = false;
+    m_HandleVisible = false;
     m_Armed = false;
     m_Cancelled = false; // Remaining fingers are ignored, so they cannot re-arm
     m_HaveActive = false;
@@ -163,7 +213,10 @@ Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
         m_HaveActive = false;
     }
 
-    Finger finger = { id, x, y, x, y, m_Open };
+    // Decided before this touch makes the handle visible
+    bool onHandle = !m_Open && m_HandleVisible && inHandle(x, y);
+
+    Finger finger = { id, x, y, x, y, m_Open || onHandle, onHandle };
     m_Fingers.push_back(finger);
 
     if (m_Open) {
@@ -176,6 +229,9 @@ Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
         result.swallow = true;
         return result;
     }
+
+    noteActivity(nowMs);
+    result.swallow = onHandle;
 
     if (!m_Armed && !m_Cancelled && gestureFingerCount() >= HoldFingers) {
         // Fingers that already travelled too far (a scroll in progress)
@@ -216,6 +272,7 @@ Event TouchMenu::fingerMove(int64_t id, float x, float y, uint32_t nowMs)
         return result;
     }
 
+    noteActivity(nowMs);
     if (finger == nullptr) {
         return result;
     }
@@ -233,8 +290,12 @@ Event TouchMenu::fingerUp(int64_t id, float x, float y, uint32_t nowMs)
     Event result;
     Finger* finger = find(id);
     bool wasIgnored = finger != nullptr ? finger->ignored : false;
+    bool tappedHandle = false;
 
     if (finger != nullptr) {
+        finger->x = x;
+        finger->y = y;
+        tappedHandle = !m_Open && finger->onHandle && inHandle(x, y) && !moved(*finger);
         m_Fingers.erase(m_Fingers.begin() + (finger - m_Fingers.data()));
     }
 
@@ -270,6 +331,44 @@ Event TouchMenu::fingerUp(int64_t id, float x, float y, uint32_t nowMs)
         m_Armed = false;
         m_Cancelled = false;
     }
+
+    if (tappedHandle) {
+        openMenu(nowMs);
+        result.type = EventType::Open;
+        result.swallow = true;
+    }
+    else {
+        noteActivity(nowMs);
+    }
+    return result;
+}
+
+Event TouchMenu::fingerCancel(int64_t id, uint32_t nowMs)
+{
+    Event result;
+    Finger* finger = find(id);
+    bool wasIgnored = finger != nullptr ? finger->ignored : false;
+
+    if (finger != nullptr) {
+        m_Fingers.erase(m_Fingers.begin() + (finger - m_Fingers.data()));
+    }
+
+    if (m_Open) {
+        m_LastTouchMs = nowMs;
+        result.swallow = true;
+        if (m_HaveActive && m_ActiveId == id) {
+            m_HaveActive = false;
+            m_PressItem = m_CurrentItem = -1;
+        }
+        return result;
+    }
+
+    result.swallow = wasIgnored;
+    if (gestureFingerCount() < HoldFingers) {
+        m_Armed = false;
+        m_Cancelled = false;
+    }
+    noteActivity(nowMs);
     return result;
 }
 
@@ -285,14 +384,19 @@ Event TouchMenu::tick(uint32_t nowMs)
         }
     }
     else if (m_Armed && (uint32_t)(nowMs - m_ArmedAtMs) >= HoldMs) {
-        m_Armed = false;
-        m_Open = true;
-        m_LastTouchMs = nowMs;
-        m_HaveActive = false;
-        m_PressItem = m_CurrentItem = -1;
-        ignoreAllFingers();
+        openMenu(nowMs);
         result.type = EventType::Open;
         result.swallow = true;
+    }
+    else if (m_HandleVisible && (uint32_t)(nowMs - m_LastActivityMs) >= HandleHideMs) {
+        m_HandleVisible = false;
+        // Whatever is still tracked has had no event for a long time: its up
+        // was probably lost. Swallowed fingers stay until they lift.
+        m_Fingers.erase(std::remove_if(m_Fingers.begin(), m_Fingers.end(),
+                                       [](const Finger& f) { return !f.ignored; }),
+                        m_Fingers.end());
+        m_Armed = false;
+        m_Cancelled = false;
     }
     return result;
 }
@@ -301,6 +405,7 @@ void TouchMenu::reset()
 {
     m_Fingers.clear();
     m_Open = false;
+    m_HandleVisible = false;
     m_Armed = false;
     m_Cancelled = false;
     m_HaveActive = false;

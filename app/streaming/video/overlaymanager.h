@@ -73,8 +73,10 @@ public:
     void setStatusMessage(StatusSource source, const std::string& text);
     // While active, the status overlay shows the touch menu (see touchmenu.h) instead of the
     // status text, laid out for an output of outputWidth x outputHeight pixels. highlightedItem
-    // is the pressed item or -1. Clearing it brings the status text back.
-    void setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem);
+    // is the pressed item or -1. Clearing it brings the status text back. Without the menu,
+    // handleVisible draws the small corner handle in the bottom-left corner, with the status
+    // text (if any) to its right.
+    void setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible);
     SDL_Color getOverlayColor(OverlayType type);
     int getOverlayFontSize(OverlayType type);
     void setOutputSize(int width, int height);
@@ -104,7 +106,7 @@ private:
     QByteArray m_FontData;
     std::shared_ptr<const TimingGraphSnapshot> m_TimingGraph;
     bool m_StatsEnabled = false, m_TimingGraphEnabled = false;
-    bool m_TouchMenuActive = false;
+    bool m_TouchMenuActive = false, m_TouchHandleVisible = false;
     int m_TouchMenuWidth = 0, m_TouchMenuHeight = 0, m_TouchMenuHighlight = -1;
     std::mutex m_StateLock;
     std::string m_StatusMessages[static_cast<int>(StatusSource::Count)];

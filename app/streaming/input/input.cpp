@@ -641,16 +641,22 @@ void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int out
 {
     auto& overlays = Session::get()->getOverlayManager();
 
-    switch (event.type) {
-    case touchmenu::EventType::Open:
+    if (event.type == touchmenu::EventType::Open) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Touch menu opened");
         releaseTouchesForTouchMenu();
-        overlays.setTouchMenu(true, outputWidth, outputHeight, -1);
-        break;
+    }
+    else if (event.type == touchmenu::EventType::Close) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Touch menu closed");
+    }
 
-    case touchmenu::EventType::Activate:
-        overlays.setTouchMenu(false, 0, 0, -1);
+    // Menu (with the pressed item highlight) or corner handle. Nothing is
+    // redrawn when the state did not change.
+    overlays.setTouchMenu(m_TouchMenu.isOpen(), outputWidth, outputHeight,
+                          m_TouchMenu.highlightedItem(), m_TouchMenu.handleVisible());
+
+    if (event.type == touchmenu::EventType::Activate) {
         if (event.item == touchmenu::ItemDisconnect) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Touch menu: disconnect");
@@ -661,20 +667,6 @@ void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int out
                         "Touch menu: toggle statistics");
             performSpecialKeyCombo(KeyComboToggleStatsOverlay);
         }
-        break;
-
-    case touchmenu::EventType::Close:
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Touch menu closed");
-        overlays.setTouchMenu(false, 0, 0, -1);
-        break;
-
-    case touchmenu::EventType::None:
-        if (m_TouchMenu.isOpen()) {
-            // Pressed item highlight
-            overlays.setTouchMenu(true, outputWidth, outputHeight, m_TouchMenu.highlightedItem());
-        }
-        break;
     }
 
     updateTouchMenuTimer();

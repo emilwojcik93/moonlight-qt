@@ -109,6 +109,45 @@ SDL_Surface* renderTouchMenu(TTF_Font* font, const touchmenu::Layout& layout, in
     return surface;
 }
 
+// Touch menu corner handle: a dark square with a three-bar menu glyph at the
+// bottom-left corner of the surface, the optional status text (consumed) to its
+// right, bottom aligned. The handle is exactly side x side pixels at the output's
+// bottom-left corner, which is where the input handler hit-tests it.
+SDL_Surface* composeTouchHandle(SDL_Surface* text, int side)
+{
+    const int gap = std::max(8, side / 4);
+    const int width = side + (text ? gap + text->w : 0);
+    const int height = std::max(side, text ? text->h : 0);
+    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surface) return text;
+    SDL_FillRect(surface, nullptr, 0);
+
+    const auto fill = [&](const SDL_Rect& rect, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
+        SDL_Rect copy = rect;
+        SDL_FillRect(surface, &copy, SDL_MapRGBA(surface->format, r, g, b, a));
+    };
+    const int top = height - side;
+    const int frame = std::max(2, side / 24);
+    fill({0, top, side, side}, 235, 240, 245, 255);
+    fill({frame, top + frame, side - 2 * frame, side - 2 * frame}, 12, 16, 24, 225);
+
+    const int barHeight = std::max(2, side / 10);
+    const int barWidth = side / 2;
+    const int glyphHeight = 3 * barHeight + 2 * barHeight;
+    const int barX = (side - barWidth) / 2;
+    const int barY = top + (side - glyphHeight) / 2;
+    for (int i = 0; i < 3; ++i) {
+        fill({barX, barY + i * 2 * barHeight, barWidth, barHeight}, 255, 255, 255, 255);
+    }
+
+    if (text) {
+        SDL_Rect at{side + gap, height - text->h, text->w, text->h};
+        SDL_BlitSurface(text, nullptr, surface, &at);
+        SDL_FreeSurface(text);
+    }
+    return surface;
+}
+
 // CPU rasterization runs on the overlay worker. All backends receive the same
 // composed surface through their current overlay upload path; no GPU API work
 // or text rendering happens on the frame path.
@@ -520,8 +559,8 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
         if (!combined.empty() && !host.empty()) combined += "\n\n";
         combined += host;
         auto& overlay = m_Overlays[OverlayStatusUpdate];
-        // The overlay stays visible while the touch menu replaces the text
-        const bool show = !combined.empty() || m_TouchMenuActive;
+        // The overlay stays visible while the touch menu or the handle is drawn
+        const bool show = !combined.empty() || m_TouchMenuActive || m_TouchHandleVisible;
         if (combined == overlay.text && overlay.enabled == show) return;
         SDL_utf8strlcpy(overlay.text, combined.c_str(), sizeof(overlay.text));
         overlay.enabled = show;
@@ -532,22 +571,26 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
     m_WorkReady.notify_one();
 }
 
-void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem)
+void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible)
 {
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
+        // The handle is never drawn together with the menu
+        handleVisible = handleVisible && !active;
         if (!active) {
-            outputWidth = outputHeight = 0;
             highlightedItem = -1;
+            if (!handleVisible) outputWidth = outputHeight = 0;
         }
-        if (m_TouchMenuActive == active && m_TouchMenuWidth == outputWidth &&
-                m_TouchMenuHeight == outputHeight && m_TouchMenuHighlight == highlightedItem) return;
+        if (m_TouchMenuActive == active && m_TouchHandleVisible == handleVisible &&
+                m_TouchMenuWidth == outputWidth && m_TouchMenuHeight == outputHeight &&
+                m_TouchMenuHighlight == highlightedItem) return;
         m_TouchMenuActive = active;
+        m_TouchHandleVisible = handleVisible;
         m_TouchMenuWidth = outputWidth;
         m_TouchMenuHeight = outputHeight;
         m_TouchMenuHighlight = highlightedItem;
         auto& overlay = m_Overlays[OverlayStatusUpdate];
-        overlay.enabled = active || overlay.text[0] != 0;
+        overlay.enabled = active || handleVisible || overlay.text[0] != 0;
         ++overlay.revision;
         overlay.dirty = true;
         overlay.queued = std::chrono::steady_clock::now();
@@ -683,8 +726,8 @@ void OverlayManager::run()
     for (;;) {
         OverlayType type;
         char text[1024];
-        bool enabled, drawText, drawMenu;
-        int fontSize, outputWidth, outputHeight, menuHighlight;
+        bool enabled, drawText, drawMenu, drawHandle;
+        int fontSize, outputWidth, outputHeight, menuHighlight, handleSide = 0;
         touchmenu::Layout menuLayout;
         std::shared_ptr<const TimingGraphSnapshot> graph;
         uint64_t revision;
@@ -715,6 +758,11 @@ void OverlayManager::run()
                 if (menuLayout.valid) fontSize = menuLayout.fontPixels;
                 else drawMenu = false; // Output size unknown or too small
             }
+            drawHandle = enabled && type == OverlayStatusUpdate && !drawMenu && m_TouchHandleVisible && !m_TouchMenuActive;
+            if (drawHandle) {
+                handleSide = touchmenu::handleSize(m_TouchMenuWidth, m_TouchMenuHeight);
+                if (handleSide <= 0) drawHandle = false;
+            }
             outputWidth = overlay.outputWidth;
             outputHeight = overlay.outputHeight;
             revision = overlay.revision;
@@ -726,7 +774,7 @@ void OverlayManager::run()
         auto& overlay = m_Overlays[type];
         SDL_Surface* surface = nullptr;
         const bool drawGraph = enabled && graph && graph->points.size() >= 2;
-        if (drawText || drawGraph || drawMenu) {
+        if (drawText || drawGraph || drawMenu || drawHandle) {
             if ((!overlay.font || rasterFontSizes[type] != fontSize) && !m_FontData.isEmpty()) {
                 auto resized = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()), 1, fontSize);
                 if (!resized) continue;
@@ -748,6 +796,7 @@ void OverlayManager::run()
                 if (!surface) continue; // Keep the last successful overlay on failure.
             }
             if (drawGraph && overlay.font) surface = composeTimingGraph(overlay.font, surface, *graph, scale);
+            if (drawHandle) surface = composeTouchHandle(surface, handleSide);
         }
         if (type == OverlayDebug) surface = fitToOutput(surface, outputWidth, outputHeight);
         const auto rasterized = Clock::now();
