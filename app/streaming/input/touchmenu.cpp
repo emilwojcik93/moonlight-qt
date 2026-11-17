@@ -25,7 +25,7 @@ const char* itemLabel(int item)
     return "";
 }
 
-Layout computeLayout(int outputWidth, int outputHeight)
+Layout computeLayout(int outputWidth, int outputHeight, Side side)
 {
     Layout layout;
     if (outputWidth <= 0 || outputHeight <= 0) {
@@ -51,12 +51,16 @@ Layout computeLayout(int outputWidth, int outputHeight)
     }
 
     int itemWidth = surfaceWidth - 2 * pad;
+    int panelX = side == Side::Right ? outputWidth - surfaceWidth : 0;
     layout.valid = true;
-    layout.surfaceWidth = surfaceWidth;
+    layout.panelWidth = surfaceWidth;
+    layout.panelX = panelX;
+    layout.surfaceWidth = side == Side::Right ? outputWidth : surfaceWidth;
     layout.surfaceHeight = surfaceHeight;
+    layout.originY = outputHeight - surfaceHeight;
     layout.border = std::max(2, itemHeight / 24);
     for (int i = 0; i < ItemCount; i++) {
-        layout.items[i].x = pad;
+        layout.items[i].x = panelX + pad;
         layout.items[i].y = pad + i * (itemHeight + pad);
         layout.items[i].w = itemWidth;
         layout.items[i].h = itemHeight;
@@ -139,8 +143,10 @@ void TouchMenu::noteActivity(uint32_t nowMs)
     m_LastActivityMs = nowMs;
 }
 
-void TouchMenu::openMenu(uint32_t nowMs)
+void TouchMenu::openMenu(uint32_t nowMs, Side side)
 {
+    cancelEdge();
+    m_Side = side == Side::Right && !m_RightPanelAllowed ? Side::Left : side;
     m_Armed = false;
     m_Open = true;
     m_HandleVisible = false;
@@ -152,6 +158,7 @@ void TouchMenu::openMenu(uint32_t nowMs)
 
 void TouchMenu::closeMenu()
 {
+    cancelEdge();
     m_Open = false;
     m_HandleVisible = false;
     m_Armed = false;
@@ -175,7 +182,7 @@ int TouchMenu::gestureFingerCount() const
 
 int TouchMenu::hitTest(float x, float y) const
 {
-    Layout layout = computeLayout(m_OutputWidth, m_OutputHeight);
+    Layout layout = computeLayout(m_OutputWidth, m_OutputHeight, m_Side);
     if (!layout.valid) {
         return -1;
     }
@@ -201,11 +208,58 @@ int TouchMenu::highlightedItem() const
     return -1;
 }
 
+// Checks the running edge swipe attempt. Returns true when it completes.
+bool TouchMenu::evaluateEdge(uint32_t nowMs)
+{
+    if (!m_EdgeActive) {
+        return false;
+    }
+
+    if ((uint32_t)(nowMs - m_EdgeFirstMs) > EdgeSwipeWindowMs) {
+        cancelEdge();
+        return false;
+    }
+
+    const Finger* a = nullptr;
+    const Finger* b = nullptr;
+    for (const auto& f : m_Fingers) {
+        if (f.id == m_EdgeA) a = &f;
+        if (m_EdgeHaveB && f.id == m_EdgeB) b = &f;
+    }
+    if (a == nullptr || (m_EdgeHaveB && b == nullptr)) {
+        cancelEdge();
+        return false;
+    }
+
+    float w = m_OutputWidth > 0 ? (float)m_OutputWidth : 1.0f;
+    float h = m_OutputHeight > 0 ? (float)m_OutputHeight : 1.0f;
+    float rightLimit = MoveFraction * std::min(w, h) / w; // Normalized x
+    const Finger* swipers[2] = { a, b };
+    bool complete = m_EdgeHaveB;
+    for (const Finger* f : swipers) {
+        if (f == nullptr) {
+            continue;
+        }
+        if (f->x - f->startX > rightLimit) {
+            cancelEdge();
+            return false;
+        }
+        if (f->startX - f->x < EdgeSwipeFraction) {
+            complete = false;
+        }
+    }
+    return complete;
+}
+
 Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
 {
     Event result;
 
-    // A repeated down for a known id replaces the old record
+    // A repeated down for a known id replaces the old record (the platform
+    // lost the old contact)
+    if (edgeFinger(id)) {
+        cancelEdge();
+    }
     m_Fingers.erase(std::remove_if(m_Fingers.begin(), m_Fingers.end(),
                                    [id](const Finger& f) { return f.id == id; }),
                     m_Fingers.end());
@@ -232,6 +286,27 @@ Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
 
     noteActivity(nowMs);
     result.swallow = onHandle;
+
+    // Edge swipe: first finger in the zone starts an attempt, a second one
+    // within the pair time joins it, anything else ends it.
+    bool inEdgeZone = x >= 1.0f - EdgeZoneFraction;
+    int gestureFingers = gestureFingerCount();
+    if (m_EdgeActive) {
+        if (!m_EdgeHaveB && gestureFingers == 2 && inEdgeZone && !onHandle &&
+                (uint32_t)(nowMs - m_EdgeFirstMs) <= EdgePairMs) {
+            m_EdgeHaveB = true;
+            m_EdgeB = id;
+        }
+        else {
+            cancelEdge();
+        }
+    }
+    else if (gestureFingers == 1 && inEdgeZone && !onHandle) {
+        m_EdgeActive = true;
+        m_EdgeHaveB = false;
+        m_EdgeA = id;
+        m_EdgeFirstMs = nowMs;
+    }
 
     if (!m_Armed && !m_Cancelled && gestureFingerCount() >= HoldFingers) {
         // Fingers that already travelled too far (a scroll in progress)
@@ -282,6 +357,13 @@ Event TouchMenu::fingerMove(int64_t id, float x, float y, uint32_t nowMs)
         m_Armed = false;
         m_Cancelled = true;
     }
+
+    if (edgeFinger(id) && evaluateEdge(nowMs)) {
+        openMenu(nowMs, Side::Right);
+        result.type = EventType::Open;
+        result.side = m_Side;
+        result.swallow = true;
+    }
     return result;
 }
 
@@ -327,14 +409,18 @@ Event TouchMenu::fingerUp(int64_t id, float x, float y, uint32_t nowMs)
     }
 
     result.swallow = wasIgnored;
+    if (edgeFinger(id)) {
+        cancelEdge();
+    }
     if (gestureFingerCount() < HoldFingers) {
         m_Armed = false;
         m_Cancelled = false;
     }
 
     if (tappedHandle) {
-        openMenu(nowMs);
+        openMenu(nowMs, Side::Left);
         result.type = EventType::Open;
+        result.side = m_Side;
         result.swallow = true;
     }
     else {
@@ -364,6 +450,9 @@ Event TouchMenu::fingerCancel(int64_t id, uint32_t nowMs)
     }
 
     result.swallow = wasIgnored;
+    if (edgeFinger(id)) {
+        cancelEdge();
+    }
     if (gestureFingerCount() < HoldFingers) {
         m_Armed = false;
         m_Cancelled = false;
@@ -383,9 +472,14 @@ Event TouchMenu::tick(uint32_t nowMs)
             result.swallow = true;
         }
     }
+    else if (m_EdgeActive && (uint32_t)(nowMs - m_EdgeFirstMs) > EdgeSwipeWindowMs) {
+        // Edge swipe timed out. The remaining timers are checked on the next tick.
+        cancelEdge();
+    }
     else if (m_Armed && (uint32_t)(nowMs - m_ArmedAtMs) >= HoldMs) {
-        openMenu(nowMs);
+        openMenu(nowMs, Side::Left);
         result.type = EventType::Open;
+        result.side = m_Side;
         result.swallow = true;
     }
     else if (m_HandleVisible && (uint32_t)(nowMs - m_LastActivityMs) >= HandleHideMs) {
@@ -397,12 +491,14 @@ Event TouchMenu::tick(uint32_t nowMs)
                         m_Fingers.end());
         m_Armed = false;
         m_Cancelled = false;
+        cancelEdge();
     }
     return result;
 }
 
 void TouchMenu::reset()
 {
+    cancelEdge();
     m_Fingers.clear();
     m_Open = false;
     m_HandleVisible = false;

@@ -82,10 +82,12 @@ SDL_Surface* renderTouchMenu(TTF_Font* font, const touchmenu::Layout& layout, in
         SDL_FillRect(surface, &copy, SDL_MapRGBA(surface->format, r, g, b, a));
     };
 
-    // Panel with a light frame
+    // Fully transparent (the right panel's surface is output-wide), then the
+    // panel with a light frame
     const int frame = layout.border;
-    fill({0, 0, surface->w, surface->h}, 235, 240, 245, 255);
-    fill({frame, frame, surface->w - 2 * frame, surface->h - 2 * frame}, 12, 16, 24, 225);
+    SDL_FillRect(surface, nullptr, 0);
+    fill({layout.panelX, 0, layout.panelWidth, surface->h}, 235, 240, 245, 255);
+    fill({layout.panelX + frame, frame, layout.panelWidth - 2 * frame, surface->h - 2 * frame}, 12, 16, 24, 225);
 
     for (int i = 0; i < touchmenu::ItemCount; ++i) {
         const touchmenu::Rect& item = layout.items[i];
@@ -571,10 +573,18 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
     m_WorkReady.notify_one();
 }
 
-void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible)
+bool OverlayManager::supportsWideOverlay()
+{
+    std::lock_guard<std::mutex> lock(m_StateLock);
+    return m_WideOverlaySupported;
+}
+
+void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible, bool rightSide)
 {
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
+        // Same fallback as the input side: no wide surface, no right panel
+        rightSide = rightSide && active && m_WideOverlaySupported;
         // The handle is never drawn together with the menu
         handleVisible = handleVisible && !active;
         if (!active) {
@@ -582,10 +592,12 @@ void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight
             if (!handleVisible) outputWidth = outputHeight = 0;
         }
         if (m_TouchMenuActive == active && m_TouchHandleVisible == handleVisible &&
+                m_TouchMenuRight == rightSide &&
                 m_TouchMenuWidth == outputWidth && m_TouchMenuHeight == outputHeight &&
                 m_TouchMenuHighlight == highlightedItem) return;
         m_TouchMenuActive = active;
         m_TouchHandleVisible = handleVisible;
+        m_TouchMenuRight = rightSide;
         m_TouchMenuWidth = outputWidth;
         m_TouchMenuHeight = outputHeight;
         m_TouchMenuHighlight = highlightedItem;
@@ -707,6 +719,7 @@ void OverlayManager::setOverlayRenderer(IOverlayRenderer* renderer)
         std::lock_guard<std::mutex> stateLock(m_StateLock);
         m_Renderer = renderer;
         m_HaveRenderer = renderer != nullptr;
+        m_WideOverlaySupported = renderer == nullptr || renderer->supportsWideOverlay();
         for (auto& overlay : m_Overlays) {
             ++overlay.revision;
             overlay.dirty = m_HaveRenderer;
@@ -754,7 +767,8 @@ void OverlayManager::run()
             fontSize = overlay.fontSize;
             menuHighlight = m_TouchMenuHighlight;
             if (drawMenu) {
-                menuLayout = touchmenu::computeLayout(m_TouchMenuWidth, m_TouchMenuHeight);
+                menuLayout = touchmenu::computeLayout(m_TouchMenuWidth, m_TouchMenuHeight,
+                                                      m_TouchMenuRight ? touchmenu::Side::Right : touchmenu::Side::Left);
                 if (menuLayout.valid) fontSize = menuLayout.fontPixels;
                 else drawMenu = false; // Output size unknown or too small
             }

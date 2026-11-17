@@ -29,6 +29,11 @@ public:
 
     virtual void notifyOverlayUpdated(OverlayType type) = 0;
 
+    // Whether the renderer draws an output-wide surface that is mostly fully
+    // transparent correctly (the touch menu's right-hand panel needs one). When it
+    // does not, the menu opens on the left, where the surface is only the panel.
+    virtual bool supportsWideOverlay() const { return true; }
+
     struct UpdateTiming {
         OverlayType type;
         uint64_t revision;
@@ -75,8 +80,12 @@ public:
     // status text, laid out for an output of outputWidth x outputHeight pixels. highlightedItem
     // is the pressed item or -1. Clearing it brings the status text back. Without the menu,
     // handleVisible draws the small corner handle in the bottom-left corner, with the status
-    // text (if any) to its right.
-    void setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible);
+    // text (if any) to its right. rightSide puts the menu panel at the right end of an
+    // output-wide surface instead of at the left.
+    void setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible, bool rightSide);
+
+    // False when the active renderer cannot draw the wide transparent surface of the right panel
+    bool supportsWideOverlay();
     SDL_Color getOverlayColor(OverlayType type);
     int getOverlayFontSize(OverlayType type);
     void setOutputSize(int width, int height);
@@ -106,7 +115,8 @@ private:
     QByteArray m_FontData;
     std::shared_ptr<const TimingGraphSnapshot> m_TimingGraph;
     bool m_StatsEnabled = false, m_TimingGraphEnabled = false;
-    bool m_TouchMenuActive = false, m_TouchHandleVisible = false;
+    bool m_TouchMenuActive = false, m_TouchHandleVisible = false, m_TouchMenuRight = false;
+    bool m_WideOverlaySupported = true;
     int m_TouchMenuWidth = 0, m_TouchMenuHeight = 0, m_TouchMenuHighlight = -1;
     std::mutex m_StateLock;
     std::string m_StatusMessages[static_cast<int>(StatusSource::Count)];

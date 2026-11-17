@@ -654,7 +654,8 @@ void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int out
     // Menu (with the pressed item highlight) or corner handle. Nothing is
     // redrawn when the state did not change.
     overlays.setTouchMenu(m_TouchMenu.isOpen(), outputWidth, outputHeight,
-                          m_TouchMenu.highlightedItem(), m_TouchMenu.handleVisible());
+                          m_TouchMenu.highlightedItem(), m_TouchMenu.handleVisible(),
+                          m_TouchMenu.side() == touchmenu::Side::Right);
 
     if (event.type == touchmenu::EventType::Activate) {
         if (event.item == touchmenu::ItemDisconnect) {
@@ -677,6 +678,7 @@ bool SdlInputHandler::handleTouchMenuFingerEvent(SDL_TouchFingerEvent* event)
     int outputWidth, outputHeight;
     getTouchMenuOutputSize(&outputWidth, &outputHeight);
     m_TouchMenu.setOutputSize(outputWidth, outputHeight);
+    m_TouchMenu.setRightPanelAllowed(Session::get()->getOverlayManager().supportsWideOverlay());
 
     touchmenu::Event result;
     switch (event->type) {
@@ -706,6 +708,7 @@ void SdlInputHandler::handleTouchMenuTick()
     int outputWidth, outputHeight;
     getTouchMenuOutputSize(&outputWidth, &outputHeight);
     m_TouchMenu.setOutputSize(outputWidth, outputHeight);
+    m_TouchMenu.setRightPanelAllowed(Session::get()->getOverlayManager().supportsWideOverlay());
 
     applyTouchMenuEvent(m_TouchMenu.tick(SDL_GetTicks()), outputWidth, outputHeight);
 }

@@ -33,12 +33,22 @@ void liftHoldFingers(TouchMenu& m, uint32_t t)
 }
 
 // Center of an item in normalized window coordinates
-void itemCenter(int outW, int outH, int item, float& x, float& y)
+void itemCenter(int outW, int outH, int item, float& x, float& y, Side side = Side::Left)
 {
-    Layout l = computeLayout(outW, outH);
-    const Rect& r = l.items[item];
+    Layout l = computeLayout(outW, outH, side);
+    Rect r = l.itemInOutput(item);
     x = (r.x + r.w / 2.0f) / outW;
-    y = (outH - l.surfaceHeight + r.y + r.h / 2.0f) / outH;
+    y = (r.y + r.h / 2.0f) / outH;
+}
+
+// Two fingers land at the right edge (the second 100 ms later) and both move
+// left by 0.12 of the width. Returns the event of the last move.
+Event edgeSwipe(TouchMenu& m, uint32_t t0, uint32_t gapMs = 100, float dx = 0.12f)
+{
+    m.fingerDown(1, 0.97f, 0.50f, t0);
+    m.fingerDown(2, 0.98f, 0.60f, t0 + gapMs);
+    m.fingerMove(1, 0.97f - dx, 0.50f, t0 + gapMs + 100);
+    return m.fingerMove(2, 0.98f - dx, 0.60f, t0 + gapMs + 200);
 }
 
 } // namespace
@@ -66,6 +76,7 @@ private slots:
         QVERIFY(!m.isOpen());
         Event e = m.tick(1000 + HoldMs);
         QCOMPARE(e.type, EventType::Open);
+        QVERIFY(e.side == Side::Left);
         QVERIFY(e.swallow);
         QVERIFY(m.isOpen());
     }
@@ -416,6 +427,7 @@ private slots:
         QVERIFY(m.fingerDown(9, x, y, 200).swallow);
         Event e = m.fingerUp(9, x, y, 300);
         QCOMPARE(e.type, EventType::Open);
+        QVERIFY(e.side == Side::Left);
         QVERIFY(e.swallow);
         QVERIFY(m.isOpen());
         QVERIFY(!m.handleVisible());
@@ -528,6 +540,232 @@ private slots:
         QCOMPARE(r.h, 56);
         QCOMPARE(r.y, 720 - 56);
         QCOMPARE(handleSize(1280, 0), 0);
+    }
+
+    void edgeSwipeOpensRight()
+    {
+        m.fingerDown(1, 0.97f, 0.50f, 1000);
+        QVERIFY(!m.fingerDown(2, 0.98f, 0.60f, 1100).swallow);
+        // Touches reach the host until the menu opens
+        QVERIFY(!m.fingerMove(1, 0.90f, 0.50f, 1200).swallow);
+        Event e = m.fingerMove(1, 0.85f, 0.50f, 1300);
+        QCOMPARE(e.type, EventType::None);
+        e = m.fingerMove(2, 0.86f, 0.60f, 1400);
+        QCOMPARE(e.type, EventType::Open);
+        QVERIFY(e.side == Side::Right);
+        QVERIFY(e.swallow);
+        QVERIFY(m.isOpen());
+        QVERIFY(m.side() == Side::Right);
+    }
+
+    void edgeSwipeAtExactTimingLimitsOpens()
+    {
+        // Second finger exactly 300 ms later, completion exactly 1200 ms after the first
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        m.fingerDown(2, 0.98f, 0.6f, EdgePairMs);
+        m.fingerMove(1, 0.80f, 0.5f, 500);
+        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs).type, EventType::Open);
+    }
+
+    void oneFingerFromEdgeDoesNotOpen()
+    {
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        QVERIFY(!m.fingerMove(1, 0.60f, 0.5f, 200).swallow);
+        QCOMPARE(m.fingerMove(1, 0.30f, 0.5f, 400).type, EventType::None);
+        QVERIFY(!m.isOpen());
+        QVERIFY(!m.fingerUp(1, 0.30f, 0.5f, 500).swallow);
+    }
+
+    void edgeSwipeNeedsBothFingersInEdgeZone()
+    {
+        m.fingerDown(1, 0.85f, 0.5f, 0);
+        m.fingerDown(2, 0.86f, 0.6f, 100);
+        m.fingerMove(1, 0.60f, 0.5f, 200);
+        QCOMPARE(m.fingerMove(2, 0.61f, 0.6f, 300).type, EventType::None);
+        QVERIFY(!m.isOpen());
+
+        // Only the second finger outside the zone
+        TouchMenu n;
+        n.setOutputSize(1280, 720);
+        n.fingerDown(1, 0.97f, 0.5f, 0);
+        n.fingerDown(2, 0.85f, 0.6f, 100);
+        n.fingerMove(1, 0.70f, 0.5f, 200);
+        QCOMPARE(n.fingerMove(2, 0.60f, 0.6f, 300).type, EventType::None);
+    }
+
+    void edgeSwipeSecondFingerTooLate()
+    {
+        QCOMPARE(edgeSwipe(m, 0, EdgePairMs + 1).type, EventType::None);
+        QVERIFY(!m.isOpen());
+    }
+
+    void edgeSwipeNotFarEnough()
+    {
+        QCOMPARE(edgeSwipe(m, 0, 100, 0.07f).type, EventType::None);
+        QVERIFY(!m.isOpen());
+        // One finger far enough is not enough either
+        TouchMenu n;
+        n.setOutputSize(1280, 720);
+        n.fingerDown(1, 0.97f, 0.5f, 0);
+        n.fingerDown(2, 0.98f, 0.6f, 100);
+        n.fingerMove(1, 0.80f, 0.5f, 200);
+        QCOMPARE(n.fingerMove(2, 0.95f, 0.6f, 300).type, EventType::None);
+    }
+
+    void edgeSwipeCancelledWhenAFingerLiftsEarly()
+    {
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        m.fingerDown(2, 0.98f, 0.6f, 100);
+        m.fingerMove(1, 0.84f, 0.5f, 200);
+        m.fingerUp(1, 0.84f, 0.5f, 250);
+        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 300).type, EventType::None);
+        QVERIFY(!m.isOpen());
+    }
+
+    void edgeSwipeTimesOut()
+    {
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        m.fingerDown(2, 0.98f, 0.6f, 100);
+        m.fingerMove(1, 0.80f, 0.5f, 1000);
+        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs + 1).type, EventType::None);
+        QVERIFY(!m.isOpen());
+
+        // Same through the tick, then the fingers keep moving
+        TouchMenu n;
+        n.setOutputSize(1280, 720);
+        n.fingerDown(1, 0.97f, 0.5f, 0);
+        n.fingerDown(2, 0.98f, 0.6f, 100);
+        QCOMPARE(n.tick(EdgeSwipeWindowMs + 1).type, EventType::None);
+        n.fingerMove(1, 0.80f, 0.5f, EdgeSwipeWindowMs + 100);
+        QCOMPARE(n.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs + 200).type, EventType::None);
+    }
+
+    void edgeSwipeCancelledByRightwardMovement()
+    {
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        m.fingerDown(2, 0.98f, 0.6f, 100);
+        // 3 % of the shorter side (720) is 21.6 px = 0.017 of the width
+        m.fingerMove(1, 0.99f, 0.5f, 200);
+        m.fingerMove(1, 0.80f, 0.5f, 300);
+        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 400).type, EventType::None);
+        QVERIFY(!m.isOpen());
+    }
+
+    void edgeSwipeCancelledByThirdFinger()
+    {
+        m.fingerDown(1, 0.97f, 0.5f, 0);
+        m.fingerDown(2, 0.98f, 0.6f, 100);
+        m.fingerDown(3, 0.50f, 0.5f, 150);
+        m.fingerMove(1, 0.80f, 0.5f, 200);
+        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 300).type, EventType::None);
+        QVERIFY(!m.isOpen());
+    }
+
+    void edgeSwipeWorksAgainAfterFingersLift()
+    {
+        QCOMPARE(edgeSwipe(m, 0, EdgePairMs + 1).type, EventType::None);
+        m.fingerUp(1, 0.85f, 0.5f, 700);
+        m.fingerUp(2, 0.86f, 0.6f, 700);
+        QCOMPARE(edgeSwipe(m, 2000).type, EventType::Open);
+    }
+
+    void edgeSwipeFallsBackToLeftWithoutWideOverlay()
+    {
+        m.setRightPanelAllowed(false);
+        Event e = edgeSwipe(m, 0);
+        QCOMPARE(e.type, EventType::Open);
+        QVERIFY(e.side == Side::Left);
+        QVERIFY(m.side() == Side::Left);
+    }
+
+    void edgeSwipeFingersDoNotActivateOnLift()
+    {
+        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
+        // Lift both fingers over menu items
+        float x, y;
+        itemCenter(1280, 720, ItemDisconnect, x, y, Side::Right);
+        QVERIFY(m.fingerMove(1, x, y, 600).swallow);
+        Event e = m.fingerUp(1, x, y, 650);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(e.swallow);
+        itemCenter(1280, 720, ItemToggleStats, x, y, Side::Right);
+        e = m.fingerUp(2, x, y, 650);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(e.swallow);
+        QVERIFY(m.isOpen());
+    }
+
+    void rightPanelItemsActivate()
+    {
+        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
+        m.fingerUp(1, 0.85f, 0.5f, 600);
+        m.fingerUp(2, 0.86f, 0.6f, 600);
+        for (int i = 0; i < ItemCount; i++) {
+            float x, y;
+            itemCenter(1280, 720, i, x, y, Side::Right);
+            QCOMPARE(m.hitTest(x, y), i);
+        }
+        float x, y;
+        itemCenter(1280, 720, ItemToggleStats, x, y, Side::Right);
+        m.fingerDown(7, x, y, 700);
+        QCOMPARE(m.highlightedItem(), (int)ItemToggleStats);
+        Event e = m.fingerUp(7, x, y, 750);
+        QCOMPARE(e.type, EventType::Activate);
+        QCOMPARE(e.item, (int)ItemToggleStats);
+        QVERIFY(!m.isOpen());
+    }
+
+    void rightPanelTransparentPartClosesMenu()
+    {
+        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
+        m.fingerUp(1, 0.85f, 0.5f, 600);
+        m.fingerUp(2, 0.86f, 0.6f, 600);
+        // Where the left panel would be: transparent surface, outside the panel
+        float x, y;
+        itemCenter(1280, 720, ItemDisconnect, x, y, Side::Left);
+        QCOMPARE(m.hitTest(x, y), -1);
+        m.fingerDown(7, x, y, 700);
+        QCOMPARE(m.fingerUp(7, x, y, 750).type, EventType::Close);
+        QVERIFY(!m.isOpen());
+    }
+
+    void layoutRightPanel_data()
+    {
+        QTest::addColumn<int>("w");
+        QTest::addColumn<int>("h");
+        QTest::newRow("1920x1280") << 1920 << 1280;
+        QTest::newRow("1280x720") << 1280 << 720;
+    }
+
+    void layoutRightPanel()
+    {
+        QFETCH(int, w);
+        QFETCH(int, h);
+        Layout left = computeLayout(w, h, Side::Left);
+        Layout l = computeLayout(w, h, Side::Right);
+        QVERIFY(l.valid);
+        QCOMPARE(l.surfaceWidth, w);
+        QCOMPARE(l.surfaceHeight, left.surfaceHeight);
+        QCOMPARE(l.panelWidth, left.panelWidth);
+        QCOMPARE(l.panelX + l.panelWidth, w);
+        QCOMPARE(l.originY, h - l.surfaceHeight);
+
+        const int minHeight = (int)std::ceil(h * MinItemHeightFraction);
+        for (int i = 0; i < ItemCount; i++) {
+            const Rect& r = l.items[i];
+            QVERIFY(r.h >= minHeight);
+            // Inside the panel
+            QVERIFY(r.x >= l.panelX && r.x + r.w <= l.panelX + l.panelWidth);
+            QVERIFY(r.y >= 0 && r.y + r.h <= l.surfaceHeight);
+            // Inside the output
+            Rect o = l.itemInOutput(i);
+            QVERIFY(o.x >= 0 && o.x + o.w <= w);
+            QVERIFY(o.y >= 0 && o.y + o.h <= h);
+            for (int j = i + 1; j < ItemCount; j++) {
+                const Rect& q = l.items[j];
+                QVERIFY(r.y + r.h <= q.y || q.y + q.h <= r.y);
+            }
+        }
     }
 
     void layoutInvalidOutput()
