@@ -184,6 +184,8 @@ SOURCES += \
     backend/identitymanager.cpp \
     backend/nvcomputer.cpp \
     backend/nvhttp.cpp \
+    backend/postureclassifier.cpp \
+    backend/posturedetector.cpp \
     backend/pyrowaveudpprobe.cpp \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
@@ -234,6 +236,8 @@ SOURCES += \
     wm.cpp
 
 HEADERS += \
+    backend/postureclassifier.h \
+    backend/posturedetector.h \
     streaming/video/videothreadpriority.h \
     streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
@@ -592,6 +596,13 @@ linux:!disable-kwin-scanout-guard:packagesExist(wayland-client) {
 }
 !disable-h264bitstream {
     DEFINES += HAVE_H264BITSTREAM
+}
+
+# Tablet-mode detection through KWin's TabletModeManager over D-Bus. Builds
+# without QtDBus still work; they just lack the OS tablet-mode signal.
+linux:!disable-posture-dbus:qtHaveModule(dbus) {
+    QT += dbus
+    DEFINES += HAVE_POSTURE_DBUS
 }
 
 # PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
