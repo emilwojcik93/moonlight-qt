@@ -1,0 +1,16 @@
+---
+name: Posture - Windows build
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - ci/posture-windows
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-win-mac.yml
+    with:
+      ci_version: 6.2.0-posture.1
+      build_macos: false
