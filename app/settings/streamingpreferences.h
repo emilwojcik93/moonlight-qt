@@ -160,6 +160,9 @@ public:
         POSTURE_AUTO,
         POSTURE_ALWAYS_TABLET,
         POSTURE_NEVER,
+        // Appended so stored values keep their meaning
+        POSTURE_ALWAYS_HANDHELD,
+        POSTURE_ALWAYS_DESKTOP,
     };
     Q_ENUM(PostureMode);
 

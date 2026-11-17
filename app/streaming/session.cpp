@@ -1813,6 +1813,10 @@ static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
         return posture::Mode::AlwaysTablet;
     case StreamingPreferences::POSTURE_NEVER:
         return posture::Mode::Never;
+    case StreamingPreferences::POSTURE_ALWAYS_HANDHELD:
+        return posture::Mode::AlwaysHandheld;
+    case StreamingPreferences::POSTURE_ALWAYS_DESKTOP:
+        return posture::Mode::AlwaysDesktop;
     case StreamingPreferences::POSTURE_AUTO:
     default:
         return posture::Mode::Auto;

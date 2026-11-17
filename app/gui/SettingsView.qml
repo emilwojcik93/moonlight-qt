@@ -2732,6 +2732,8 @@ FocusScope {
                         model: ListModel {
                             ListElement { text: qsTr("Auto"); val: StreamingPreferences.POSTURE_AUTO }
                             ListElement { text: qsTr("Always tablet"); val: StreamingPreferences.POSTURE_ALWAYS_TABLET }
+                            ListElement { text: qsTr("Always handheld (gamepad)"); val: StreamingPreferences.POSTURE_ALWAYS_HANDHELD }
+                            ListElement { text: qsTr("Always desktop (keyboard)"); val: StreamingPreferences.POSTURE_ALWAYS_DESKTOP }
                             ListElement { text: qsTr("Never"); val: StreamingPreferences.POSTURE_NEVER }
                         }
                         Component.onCompleted: {

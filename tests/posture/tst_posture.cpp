@@ -139,7 +139,81 @@ private slots:
     }
 
     // Only tablet is ever produced; phone and handheld are parse-only here
-    void neverProducesPhoneOrHandheld()
+    void gamepadInTabletPostureIsHandheld()
+    {
+        Signals s = touchLaptop();
+        s.osTabletMode = true;
+        s.osTabletModeAvailable = true;
+        s.hasGamepad = true;
+        QCOMPARE(classify(s).cls, PostureClass::Handheld);
+
+        // Keyboard folded out: the controller does not change desktop mode
+        s.osTabletMode = false;
+        QCOMPARE(classify(s).cls, PostureClass::Laptop);
+
+        // No OS signal, nothing but touch and a controller
+        Signals bare = touchOnly();
+        bare.hasGamepad = true;
+        QCOMPARE(classify(bare).cls, PostureClass::Handheld);
+
+        // A controller on a machine without a touchscreen changes nothing
+        Signals desktop;
+        desktop.hasKeyboard = true;
+        desktop.hasPointer = true;
+        desktop.hasGamepad = true;
+        QCOMPARE(classify(desktop).cls, PostureClass::Desktop);
+    }
+
+    void handheldDeviceFormIsHandheld()
+    {
+        // ROG Ally style: touch, battery, a mouse device, OEM says handheld
+        Signals s = touchLaptop();
+        s.handheldForm = true;
+        const Result r = classify(s);
+        QCOMPARE(r.cls, PostureClass::Handheld);
+        QCOMPARE(r.confidence, Confidence::High);
+        QVERIFY(r.touch);
+
+        // Without a touchscreen the form alone is not enough
+        Signals noTouch;
+        noTouch.handheldForm = true;
+        QCOMPARE(classify(noTouch).cls, PostureClass::Desktop);
+    }
+
+    void overrideAlwaysHandheldAndAlwaysDesktop()
+    {
+        const Result handheld = resolve(touchLaptop(), Mode::AlwaysHandheld);
+        QCOMPARE(handheld.cls, PostureClass::Handheld);
+        QVERIFY(handheld.touch);
+
+        Signals tablet = touchOnly();
+        const Result desktop = resolve(tablet, Mode::AlwaysDesktop);
+        QCOMPARE(desktop.cls, PostureClass::Laptop);
+        QVERIFY(desktop.touch);
+    }
+
+    void hostModeMapping()
+    {
+        QCOMPARE(hostMode(PostureClass::Desktop), HostMode::Desktop);
+        QCOMPARE(hostMode(PostureClass::Laptop), HostMode::Desktop);
+        QCOMPARE(hostMode(PostureClass::Tablet), HostMode::Tablet);
+        QCOMPARE(hostMode(PostureClass::Phone), HostMode::Tablet);
+        QCOMPARE(hostMode(PostureClass::Handheld), HostMode::Handheld);
+    }
+
+    void gateSendsWhenAControllerMakesItAHandheld()
+    {
+        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
+        Payload tablet{true, PostureClass::Tablet, true};
+        Payload handheld{true, PostureClass::Handheld, true};
+        UpdateGate gate(tablet, milliseconds(3000));
+        QVERIFY(!gate.observe(handheld, t0));
+        const auto sent = gate.observe(handheld, t0 + std::chrono::seconds(4));
+        QVERIFY(sent.has_value());
+        QCOMPARE(sent->cls, PostureClass::Handheld);
+    }
+
+    void neverProducesPhoneOrHandheldWithoutGamepadSignals()
     {
         for (int bits = 0; bits < 64; ++bits) {
             Signals s;

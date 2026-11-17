@@ -40,6 +40,15 @@ enum class Mode {
     Auto,
     AlwaysTablet,
     Never,
+    AlwaysHandheld,
+    AlwaysDesktop,
+};
+
+// What the host does with a class; several classes share one mode.
+enum class HostMode {
+    Desktop,
+    Tablet,
+    Handheld,
 };
 
 struct Signals {
@@ -57,6 +66,12 @@ struct Signals {
 
     // Chassis says portable (laptop, convertible, detachable). Unset = unknown.
     std::optional<bool> portable;
+
+    // A game controller is present: built in (handheld) or attached.
+    bool hasGamepad = false;
+    // The OS or firmware declares a handheld gaming device (Windows DeviceForm,
+    // DMI product names of known handhelds).
+    bool handheldForm = false;
 };
 
 struct Result {
@@ -79,6 +94,16 @@ bool parseClassName(const std::string& name, PostureClass& out);
 inline bool isTouchPrimary(PostureClass cls)
 {
     return cls == PostureClass::Tablet || cls == PostureClass::Handheld || cls == PostureClass::Phone;
+}
+
+// The host mode a class maps to: handheld has its own, tablet and phone share
+// tablet, everything else is desktop.
+inline HostMode hostMode(PostureClass cls)
+{
+    if (cls == PostureClass::Handheld) {
+        return HostMode::Handheld;
+    }
+    return isTouchPrimary(cls) ? HostMode::Tablet : HostMode::Desktop;
 }
 
 // Classify from signals alone (the Auto path).
