@@ -2782,6 +2782,23 @@ FocusScope {
                 }
 
                 ConsoleCheckBox {
+                    id: touchMenuCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Touch menu (hold three fingers)")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.touchMenu
+                    onCheckedChanged: {
+                        StreamingPreferences.touchMenu = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Holding three fingers still on the stream for a moment opens a menu to disconnect or toggle statistics without a keyboard.")
+                }
+
+                ConsoleCheckBox {
                     id: swapMouseButtonsCheck
                     hoverEnabled: true
                     width: parent.width

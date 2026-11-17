@@ -2498,6 +2498,9 @@ void Session::exec()
             case SDL_CODE_STEAM_CONTROLLER_LINK:
                 m_InputHandler->handleSteamControllerEvent(&event.user);
                 break;
+            case SDL_CODE_TOUCH_MENU_TICK:
+                m_InputHandler->handleTouchMenuTick();
+                break;
             default:
                 SDL_assert(false);
             }

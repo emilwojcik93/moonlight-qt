@@ -6,6 +6,7 @@
 #include "SDL_compat.h"
 #include "dualsensetriggers.h"
 #include "steamcontroller/steamcontrollersdl.h"
+#include "touchmenu.h"
 
 #include <memory>
 
@@ -56,6 +57,9 @@ struct GamepadState {
 #define MAX_GAMEPADS 16
 
 #define MAX_FINGERS 2
+
+// SDL_USEREVENT code posted by the touch menu timer (the Steam Controller link uses 106)
+#define SDL_CODE_TOUCH_MENU_TICK 107
 
 #define GAMEPAD_HAPTIC_METHOD_NONE 0
 #define GAMEPAD_HAPTIC_METHOD_LEFTRIGHT 1
@@ -119,6 +123,9 @@ public:
 
 
     void handleTouchFingerEvent(SDL_TouchFingerEvent* event);
+
+    // SDL_CODE_TOUCH_MENU_TICK: times the three finger hold and the menu idle timeout (main thread)
+    void handleTouchMenuTick();
 
     int getAttachedGamepadMask();
 
@@ -191,6 +198,17 @@ private:
 
     void handleRelativeFingerEvent(SDL_TouchFingerEvent* event);
 
+    // Returns true if the touch menu consumed the event and it must not reach the host
+    bool handleTouchMenuFingerEvent(SDL_TouchFingerEvent* event);
+
+    void applyTouchMenuEvent(const touchmenu::Event& event, int outputWidth, int outputHeight);
+
+    void releaseTouchesForTouchMenu();
+
+    void updateTouchMenuTimer();
+
+    void getTouchMenuOutputSize(int* width, int* height);
+
     void performSpecialKeyCombo(KeyCombo combo);
 
     static
@@ -207,6 +225,9 @@ private:
 
     static
     Uint32 dragTimerCallback(Uint32 interval, void* param);
+
+    static
+    Uint32 touchMenuTimerCallback(Uint32 interval, void* param);
 
     SDL_Window* m_Window;
     bool m_MultiController;
@@ -262,6 +283,10 @@ private:
     SDL_TimerID m_DragTimer;
     char m_DragButton;
     int m_NumFingersDown;
+
+    bool m_TouchMenuEnabled;
+    touchmenu::TouchMenu m_TouchMenu;
+    SDL_TimerID m_TouchMenuTimer;
 
     static const int k_ButtonMap[];
 };

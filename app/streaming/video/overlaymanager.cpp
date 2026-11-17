@@ -1,5 +1,6 @@
 #include "overlaymanager.h"
 #include "path.h"
+#include "streaming/input/touchmenu.h"
 #include <exception>
 #include <cmath>
 #include <cstdio>
@@ -65,6 +66,46 @@ SDL_Surface* renderStatsText(TTF_Font* font, const char* text, SDL_Color color, 
         stamp(face, stroke, stroke);
     }
     SDL_FreeSurface(face); SDL_FreeSurface(shadow);
+    return surface;
+}
+
+// Touch menu: one bordered button per item on a semi-opaque dark panel. The surface is
+// exactly the layout size, so every renderer draws it 1:1 at the bottom-left corner.
+SDL_Surface* renderTouchMenu(TTF_Font* font, const touchmenu::Layout& layout, int highlighted)
+{
+    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, layout.surfaceWidth, layout.surfaceHeight,
+                                                   32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surface) return nullptr;
+
+    const auto fill = [&](const SDL_Rect& rect, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
+        SDL_Rect copy = rect;
+        SDL_FillRect(surface, &copy, SDL_MapRGBA(surface->format, r, g, b, a));
+    };
+
+    // Panel with a light frame
+    const int frame = layout.border;
+    fill({0, 0, surface->w, surface->h}, 235, 240, 245, 255);
+    fill({frame, frame, surface->w - 2 * frame, surface->h - 2 * frame}, 12, 16, 24, 225);
+
+    for (int i = 0; i < touchmenu::ItemCount; ++i) {
+        const touchmenu::Rect& item = layout.items[i];
+        const bool pressed = i == highlighted;
+        fill({item.x, item.y, item.w, item.h}, 235, 240, 245, 255);
+        if (pressed) {
+            fill({item.x + frame, item.y + frame, item.w - 2 * frame, item.h - 2 * frame}, 30, 120, 220, 255);
+        }
+        else {
+            fill({item.x + frame, item.y + frame, item.w - 2 * frame, item.h - 2 * frame}, 36, 44, 58, 255);
+        }
+
+        if (!font) continue;
+        auto* label = TTF_RenderUTF8_Blended(font, touchmenu::itemLabel(i), {255, 255, 255, 255});
+        if (label) {
+            SDL_Rect at{item.x + (item.w - label->w) / 2, item.y + (item.h - label->h) / 2, label->w, label->h};
+            SDL_BlitSurface(label, nullptr, surface, &at);
+            SDL_FreeSurface(label);
+        }
+    }
     return surface;
 }
 
@@ -479,9 +520,34 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
         if (!combined.empty() && !host.empty()) combined += "\n\n";
         combined += host;
         auto& overlay = m_Overlays[OverlayStatusUpdate];
-        if (combined == overlay.text && overlay.enabled == !combined.empty()) return;
+        // The overlay stays visible while the touch menu replaces the text
+        const bool show = !combined.empty() || m_TouchMenuActive;
+        if (combined == overlay.text && overlay.enabled == show) return;
         SDL_utf8strlcpy(overlay.text, combined.c_str(), sizeof(overlay.text));
-        overlay.enabled = !combined.empty();
+        overlay.enabled = show;
+        ++overlay.revision;
+        overlay.dirty = true;
+        overlay.queued = std::chrono::steady_clock::now();
+    }
+    m_WorkReady.notify_one();
+}
+
+void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        if (!active) {
+            outputWidth = outputHeight = 0;
+            highlightedItem = -1;
+        }
+        if (m_TouchMenuActive == active && m_TouchMenuWidth == outputWidth &&
+                m_TouchMenuHeight == outputHeight && m_TouchMenuHighlight == highlightedItem) return;
+        m_TouchMenuActive = active;
+        m_TouchMenuWidth = outputWidth;
+        m_TouchMenuHeight = outputHeight;
+        m_TouchMenuHighlight = highlightedItem;
+        auto& overlay = m_Overlays[OverlayStatusUpdate];
+        overlay.enabled = active || overlay.text[0] != 0;
         ++overlay.revision;
         overlay.dirty = true;
         overlay.queued = std::chrono::steady_clock::now();
@@ -617,8 +683,9 @@ void OverlayManager::run()
     for (;;) {
         OverlayType type;
         char text[1024];
-        bool enabled, drawText;
-        int fontSize, outputWidth, outputHeight;
+        bool enabled, drawText, drawMenu;
+        int fontSize, outputWidth, outputHeight, menuHighlight;
+        touchmenu::Layout menuLayout;
         std::shared_ptr<const TimingGraphSnapshot> graph;
         uint64_t revision;
         Clock::time_point queued;
@@ -639,8 +706,15 @@ void OverlayManager::run()
             auto& overlay = m_Overlays[type];
             overlay.dirty = false;
             enabled = overlay.enabled;
-            drawText = enabled && overlay.text[0] && (type != OverlayDebug || m_StatsEnabled);
+            drawMenu = enabled && type == OverlayStatusUpdate && m_TouchMenuActive;
+            drawText = !drawMenu && enabled && overlay.text[0] && (type != OverlayDebug || m_StatsEnabled);
             fontSize = overlay.fontSize;
+            menuHighlight = m_TouchMenuHighlight;
+            if (drawMenu) {
+                menuLayout = touchmenu::computeLayout(m_TouchMenuWidth, m_TouchMenuHeight);
+                if (menuLayout.valid) fontSize = menuLayout.fontPixels;
+                else drawMenu = false; // Output size unknown or too small
+            }
             outputWidth = overlay.outputWidth;
             outputHeight = overlay.outputHeight;
             revision = overlay.revision;
@@ -652,7 +726,7 @@ void OverlayManager::run()
         auto& overlay = m_Overlays[type];
         SDL_Surface* surface = nullptr;
         const bool drawGraph = enabled && graph && graph->points.size() >= 2;
-        if (drawText || drawGraph) {
+        if (drawText || drawGraph || drawMenu) {
             if ((!overlay.font || rasterFontSizes[type] != fontSize) && !m_FontData.isEmpty()) {
                 auto resized = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()), 1, fontSize);
                 if (!resized) continue;
@@ -661,7 +735,11 @@ void OverlayManager::run()
                 rasterFontSizes[type] = fontSize;
             }
             const double scale = type == OverlayDebug ? fontSize / 20.0 : 1.0;
-            if (drawText) {
+            if (drawMenu) {
+                surface = renderTouchMenu(overlay.font, menuLayout, menuHighlight);
+                if (!surface) continue; // Keep the last successful overlay on failure.
+            }
+            else if (drawText) {
                 if (overlay.font) {
                     surface = type == OverlayDebug ? renderStatsText(overlay.font, text, overlay.color, scale) :
                         RenderTextOutlinedWrapped(overlay.font, text, overlay.color,

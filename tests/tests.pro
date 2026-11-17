@@ -11,6 +11,7 @@ contains(CONFIG, tests) {
     SUBDIRS += launchWarning
     SUBDIRS += updates
     SUBDIRS += posture
+    SUBDIRS += touchmenu
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += steamcontroller

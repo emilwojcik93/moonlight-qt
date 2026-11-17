@@ -11,6 +11,9 @@
 #include <QDir>
 #include <QGuiApplication>
 
+// How often the touch menu timer wakes the main loop while a hold is timed or the menu is open
+#define TOUCH_MENU_TICK_INTERVAL 50
+
 SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight)
     : m_MultiController(prefs.multiController),
       m_GamepadMouse(prefs.gamepadMouse),
@@ -35,7 +38,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_RightButtonReleaseTimer(0),
       m_DragTimer(0),
       m_DragButton(0),
-      m_NumFingersDown(0)
+      m_NumFingersDown(0),
+      m_TouchMenuEnabled(prefs.touchMenu),
+      m_TouchMenuTimer(0)
 {
     DualSenseHaptics::resetSpeakerGenerationFloor();
 
@@ -299,6 +304,7 @@ SdlInputHandler::~SdlInputHandler()
     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
+    SDL_RemoveTimer(m_TouchMenuTimer);
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
@@ -537,10 +543,177 @@ void SdlInputHandler::handleTouchFingerEvent(SDL_TouchFingerEvent* event)
     return;
 #endif
 
+    // While the touch menu is open, or for fingers that took part in opening it,
+    // nothing reaches the host.
+    if (m_TouchMenuEnabled && handleTouchMenuFingerEvent(event)) {
+        return;
+    }
+
     if (m_AbsoluteTouchMode) {
         handleAbsoluteFingerEvent(event);
     }
     else {
         handleRelativeFingerEvent(event);
     }
+}
+
+Uint32 SdlInputHandler::touchMenuTimerCallback(Uint32 interval, void*)
+{
+    // Runs on the SDL timer thread: just wake up the main loop
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_TOUCH_MENU_TICK;
+    SDL_PushEvent(&event);
+
+    return interval;
+}
+
+void SdlInputHandler::getTouchMenuOutputSize(int* width, int* height)
+{
+    // The overlay is drawn 1:1 in output (drawable) pixels, anchored at the
+    // bottom-left corner of the window. Mirrors updateStatsOutputSize() in ffmpeg.cpp.
+    *width = *height = 0;
+    if (m_Window == nullptr) {
+        return;
+    }
+
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+    SDL_GetWindowSizeInPixels(m_Window, width, height);
+#else
+    if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_OPENGL) {
+        SDL_GL_GetDrawableSize(m_Window, width, height);
+    }
+    else {
+        SDL_GetWindowSize(m_Window, width, height);
+    }
+#endif
+}
+
+void SdlInputHandler::updateTouchMenuTimer()
+{
+    if (m_TouchMenu.needsTick()) {
+        if (m_TouchMenuTimer == 0) {
+            m_TouchMenuTimer = SDL_AddTimer(TOUCH_MENU_TICK_INTERVAL,
+                                            touchMenuTimerCallback,
+                                            nullptr);
+        }
+    }
+    else if (m_TouchMenuTimer != 0) {
+        SDL_RemoveTimer(m_TouchMenuTimer);
+        m_TouchMenuTimer = 0;
+    }
+}
+
+void SdlInputHandler::releaseTouchesForTouchMenu()
+{
+    // Release every contact that was already forwarded to the host, the same
+    // way each touch mode ends a touch, so nothing stays stuck there.
+    if (m_AbsoluteTouchMode) {
+        if (LiGetHostFeatureFlags() & LI_FF_PEN_TOUCH_EVENTS) {
+            // Native touch: cancel all active contacts
+            LiSendTouchEvent(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0f, 0.0f, 0.0f,
+                             0.0f, 0.0f, LI_ROT_UNKNOWN);
+        }
+        else {
+            // Touch emulated with the mouse: stop the long press timer and
+            // raise the buttons like emulateAbsoluteFingerEvent() does on finger up.
+            SDL_RemoveTimer(m_LongPressTimer);
+            m_LongPressTimer = 0;
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        }
+    }
+    else {
+        // Trackpad mode: cancel any drag and raise the buttons like
+        // handleRelativeFingerEvent() does on finger up.
+        SDL_RemoveTimer(m_DragTimer);
+        m_DragTimer = 0;
+        m_DragButton = 0;
+        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+
+        SDL_zero(m_TouchDownEvent);
+        m_NumFingersDown = 0;
+    }
+}
+
+void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int outputWidth, int outputHeight)
+{
+    auto& overlays = Session::get()->getOverlayManager();
+
+    switch (event.type) {
+    case touchmenu::EventType::Open:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Touch menu opened");
+        releaseTouchesForTouchMenu();
+        overlays.setTouchMenu(true, outputWidth, outputHeight, -1);
+        break;
+
+    case touchmenu::EventType::Activate:
+        overlays.setTouchMenu(false, 0, 0, -1);
+        if (event.item == touchmenu::ItemDisconnect) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Touch menu: disconnect");
+            performSpecialKeyCombo(KeyComboQuit);
+        }
+        else if (event.item == touchmenu::ItemToggleStats) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Touch menu: toggle statistics");
+            performSpecialKeyCombo(KeyComboToggleStatsOverlay);
+        }
+        break;
+
+    case touchmenu::EventType::Close:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Touch menu closed");
+        overlays.setTouchMenu(false, 0, 0, -1);
+        break;
+
+    case touchmenu::EventType::None:
+        if (m_TouchMenu.isOpen()) {
+            // Pressed item highlight
+            overlays.setTouchMenu(true, outputWidth, outputHeight, m_TouchMenu.highlightedItem());
+        }
+        break;
+    }
+
+    updateTouchMenuTimer();
+}
+
+bool SdlInputHandler::handleTouchMenuFingerEvent(SDL_TouchFingerEvent* event)
+{
+    int outputWidth, outputHeight;
+    getTouchMenuOutputSize(&outputWidth, &outputHeight);
+    m_TouchMenu.setOutputSize(outputWidth, outputHeight);
+
+    touchmenu::Event result;
+    switch (event->type) {
+    case SDL_FINGERDOWN:
+        result = m_TouchMenu.fingerDown((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
+        break;
+    case SDL_FINGERMOTION:
+        result = m_TouchMenu.fingerMove((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
+        break;
+    case SDL_FINGERUP:
+        result = m_TouchMenu.fingerUp((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
+        break;
+    default:
+        return false;
+    }
+
+    applyTouchMenuEvent(result, outputWidth, outputHeight);
+    return result.swallow;
+}
+
+void SdlInputHandler::handleTouchMenuTick()
+{
+    if (!m_TouchMenuEnabled) {
+        return;
+    }
+
+    int outputWidth, outputHeight;
+    getTouchMenuOutputSize(&outputWidth, &outputHeight);
+    m_TouchMenu.setOutputSize(outputWidth, outputHeight);
+
+    applyTouchMenuEvent(m_TouchMenu.tick(SDL_GetTicks()), outputWidth, outputHeight);
 }
