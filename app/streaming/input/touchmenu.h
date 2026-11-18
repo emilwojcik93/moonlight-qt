@@ -60,12 +60,13 @@ constexpr float MoveFraction = 0.03f;
 constexpr float MinItemHeightFraction = 0.12f;
 constexpr float HandleHeightFraction = 0.06f;
 constexpr int HandleMinPixels = 56;
-constexpr int ItemCount = 3;
+constexpr int ItemCount = 4;
 
 enum Item {
-    ItemDisconnect = 0,
-    ItemToggleStats = 1,
-    ItemCloseMenu = 2,
+    ItemDisconnect = 0,   // End the stream, the host app keeps running
+    ItemQuitSession = 1,  // End the stream and quit the host app
+    ItemToggleStats = 2,
+    ItemCloseMenu = 3,
 };
 
 // Screen side the panel opens on
@@ -77,7 +78,7 @@ enum class Side {
 enum class EventType {
     None,
     Open,
-    Activate,   // item = ItemDisconnect or ItemToggleStats, menu is closed
+    Activate,   // item = any item except ItemCloseMenu, menu is closed
     Close,      // menu is closed (close item, tap outside, idle timeout)
 };
 
