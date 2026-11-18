@@ -215,6 +215,7 @@ SOURCES += \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
+    streaming/input/touchmenu.cpp \
     streaming/session.cpp \
     streaming/gpuperformancehold.cpp \
     streaming/gamescopecomposition.cpp \
@@ -284,6 +285,7 @@ HEADERS += \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
     streaming/input/input.h \
+    streaming/input/touchmenu.h \
     streaming/session.h \
     streaming/gpuperformancehold.h \
     streaming/video/amddecodepolicy.h \
