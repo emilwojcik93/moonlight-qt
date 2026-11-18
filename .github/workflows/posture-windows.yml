@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - ci/posture-windows
@@ -12,5 +13,5 @@ jobs:
   windows:
     uses: ./.github/workflows/build-win-mac.yml
     with:
-      ci_version: 6.2.0-daily.60004
+      ci_version: 6.2.0-daily.60005
       build_macos: false
