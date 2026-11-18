@@ -249,6 +249,20 @@ private slots:
         QCOMPARE(e.item, (int)ItemDisconnect);
     }
 
+    void quitSessionItemActivates()
+    {
+        uint32_t now;
+        openMenu(m, now);
+        liftHoldFingers(m, now);
+        float x, y;
+        itemCenter(1280, 720, ItemQuitSession, x, y);
+        m.fingerDown(7, x, y, now + 100);
+        Event e = m.fingerUp(7, x, y, now + 150);
+        QCOMPARE(e.type, EventType::Activate);
+        QCOMPARE(e.item, (int)ItemQuitSession);
+        QVERIFY(!m.isOpen());
+    }
+
     void closeItemCloses()
     {
         uint32_t now;
@@ -374,7 +388,7 @@ private slots:
             }
         }
         // Stacked top to bottom in menu order
-        QVERIFY(l.items[0].y < l.items[1].y && l.items[1].y < l.items[2].y);
+        QVERIFY(l.items[0].y < l.items[1].y && l.items[1].y < l.items[2].y && l.items[2].y < l.items[3].y);
     }
 
     void layoutHitTest()

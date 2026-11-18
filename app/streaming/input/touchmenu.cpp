@@ -19,6 +19,7 @@ const char* itemLabel(int item)
 {
     switch (item) {
     case ItemDisconnect:  return "Disconnect";
+    case ItemQuitSession: return "Quit session";
     case ItemToggleStats: return "Toggle statistics";
     case ItemCloseMenu:   return "Close menu";
     }

@@ -663,6 +663,13 @@ void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int out
                         "Touch menu: disconnect");
             performSpecialKeyCombo(KeyComboQuit);
         }
+        else if (event.item == touchmenu::ItemQuitSession) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Touch menu: quit session");
+            // End the stream like Disconnect and quit the host app afterwards
+            Session::get()->setQuitHostAppOnExit();
+            performSpecialKeyCombo(KeyComboQuit);
+        }
         else if (event.item == touchmenu::ItemToggleStats) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Touch menu: toggle statistics");
