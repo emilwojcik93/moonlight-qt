@@ -150,6 +150,10 @@ public:
 
     void setShouldExit(bool quitHostApp = false);
 
+    // Quit the host app when this session ends, whatever the "quit app after
+    // stream" preference says. The client itself keeps running.
+    void setQuitHostAppOnExit();
+
 signals:
     void stageStarting(QString stage);
 
@@ -326,6 +330,7 @@ private:
     QStringList m_LaunchWarnings;
     QString m_HostLaunchWarning;
     bool m_ShouldExit;
+    bool m_QuitHostAppOnExit;
 
     bool m_AsyncConnectionSuccess;
 

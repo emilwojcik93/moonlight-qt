@@ -638,6 +638,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
+      m_QuitHostAppOnExit(false),
       m_AsyncConnectionSuccess(false),
       m_PortTestResults(0),
       m_OpusDecoder(nullptr),
@@ -1511,7 +1512,8 @@ private:
         bool shouldQuit =
                 !restarting &&
                 !m_Session->m_UnexpectedTermination &&
-                m_Session->m_Preferences->quitAppAfter;
+                (m_Session->m_Preferences->quitAppAfter ||
+                 m_Session->m_QuitHostAppOnExit);
 
         // Notify the UI
         if (restarting) {
@@ -2086,6 +2088,11 @@ void Session::setShouldExit(bool quitHostApp)
     m_ShouldExit = true;
 }
 
+void Session::setQuitHostAppOnExit()
+{
+    m_QuitHostAppOnExit = true;
+}
+
 Session* Session::createRestartSession()
 {
     auto* next = new Session(m_Computer, m_App, m_Preferences);
@@ -2498,6 +2505,9 @@ void Session::exec()
                 break;
             case SDL_CODE_STEAM_CONTROLLER_LINK:
                 m_InputHandler->handleSteamControllerEvent(&event.user);
+                break;
+            case SDL_CODE_TOUCH_MENU_TICK:
+                m_InputHandler->handleTouchMenuTick();
                 break;
             default:
                 SDL_assert(false);
