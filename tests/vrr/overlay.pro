@@ -5,7 +5,7 @@ CONFIG += console c++17
 CONFIG -= app_bundle
 DEFINES += SDL_MAIN_HANDLED
 INCLUDEPATH += $$PWD/../../app $$PWD/../../app/streaming/video
-SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/path.cpp
+SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/streaming/input/touchmenu.cpp $$PWD/../../app/path.cpp
 HEADERS += $$PWD/../../app/streaming/video/timinggraph.h
 win32 {
     VRR_ARCH = $$QT_ARCH

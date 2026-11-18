@@ -2782,6 +2782,23 @@ FocusScope {
                 }
 
                 ConsoleCheckBox {
+                    id: touchMenuCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Touch menu (corner handle, two-finger swipe from the right edge)")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.touchMenu
+                    onCheckedChanged: {
+                        StreamingPreferences.touchMenu = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Tap the small handle that appears in the bottom-left corner when you touch the stream to open a menu to disconnect or toggle statistics. Alternatively swipe left with two fingers starting at the right edge of the screen.")
+                }
+
+                ConsoleCheckBox {
                     id: swapMouseButtonsCheck
                     hoverEnabled: true
                     width: parent.width
