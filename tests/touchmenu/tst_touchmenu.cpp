@@ -572,6 +572,62 @@ private slots:
         QVERIFY(m.side() == Side::Right);
     }
 
+    void handleOffNeverShowsAndCornerTouchPasses()
+    {
+        m.setTriggers(true, false);
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        QVERIFY(!m.handleVisible());
+        m.fingerUp(1, 0.5f, 0.2f, 100);
+        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
+        QVERIFY(!m.fingerDown(9, x, y, 200).swallow);
+        Event e = m.fingerUp(9, x, y, 300);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(!e.swallow);
+        QVERIFY(!m.isOpen());
+        // Lost contacts are still forgotten after the idle time
+        m.fingerDown(5, 0.5f, 0.5f, 400);
+        QVERIFY(m.needsTick());
+        m.tick(400 + HandleHideMs);
+        QCOMPARE(m.gestureFingerCount(), 0);
+        QVERIFY(!m.needsTick());
+    }
+
+    void handleOffEdgeSwipeStillOpens()
+    {
+        m.setTriggers(true, false);
+        m.fingerDown(1, 0.97f, 0.50f, 1000);
+        m.fingerDown(2, 0.98f, 0.60f, 1100);
+        m.fingerMove(1, 0.85f, 0.50f, 1300);
+        QCOMPARE(m.fingerMove(2, 0.86f, 0.60f, 1400).type, EventType::Open);
+    }
+
+    void gesturesOffEdgeSwipeAndHoldDoNothing()
+    {
+        m.setTriggers(false, true);
+        m.fingerDown(1, 0.97f, 0.50f, 1000);
+        m.fingerDown(2, 0.98f, 0.60f, 1100);
+        m.fingerMove(1, 0.85f, 0.50f, 1300);
+        Event e = m.fingerMove(2, 0.86f, 0.60f, 1400);
+        QCOMPARE(e.type, EventType::None);
+        QVERIFY(!e.swallow);
+        m.fingerUp(1, 0.85f, 0.50f, 1500);
+        m.fingerUp(2, 0.86f, 0.60f, 1500);
+        threeDown(m, 2000);
+        QCOMPARE(m.tick(2000 + HoldMs).type, EventType::None);
+        QVERIFY(!m.isOpen());
+    }
+
+    void gesturesOffHandleStillOpens()
+    {
+        m.setTriggers(false, true);
+        m.fingerDown(1, 0.5f, 0.2f, 0);
+        m.fingerUp(1, 0.5f, 0.2f, 100);
+        QVERIFY(m.handleVisible());
+        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
+        m.fingerDown(9, x, y, 200);
+        QCOMPARE(m.fingerUp(9, x, y, 300).type, EventType::Open);
+    }
+
     void edgeSwipeAtExactTimingLimitsOpens()
     {
         // Second finger exactly 300 ms later, completion exactly 1200 ms after the first

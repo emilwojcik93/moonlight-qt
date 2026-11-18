@@ -138,9 +138,19 @@ bool TouchMenu::inHandle(float x, float y) const
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
 }
 
+void TouchMenu::setTriggers(bool gestures, bool handle)
+{
+    m_GesturesEnabled = gestures;
+    m_HandleEnabled = handle;
+    if (!gestures) {
+        m_Armed = false;
+        cancelEdge();
+    }
+}
+
 void TouchMenu::noteActivity(uint32_t nowMs)
 {
-    m_HandleVisible = true;
+    m_RecentActivity = true;
     m_LastActivityMs = nowMs;
 }
 
@@ -150,7 +160,7 @@ void TouchMenu::openMenu(uint32_t nowMs, Side side)
     m_Side = side == Side::Right && !m_RightPanelAllowed ? Side::Left : side;
     m_Armed = false;
     m_Open = true;
-    m_HandleVisible = false;
+    m_RecentActivity = false;
     m_LastTouchMs = nowMs;
     m_HaveActive = false;
     m_PressItem = m_CurrentItem = -1;
@@ -161,7 +171,7 @@ void TouchMenu::closeMenu()
 {
     cancelEdge();
     m_Open = false;
-    m_HandleVisible = false;
+    m_RecentActivity = false;
     m_Armed = false;
     m_Cancelled = false; // Remaining fingers are ignored, so they cannot re-arm
     m_HaveActive = false;
@@ -269,7 +279,7 @@ Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
     }
 
     // Decided before this touch makes the handle visible
-    bool onHandle = !m_Open && m_HandleVisible && inHandle(x, y);
+    bool onHandle = !m_Open && m_HandleEnabled && m_RecentActivity && inHandle(x, y);
 
     Finger finger = { id, x, y, x, y, m_Open || onHandle, onHandle };
     m_Fingers.push_back(finger);
@@ -302,14 +312,14 @@ Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
             cancelEdge();
         }
     }
-    else if (gestureFingers == 1 && inEdgeZone && !onHandle) {
+    else if (m_GesturesEnabled && gestureFingers == 1 && inEdgeZone && !onHandle) {
         m_EdgeActive = true;
         m_EdgeHaveB = false;
         m_EdgeA = id;
         m_EdgeFirstMs = nowMs;
     }
 
-    if (!m_Armed && !m_Cancelled && gestureFingerCount() >= HoldFingers) {
+    if (m_GesturesEnabled && !m_Armed && !m_Cancelled && gestureFingerCount() >= HoldFingers) {
         // Fingers that already travelled too far (a scroll in progress)
         // do not start a hold.
         bool anyMoved = false;
@@ -483,8 +493,8 @@ Event TouchMenu::tick(uint32_t nowMs)
         result.side = m_Side;
         result.swallow = true;
     }
-    else if (m_HandleVisible && (uint32_t)(nowMs - m_LastActivityMs) >= HandleHideMs) {
-        m_HandleVisible = false;
+    else if (m_RecentActivity && (uint32_t)(nowMs - m_LastActivityMs) >= HandleHideMs) {
+        m_RecentActivity = false;
         // Whatever is still tracked has had no event for a long time: its up
         // was probably lost. Swallowed fingers stay until they lift.
         m_Fingers.erase(std::remove_if(m_Fingers.begin(), m_Fingers.end(),
@@ -502,7 +512,7 @@ void TouchMenu::reset()
     cancelEdge();
     m_Fingers.clear();
     m_Open = false;
-    m_HandleVisible = false;
+    m_RecentActivity = false;
     m_Armed = false;
     m_Cancelled = false;
     m_HaveActive = false;
