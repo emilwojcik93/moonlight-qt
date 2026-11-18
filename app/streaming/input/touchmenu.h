@@ -135,6 +135,11 @@ public:
     // When false the edge swipe opens the left panel instead. Default true.
     void setRightPanelAllowed(bool allowed) { m_RightPanelAllowed = allowed; }
 
+    // Which triggers may open the menu. Gestures are the edge swipe and the
+    // three finger hold. With the handle off it is never shown and a touch on
+    // its corner is a normal touch. Default: both on.
+    void setTriggers(bool gestures, bool handle);
+
     // Side of the open (or last opened) menu
     Side side() const { return m_Side; }
 
@@ -155,10 +160,10 @@ public:
     bool isOpen() const { return m_Open; }
 
     // True while a hold is being timed, the menu is open or the handle is visible
-    bool needsTick() const { return m_Open || m_Armed || m_HandleVisible || m_EdgeActive; }
+    bool needsTick() const { return m_Open || m_Armed || m_RecentActivity || m_EdgeActive; }
 
     // True while the corner handle should be drawn (never while the menu is open)
-    bool handleVisible() const { return m_HandleVisible && !m_Open; }
+    bool handleVisible() const { return m_HandleEnabled && m_RecentActivity && !m_Open; }
 
     // Item that the active finger went down on and is still over, or -1
     int highlightedItem() const;
@@ -197,7 +202,10 @@ private:
     bool m_EdgeActive = false, m_EdgeHaveB = false;
     int64_t m_EdgeA = 0, m_EdgeB = 0;
     uint32_t m_EdgeFirstMs = 0;
-    bool m_HandleVisible = false;
+    bool m_GesturesEnabled = true, m_HandleEnabled = true;
+    // A finger event arrived less than HandleHideMs ago: the handle shows
+    // (when enabled) and lost contacts are not yet forgotten
+    bool m_RecentActivity = false;
     uint32_t m_LastActivityMs = 0;
     bool m_Armed = false;
     bool m_Cancelled = false;

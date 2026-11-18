@@ -39,9 +39,12 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_DragTimer(0),
       m_DragButton(0),
       m_NumFingersDown(0),
-      m_TouchMenuEnabled(prefs.touchMenu),
+      m_TouchMenuEnabled(prefs.touchMenuTrigger != StreamingPreferences::TMT_OFF),
       m_TouchMenuTimer(0)
 {
+    m_TouchMenu.setTriggers(prefs.touchMenuTrigger != StreamingPreferences::TMT_HANDLE,
+                            prefs.touchMenuTrigger != StreamingPreferences::TMT_GESTURE);
+
     DualSenseHaptics::resetSpeakerGenerationFloor();
 
     // System keys are always captured when running without a DE
