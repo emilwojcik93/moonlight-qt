@@ -166,13 +166,14 @@ public:
     };
     Q_ENUM(PostureMode);
 
-    // What opens the touch-only stream menu. Off leaves only the keyboard
-    // and gamepad shortcuts.
+    // What opens the touch-only stream menu. The default is the swipe alone:
+    // nothing is drawn over the stream. Off leaves only the keyboard and
+    // gamepad shortcuts.
     enum TouchMenuTrigger
     {
-        TMT_GESTURE_AND_HANDLE,
         TMT_GESTURE,
         TMT_HANDLE,
+        TMT_GESTURE_AND_HANDLE,
         TMT_OFF,
     };
     Q_ENUM(TouchMenuTrigger);
@@ -308,7 +309,7 @@ public:
     bool muteOnFocusLoss;
     bool backgroundGamepad;
     bool reverseScrollDirection;
-    TouchMenuTrigger touchMenuTrigger = TMT_GESTURE_AND_HANDLE;
+    TouchMenuTrigger touchMenuTrigger = TMT_GESTURE;
     bool swapFaceButtons;
     bool keepAwake;
     int packetSize;

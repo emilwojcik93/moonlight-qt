@@ -2790,9 +2790,9 @@ FocusScope {
                         id: touchMenuTrigger
                         textRole: "text"
                         model: ListModel {
+                            ListElement { text: qsTr("Swipe"); val: StreamingPreferences.TMT_GESTURE }
+                            ListElement { text: qsTr("Handle"); val: StreamingPreferences.TMT_HANDLE }
                             ListElement { text: qsTr("Swipe and handle"); val: StreamingPreferences.TMT_GESTURE_AND_HANDLE }
-                            ListElement { text: qsTr("Swipe only"); val: StreamingPreferences.TMT_GESTURE }
-                            ListElement { text: qsTr("Handle only"); val: StreamingPreferences.TMT_HANDLE }
                             ListElement { text: qsTr("Off"); val: StreamingPreferences.TMT_OFF }
                         }
                         Component.onCompleted: {

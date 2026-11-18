@@ -250,9 +250,9 @@ void StreamingPreferences::reload()
     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
     touchMenuTrigger = static_cast<TouchMenuTrigger>(settings.value(SER_TOUCHMENUTRIGGER,
-                                                     static_cast<int>(TouchMenuTrigger::TMT_GESTURE_AND_HANDLE)).toInt());
-    if (touchMenuTrigger < TMT_GESTURE_AND_HANDLE || touchMenuTrigger > TMT_OFF) {
-        touchMenuTrigger = TMT_GESTURE_AND_HANDLE;
+                                                     static_cast<int>(TouchMenuTrigger::TMT_GESTURE)).toInt());
+    if (touchMenuTrigger < TMT_GESTURE || touchMenuTrigger > TMT_OFF) {
+        touchMenuTrigger = TMT_GESTURE;
     }
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
