@@ -166,6 +166,18 @@ public:
     };
     Q_ENUM(PostureMode);
 
+    // What opens the touch-only stream menu. The default is the swipe alone:
+    // nothing is drawn over the stream. Off leaves only the keyboard and
+    // gamepad shortcuts.
+    enum TouchMenuTrigger
+    {
+        TMT_GESTURE,
+        TMT_HANDLE,
+        TMT_GESTURE_AND_HANDLE,
+        TMT_OFF,
+    };
+    Q_ENUM(TouchMenuTrigger);
+
     // What the Steam Controller (2026)'s four grip buttons become on the host
     enum SteamControllerGrips
     {
@@ -232,6 +244,7 @@ public:
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
     Q_PROPERTY(bool backgroundGamepad MEMBER backgroundGamepad NOTIFY backgroundGamepadChanged)
     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
+    Q_PROPERTY(TouchMenuTrigger touchMenuTrigger MEMBER touchMenuTrigger NOTIFY touchMenuTriggerChanged)
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
@@ -296,6 +309,7 @@ public:
     bool muteOnFocusLoss;
     bool backgroundGamepad;
     bool reverseScrollDirection;
+    TouchMenuTrigger touchMenuTrigger = TMT_GESTURE;
     bool swapFaceButtons;
     bool keepAwake;
     int packetSize;
@@ -379,6 +393,7 @@ signals:
     void muteOnFocusLossChanged();
     void backgroundGamepadChanged();
     void reverseScrollDirectionChanged();
+    void touchMenuTriggerChanged();
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void clientPostureModeChanged();

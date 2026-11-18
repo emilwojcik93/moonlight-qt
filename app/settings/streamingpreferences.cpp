@@ -68,6 +68,7 @@
 #define SER_MUTEONFOCUSLOSS "muteonfocusloss"
 #define SER_BACKGROUNDGAMEPAD "backgroundgamepad"
 #define SER_REVERSESCROLL "reversescroll"
+#define SER_TOUCHMENUTRIGGER "touchmenutrigger"
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
 #define SER_CLIENTPOSTURE "clientposture"
@@ -248,6 +249,11 @@ void StreamingPreferences::reload()
     muteOnFocusLoss = settings.value(SER_MUTEONFOCUSLOSS, false).toBool();
     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
+    touchMenuTrigger = static_cast<TouchMenuTrigger>(settings.value(SER_TOUCHMENUTRIGGER,
+                                                     static_cast<int>(TouchMenuTrigger::TMT_GESTURE)).toInt());
+    if (touchMenuTrigger < TMT_GESTURE || touchMenuTrigger > TMT_OFF) {
+        touchMenuTrigger = TMT_GESTURE;
+    }
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
     enableHdr = settings.value(SER_HDR, false).toBool();
@@ -504,6 +510,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_MUTEONFOCUSLOSS, muteOnFocusLoss);
     settings.setValue(SER_BACKGROUNDGAMEPAD, backgroundGamepad);
     settings.setValue(SER_REVERSESCROLL, reverseScrollDirection);
+    settings.setValue(SER_TOUCHMENUTRIGGER, static_cast<int>(touchMenuTrigger));
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_CLIENTPOSTURE, clientPostureMode);

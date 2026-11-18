@@ -2781,6 +2781,30 @@ FocusScope {
                     ToolTip.text: qsTr("When checked, the touchscreen acts like a trackpad. When unchecked, the touchscreen will directly control the mouse pointer.")
                 }
 
+                ConsoleSettingRow {
+                    width: parent.width
+                    objectName: "touchMenuTriggerRow"
+                    labelItem: ConsoleText { text: qsTr("Touch menu") }
+                    description: qsTr("Opens a menu on touch-only devices to disconnect, quit the session or toggle statistics. Swipe: two fingers from the right edge to the left. Handle: a small button that appears in the bottom-left corner while you touch the stream. Off leaves only the keyboard and gamepad shortcuts.")
+                    editor: AutoResizingComboBox {
+                        id: touchMenuTrigger
+                        textRole: "text"
+                        model: ListModel {
+                            ListElement { text: qsTr("Swipe"); val: StreamingPreferences.TMT_GESTURE }
+                            ListElement { text: qsTr("Handle"); val: StreamingPreferences.TMT_HANDLE }
+                            ListElement { text: qsTr("Swipe and handle"); val: StreamingPreferences.TMT_GESTURE_AND_HANDLE }
+                            ListElement { text: qsTr("Off"); val: StreamingPreferences.TMT_OFF }
+                        }
+                        Component.onCompleted: {
+                            for (var i = 0; i < count; ++i) {
+                                if (model.get(i).val === StreamingPreferences.touchMenuTrigger) { currentIndex = i; break }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: StreamingPreferences.touchMenuTrigger = model.get(currentIndex).val
+                    }
+                }
+
                 ConsoleCheckBox {
                     id: swapMouseButtonsCheck
                     hoverEnabled: true
