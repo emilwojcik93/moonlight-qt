@@ -84,6 +84,15 @@ POSIX bash; works in git-bash and on ubuntu runners (needs git with
   `docs/ROT-MATRIX-2026-11-22.md`.
 * `.gitattributes` keeps `*.patch` byte-exact (no CRLF conversion on Windows).
 
+## Build automation (CI/Release)
+
+`docs/CI.md` documents the pipeline that turns every new upstream `v6.2.0-daily.U` release into an
+attested, immutable GitHub release `v6.2.0-daily.U-vp.N` (unsigned `MoonlightSetup.exe` Burn bundle,
+`SHA256SUMS`, `manifest.json`, `attestation.sigstore.json`) that the Windows updater consumes:
+`.github/workflows/` (upstream-watch, notify, rot-matrix, keepalive, ci-selftest),
+`ci/wrapper/patched-windows-release.yml` (copied into every `build/<tag>-nN` branch), `ci/*.py`
+(helpers, `ci/tests` pytest suite), `upstream-seen.json` (first-seen commit per upstream tag).
+
 ## Series identity and tool behaviour
 
 * `patch_series_sha256` (`tools/series-sha.sh`, same algorithm as the Vibepollo
