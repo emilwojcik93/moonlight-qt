@@ -90,7 +90,7 @@ function Resolve-InstalledKey {
 function Select-NewestEligibleRelease {
     <#
       Input: array of API release objects (untrusted). Output: candidate list sorted newest first, each
-      @{Release; Key}. Releases that are drafts, have invalid tags, or (channel stable) are pre-releases
+      @{Release; Key}. Releases that are drafts or have invalid tags (the pre-release flag is NOT used: every feed release is a pre-release; channels differ only by cooling-off)
       are dropped. Never throws on garbage entries.
     #>
     [CmdletBinding()]
@@ -106,9 +106,6 @@ function Select-NewestEligibleRelease {
         $tag = [string]$r.tag_name
         if (-not (Test-MoonlightTag -Tag $tag)) { continue }
         if (($names -contains 'draft') -and ($r.draft -eq $true)) { continue }
-        $pre = $false
-        if ($names -contains 'prerelease') { $pre = ($r.prerelease -eq $true) }
-        if ($Channel -eq 'stable' -and $pre) { continue }
         $key = $null
         try { $key = ConvertTo-OrderingKey -Tag $tag } catch { continue }   # N > 8 or B > 65535: not installable
         $out.Add([pscustomobject]@{ Release = $r; Key = $key })

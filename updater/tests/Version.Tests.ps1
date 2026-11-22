@@ -101,10 +101,12 @@ Describe 'Release selection' {
         $c[1].Key.Tag | Should -Be 'v6.2.0-daily.202-vp.2'
         $c[2].Key.Tag | Should -Be 'v6.2.0-daily.201-vp.1'
     }
-    It 'stable channel ignores pre-releases (feed is all pre-release until promoted)' {
-        $c = Select-NewestEligibleRelease -Releases @((New-Rel 'v6.2.0-daily.202-vp.1' $false $true), (New-Rel 'v6.2.0-daily.201-vp.1' $false $false)) -Channel stable
-        @($c).Count | Should -Be 1
-        $c[0].Key.Tag | Should -Be 'v6.2.0-daily.201-vp.1'
+    It 'channels differ only by cooling-off: the pre-release flag is not a filter (all feed releases are pre-releases)' {
+        foreach ($ch in 'canary', 'stable') {
+            $c = Select-NewestEligibleRelease -Releases @((New-Rel 'v6.2.0-daily.202-vp.1' $false $true), (New-Rel 'v6.2.0-daily.201-vp.1' $false $false)) -Channel $ch
+            @($c).Count | Should -Be 2
+            $c[0].Key.Tag | Should -Be 'v6.2.0-daily.202-vp.1'
+        }
     }
     It 'handles an empty list' { $c = Select-NewestEligibleRelease -Releases @(); @($c).Count | Should -Be 0 }
     It 'age in hours' {

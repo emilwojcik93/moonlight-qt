@@ -166,9 +166,14 @@ Describe 'SHA256SUMS and hash agreement' {
 }
 
 Describe 'Attestation argument construction' {
-    It 'refuses a source ref outside automation|build/*' {
+    It 'accepts ONLY refs/heads/build/UPSTREAMTAG-nN: automation, ci-trial, tags, other builds are refused' {
+        foreach ($bad in 'refs/heads/automation', 'refs/heads/ci-trial/v6.2.0-daily.202-n1', 'refs/tags/v6.2.0-daily.202', 'refs/heads/build/v6.2.0-daily.0202-n1', 'refs/heads/build/v6.2.0-daily.202-n9', 'refs/heads/build/v6.2.0-daily.202-n0', 'refs/heads/build/../automation', 'refs/heads/build/other') {
+            { Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'a/b' -SignerWorkflow 'w' -SourceRef $bad -SourceDigest $null } | Should -Throw '*not allowed*' -Because $bad
+        }
+    }
+    It 'refuses a source ref outside build/TAG-nN and a bad digest' {
         { Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'a/b' -SignerWorkflow 'w' -SourceRef 'refs/heads/main' -SourceDigest $null } | Should -Throw '*not allowed*'
-        { Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'a/b' -SignerWorkflow 'w' -SourceRef 'refs/heads/automation' -SourceDigest 'nothex' } | Should -Throw '*digest*'
+        { Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'a/b' -SignerWorkflow 'w' -SourceRef 'refs/heads/build/v6.2.0-daily.202-n1' -SourceDigest 'nothex' } | Should -Throw '*digest*'
     }
     It 'passes the pinned flags (checked with a stand-in gh that records its arguments)' {
         $d = New-TestRoot

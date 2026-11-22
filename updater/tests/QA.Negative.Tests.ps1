@@ -503,7 +503,7 @@ Describe 'QA gh.exe pin' {
     It 'attestation argv contains all pinned flags (repo, bundle, signer-workflow, source-ref, deny-self-hosted, source-digest)' {
         $script:capt = $null
         Mock Invoke-GhVerify { $script:capt = $Arguments; return @{ Ok = $true; Rc = 0; Err = '' } }
-        [void](Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'o/r' -SignerWorkflow 'github.com/o/r/.github/workflows/w.yml' -SourceRef 'refs/heads/automation' -SourceDigest ('a' * 40))
+        [void](Test-ArtifactAttestation -GhPath 'x' -DataDir 'y' -FilePath 'f' -BundlePath 'b' -Repo 'o/r' -SignerWorkflow 'github.com/o/r/.github/workflows/w.yml' -SourceRef 'refs/heads/build/v6.2.0-daily.202-n1' -SourceDigest ('a' * 40))
         foreach ($f in '--repo', '--bundle', '--signer-workflow', '--source-ref', '--deny-self-hosted-runners', '--source-digest') { $script:capt | Should -Contain $f }
         # P3-9 (fixed): predicate type and OIDC issuer are pinned explicitly
         $script:capt | Should -Contain '--predicate-type'

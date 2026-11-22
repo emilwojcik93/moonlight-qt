@@ -30,7 +30,7 @@ Result line (stdout + log): `MLUPD_RESULT=<updated|noop|deferred|held|report-onl
 ### Version scheme (CONTRACT v1.1 section 3b, exactly)
 `B = 60000 + 8*U + (N-1)`, N in 1..8, B <= 65535 (U <= 691). Tag `v6.2.0-daily.U-vp.N` (canonical: no leading zeros, N >= 1), manifest `build.version = 6.2.0-daily.B`, FileVersion `6.2.B.0`.
 Installed (U,N) = `((B-60000) div 8, ((B-60000) mod 8)+1)`, derived from the FileVersion alone; ordering is numeric on B. A legacy installed `6.2.60006` is not special-cased: it is numerically lower than every new build.
-Tags with N > 8 or B > 65535 are never candidates. `build.source_ref` must equal `refs/heads/build/v6.2.0-daily.<U>-n<N>` (derived from the tag, not trusted from the manifest).
+Tags with N > 8 or B > 65535 are never candidates. `build.source_ref` must equal `refs/heads/build/v6.2.0-daily.<U>-n<N>` (derived from the tag exactly like the producer: branch `build/` + upstream tag + `-n` + N; not trusted from the manifest). `refs/heads/automation`, `ci-trial/*` and anything else is refused, both in `Read-ReleaseManifest` and in `Test-ArtifactAttestation`. Expected release assets: `MoonlightSetup.exe`, `manifest.json`, `SHA256SUMS`, `attestation.sigstore.json` (names come from the manifest; the installer must match `MoonlightSetup*.exe`).
 
 ### Internal time budget (all below the task limit `ExecutionTimeLimit` = PT2H)
 API calls 3 x 60 s | small assets 3 x 120 s | installer download 600 s | `gh attestation verify` 3 x 180 s | installer run 600 s, then process-tree kill (<= 30 s) and Windows Installer idle wait (<= 120 s) |
@@ -54,7 +54,7 @@ reparse point, on the program dir, `lib\`, `bin\`, every file in them, the data 
 | key | default | meaning |
 |---|---|---|
 | `mode` | `report-only` | `install` \| `report-only` \| `hold`. Command line `-Mode` can only narrow (install > report-only > hold) |
-| `channel` | `canary` | `canary` accepts pre-releases (the feed is all pre-release); `stable` ignores them |
+| `channel` | `canary` | selects which policy cooling-off value applies (`canary`: clamped policy `canary` value, normally 0 -> the 2 h floor; `stable`: policy `stable` value, e.g. 24 h). Channels do NOT filter on the GitHub pre-release flag: every feed release is marked pre-release |
 | `cooling_off_hours` | `0` | local value; effective cooling-off = max(`min_cooling_off_hours`, this, policy value of the channel) |
 | `min_cooling_off_hours` | `2` | local FLOOR: a policy value (canary `0`) is clamped up to it. The Owner lowers it locally by editing this file (admin-only), e.g. `0` for an immediate canary |
 | `repo` | `emilwojcik93/moonlight-qt` | feed |

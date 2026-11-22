@@ -220,7 +220,7 @@ function Test-ArtifactAttestation {
         [Parameter(Mandatory)][string]$SourceRef,
         [AllowNull()][string]$SourceDigest
     )
-    if (-not (Test-UpdRegex $SourceRef '^refs/heads/(automation|build/[A-Za-z0-9._-]{1,80})$')) { throw 'source ref not allowed' }
+    if (-not (Test-UpdRegex $SourceRef '^refs/heads/build/v6\.2\.0-daily\.[1-9][0-9]{0,4}-n[1-8]$')) { throw 'source ref not allowed (only refs/heads/build/<upstream tag>-n<N>)' }
     $a = @('attestation', 'verify', $FilePath, '--repo', $Repo, '--bundle', $BundlePath,
         '--signer-workflow', $SignerWorkflow, '--source-ref', $SourceRef, '--deny-self-hosted-runners',
         '--predicate-type', 'https://slsa.dev/provenance/v1', '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com', '--format', 'json')
