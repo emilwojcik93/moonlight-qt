@@ -1,0 +1,435 @@
+# TEMPLATE. Lives in automation:ci/wrapper/ and is copied by upstream-watch into every
+# build/<tag>-nN branch as .github/workflows/patched-windows-release.yml (together with
+# ci/*.py -> .vp-ci/ and .vp-ci/build-meta.json).  It runs ONLY on those branches.
+#
+# Trigger design: pushing the build branch starts the run (the push is made with a GitHub App
+# token, which -- unlike GITHUB_TOKEN -- triggers workflows).  A workflow_dispatch trigger is
+# kept for manual re-runs.  This avoids the "dispatch only works for workflows present on the
+# default branch" limitation and keeps the run bound to the exact pushed commit.
+#
+# Trust boundaries:
+#   validate  contents:read           regex-validates ref + .vp-ci/build-meta.json, derives versions
+#   build     contents:read           upstream build-win-mac.yml (reusable, no secrets, no macOS)
+#   package   (none)                  parses the untrusted bundle (PE version resources, Burn
+#                                     manifest via 7-Zip); mandatory FileVersion gate 6.2.B.0;
+#                                     builds a preview manifest
+#   publish   contents/attestations/id-token:write   hashes, manifests, attests, releases
+#   notify    actions:write           dispatches the alert workflow on the default branch
+name: Patched Windows Release
+
+on:
+  push:
+    branches:
+      - 'build/**'
+      - 'ci-trial/**'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify but create no release and no attestation
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: vp-patched-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate branch and metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.p.outputs.release_tag }}
+      tag: ${{ steps.p.outputs.tag }}
+      n: ${{ steps.p.outputs.n }}
+      build_version: ${{ steps.p.outputs.build_version }}
+      build_number: ${{ steps.p.outputs.build_number }}
+      file_version: ${{ steps.p.outputs.file_version }}
+      upstream_file_version: ${{ steps.p.outputs.upstream_file_version }}
+      upstream_commit: ${{ steps.p.outputs.upstream_commit }}
+      release_id: ${{ steps.p.outputs.release_id }}
+      series_sha256: ${{ steps.p.outputs.series_sha256 }}
+      patch_count: ${{ steps.p.outputs.patch_count }}
+      patch_groups: ${{ steps.p.outputs.patch_groups }}
+      gate: ${{ steps.p.outputs.gate }}
+      environment: ${{ steps.p.outputs.environment }}
+      dry_run: ${{ steps.p.outputs.dry_run }}
+      trial: ${{ steps.p.outputs.trial }}
+      source_ref: ${{ steps.p.outputs.source_ref }}
+      source_sha: ${{ steps.p.outputs.source_sha }}
+    steps:
+      - name: Checkout build branch (history needed for the ancestry check)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 120
+          persist-credentials: false
+      - name: Validate ref, metadata, ancestry and workflow set
+        id: p
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: python3 .vp-ci/wrapper_params.py
+      - name: Summary
+        env:
+          RELEASE_TAG: ${{ steps.p.outputs.release_tag }}
+          BUILD_VERSION: ${{ steps.p.outputs.build_version }}
+          FILE_VERSION: ${{ steps.p.outputs.file_version }}
+          DRY_RUN: ${{ steps.p.outputs.dry_run }}
+          GATE: ${{ steps.p.outputs.gate }}
+        run: |
+          {
+            echo "### Patched build"
+            echo "* release tag: \`${RELEASE_TAG}\`"
+            echo "* ci_version: \`${BUILD_VERSION}\` (expected FileVersion \`${FILE_VERSION}\`)"
+            echo "* dry run: ${DRY_RUN}; gate: ${GATE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build (upstream build-win-mac.yml)
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-win-mac.yml
+    with:
+      # The called workflow declares no secrets at all; macOS is off.  source_ref pins the
+      # exact commit (never a movable branch name).
+      ci_version: ${{ needs.validate.outputs.build_version }}
+      source_ref: ${{ needs.validate.outputs.source_sha }}
+      build_macos: false
+
+  package:
+    name: Version gate and preview manifest (unprivileged)
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Checkout helper scripts only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .vp-ci
+          persist-credentials: false
+      - name: Download release artifact (bundle + portable zip)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Moonlight-Windows-Release-${{ needs.validate.outputs.build_version }}
+          path: in/release
+      - name: Download x64 binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Moonlight-Windows-x64-${{ needs.validate.outputs.build_version }}
+          path: in/x64
+      - name: Download arm64 binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Moonlight-Windows-arm64-${{ needs.validate.outputs.build_version }}
+          path: in/arm64
+      - name: Make sure 7-Zip is available (reads the Burn manifest inside the bundle)
+        run: |
+          set -euo pipefail
+          if ! command -v 7zz > /dev/null && ! command -v 7z > /dev/null && ! command -v 7za > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends 7zip
+          fi
+          for b in 7zz 7z 7za; do if command -v "$b" > /dev/null; then echo "using $(command -v "$b")"; break; fi; done
+      - name: Mandatory gate - bundle, embedded MSIs and Moonlight.exe must be exactly 6.2.B.0 (above upstream 6.2.U.0)
+        env:
+          UP_TAG: ${{ needs.validate.outputs.tag }}
+          N: ${{ needs.validate.outputs.n }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          python3 .vp-ci/bundle_gate.py --tag "$UP_TAG" --n "$N" \
+            --bundle "in/release/MoonlightSetup-${BUILD_VERSION}.exe" \
+            --x64-exe in/x64/Moonlight.exe --arm64-exe in/arm64/Moonlight.exe --out gate-summary.json --markdown gate.md
+      - name: Stage the installer and build the preview manifest
+        env:
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          UP_TAG: ${{ needs.validate.outputs.tag }}
+          UP_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
+          RELEASE_ID: ${{ needs.validate.outputs.release_id }}
+          N: ${{ needs.validate.outputs.n }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+          FILE_VERSION: ${{ needs.validate.outputs.file_version }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          SERIES_SHA: ${{ needs.validate.outputs.series_sha256 }}
+          PATCH_COUNT: ${{ needs.validate.outputs.patch_count }}
+          GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
+        run: |
+          set -euo pipefail
+          python3 .vp-ci/stage_assets.py --release-dir in/release --dist preview --ci-version "$BUILD_VERSION" \
+            --gate-summary gate-summary.json
+          python3 .vp-ci/manifest_gen.py generate --dist preview --tag "$TAG" --upstream-tag "$UP_TAG" \
+            --upstream-commit "$UP_COMMIT" --release-id "$RELEASE_ID" --n "$N" \
+            --build-version "$BUILD_VERSION" --file-version "$FILE_VERSION" --run-id "$RUN_ID" \
+            --source-ref "$SOURCE_REF" --source-sha "$SOURCE_SHA" --series-sha "$SERIES_SHA" \
+            --patch-count "$PATCH_COUNT" --groups "$GROUPS_CSV" \
+            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --gate-summary gate-summary.json --meta .vp-ci/build-meta.json
+          python3 .vp-ci/manifest_gen.py verify --dist preview
+          cp gate-summary.json preview/gate-summary.json
+          {
+            cat gate.md
+            echo "### Preview manifest (SHA256SUMS)"
+            echo '```'
+            cat preview/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload gate summary for the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-summary
+          path: gate-summary.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload preview (dry runs only; nothing here is published)
+        if: needs.validate.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-preview
+          path: |
+            preview/manifest.json
+            preview/SHA256SUMS
+            preview/gate-summary.json
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Attest and publish release
+    needs: [validate, build, package]
+    if: needs.validate.outputs.dry_run == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ needs.validate.outputs.environment }}
+    permissions:
+      contents: write  # create the draft release and push (see job)
+      id-token: write  # OIDC token for the Sigstore attestation (publish job only)
+      attestations: write  # store the attestation (publish job only)
+    steps:
+      - name: Checkout helper scripts only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .vp-ci
+          persist-credentials: false
+      - name: Download release artifact (bundle + portable zip)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Moonlight-Windows-Release-${{ needs.validate.outputs.build_version }}
+          path: in/release
+      - name: Download gate summary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-summary
+          path: in/summary
+      - name: Check for an existing release of this tag
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 .vp-ci/validate_tag.py release-tag "$TAG"
+          python3 .vp-ci/validate_tag.py repo-slug "$REPO"
+          state=none
+          if gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft' > draft.txt 2>/dev/null; then
+            if [ "$(cat draft.txt)" = "true" ]; then state=draft; else state=published; fi
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = "published" ]; then
+            echo "::notice::Release $TAG is already published; nothing to do."
+          fi
+      - name: Guard - immutable releases must be enabled BEFORE the tag is created
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          CONFIRMED: ${{ vars.IMMUTABLE_CONFIRMED }}
+        run: |
+          set -uo pipefail
+          # A release published while immutability is off is mutable, and its tag name is burnt.
+          if out="$(gh api "repos/${REPO}/immutable-releases" --jq '.enabled' 2>/dev/null)"; then
+            [ "$out" = "true" ] || { echo "::error::immutable releases are NOT enabled for this repository (Settings > General > Releases); refusing to create the release"; exit 1; }
+            echo "immutable releases enabled (API)"
+          else
+            [ "$CONFIRMED" = "true" ] || { echo "::error::cannot read the immutable-releases setting with GITHUB_TOKEN. Enable it in Settings > General > Releases, then set repository variable IMMUTABLE_CONFIRMED=true"; exit 1; }
+            echo "::notice::setting not readable with GITHUB_TOKEN; relying on IMMUTABLE_CONFIRMED=true"
+          fi
+          # A pre-existing tag without a published release must not be adopted.
+          if gh api "repos/${REPO}/git/ref/tags/${TAG}" > /dev/null 2>&1; then
+            echo "::error::tag ${TAG} already exists but has no published release; refusing to reuse it"
+            exit 1
+          fi
+      - name: Remove a stale draft from an earlier failed attempt
+        if: steps.existing.outputs.state == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: gh release delete "$TAG" --repo "$REPO" --yes
+      - name: Stage the installer, write manifest.json and SHA256SUMS
+        if: steps.existing.outputs.state != 'published'
+        env:
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          UP_TAG: ${{ needs.validate.outputs.tag }}
+          UP_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
+          RELEASE_ID: ${{ needs.validate.outputs.release_id }}
+          N: ${{ needs.validate.outputs.n }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+          FILE_VERSION: ${{ needs.validate.outputs.file_version }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          SERIES_SHA: ${{ needs.validate.outputs.series_sha256 }}
+          PATCH_COUNT: ${{ needs.validate.outputs.patch_count }}
+          GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
+        run: |
+          set -euo pipefail
+          python3 .vp-ci/stage_assets.py --release-dir in/release --dist dist --ci-version "$BUILD_VERSION" \
+            --gate-summary in/summary/gate-summary.json
+          python3 .vp-ci/manifest_gen.py generate --dist dist --tag "$TAG" --upstream-tag "$UP_TAG" \
+            --upstream-commit "$UP_COMMIT" --release-id "$RELEASE_ID" --n "$N" \
+            --build-version "$BUILD_VERSION" --file-version "$FILE_VERSION" --run-id "$RUN_ID" \
+            --source-ref "$SOURCE_REF" --source-sha "$SOURCE_SHA" --series-sha "$SERIES_SHA" \
+            --patch-count "$PATCH_COUNT" --groups "$GROUPS_CSV" \
+            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --gate-summary in/summary/gate-summary.json --meta .vp-ci/build-meta.json
+          python3 .vp-ci/manifest_gen.py verify --dist dist
+      - name: Attest installer, SHA256SUMS and manifest
+        if: steps.existing.outputs.state != 'published'
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/MoonlightSetup.exe
+            dist/SHA256SUMS
+            dist/manifest.json
+      - name: Self-verify the attestation exactly as a consumer would
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE" dist/attestation.sigstore.json
+          for f in MoonlightSetup.exe SHA256SUMS manifest.json; do
+            ok=0
+            for _ in 1 2 3 4; do
+              if gh attestation verify "dist/$f" --repo "$REPO" \
+                   --signer-workflow "$REPO/.github/workflows/patched-windows-release.yml" \
+                   --source-ref "$SOURCE_REF" --deny-self-hosted-runners; then ok=1; break; fi
+              sleep 15
+            done
+            [ "$ok" = 1 ] || { echo "::error::attestation for $f does not verify"; exit 1; }
+            # Offline mode (CONTRACT 3b, Ally SYSTEM task): no token, bundle from the release,
+            # exactly the flags the Windows updater passes.
+            env -u GH_TOKEN -u GITHUB_TOKEN gh attestation verify "dist/$f" --bundle dist/attestation.sigstore.json \
+              --repo "$REPO" --signer-workflow "$REPO/.github/workflows/patched-windows-release.yml" \
+              --source-ref "$SOURCE_REF" --source-digest "$SOURCE_SHA" --deny-self-hosted-runners \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              || { echo "::error::offline bundle verification of $f failed"; exit 1; }
+          done
+      - name: Create DRAFT release and upload every asset
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          UP_TAG: ${{ needs.validate.outputs.tag }}
+          UP_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          SERIES_SHA: ${{ needs.validate.outputs.series_sha256 }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+          FILE_VERSION: ${{ needs.validate.outputs.file_version }}
+          GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
+        run: |
+          set -euo pipefail
+          sensitive_line="$(python3 .vp-ci/manifest_gen.py sensitive-line --meta .vp-ci/build-meta.json)"
+          cat > notes.md <<NOTES
+          Unofficial patched build of Nonary/moonlight-qt ${UP_TAG} (upstream commit ${UP_COMMIT}).
+
+          * ci_version: ${BUILD_VERSION} (FileVersion ${FILE_VERSION})
+          * patch groups: ${GROUPS_CSV}
+          * patch series sha256: ${SERIES_SHA}
+          * source commit: ${SOURCE_SHA}
+          * ${sensitive_line}
+
+          Verify before installing: \`gh release verify ${TAG} -R ${REPO}\` and
+          \`gh attestation verify <file> -R ${REPO} --signer-workflow ${REPO}/.github/workflows/patched-windows-release.yml --deny-self-hosted-runners\`.
+          NOTES
+          gh release create "$TAG" --repo "$REPO" --draft --prerelease --latest=false \
+            --target "$SOURCE_SHA" --title "Moonlight ${TAG}" --notes-file notes.md \
+            dist/MoonlightSetup.exe dist/SHA256SUMS dist/manifest.json \
+            dist/attestation.sigstore.json
+      - name: Check uploaded asset digests against local hashes
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[] | "\(.digest) \(.name)"' > remote.txt
+          for f in MoonlightSetup.exe SHA256SUMS manifest.json attestation.sigstore.json; do
+            local_hash="sha256:$(sha256sum "dist/$f" | cut -d' ' -f1)"
+            grep -qxF "$local_hash $f" remote.txt || { echo "::error::digest mismatch for $f"; exit 1; }
+          done
+      - name: Publish (immutable once enabled in repository settings)
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+        run: gh release edit "$TAG" --repo "$REPO" --draft=false --prerelease --latest=false
+      - name: Verify the published release is immutable and attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          ok=0
+          for _ in 1 2 3 4 5; do
+            if gh release verify "$TAG" --repo "$REPO"; then ok=1; break; fi
+            sleep 15
+          done
+          [ "$ok" = 1 ] || { echo "::error::release is NOT verifiable: enable immutable releases in repository settings (consumers fail closed until then)"; exit 1; }
+          if [ -f dist/MoonlightSetup.exe ]; then gh release verify-asset "$TAG" dist/MoonlightSetup.exe --repo "$REPO"; fi
+          # CONTRACT 3b: offline consumers rely on the API field immutable == true.
+          imm="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.immutable')"
+          [ "$imm" = "true" ] || { echo "::error::release API reports immutable=${imm}; enable immutable releases"; exit 1; }
+
+  notify:
+    name: Alert
+    needs: [validate, build, package, publish]
+    if: always() && needs.validate.outputs.trial != 'true' && (contains(needs.*.result, 'failure') || needs.publish.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write  # enable workflows / re-run / dispatch notify.yml (see job)
+    steps:
+      - name: Dispatch notify.yml on the default branch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TAG: ${{ needs.validate.outputs.release_tag }}
+          PUBLISHED: ${{ needs.publish.result }}
+        run: |
+          set -euo pipefail
+          kind=failure
+          [ "$PUBLISHED" = "success" ] && kind=success
+          gh workflow run notify.yml --repo "$REPO" --ref automation \
+            -f kind="$kind" -f run_id="$RUN_ID" -f tag="$TAG"

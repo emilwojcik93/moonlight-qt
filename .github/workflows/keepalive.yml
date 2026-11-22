@@ -1,0 +1,71 @@
+# GitHub disables scheduled workflows after 60 days without repository activity.  Weekly:
+#  1. (re-)enable our scheduled workflows through the API (this counts as activity and also revives
+#     a workflow already in state disabled_inactivity),
+#  2. dead-man check: alert when upstream-watch has not succeeded for 3 days.
+name: Keepalive
+
+on:
+  schedule:
+    - cron: '41 3 * * 3'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    name: Keep schedules alive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write  # enable workflows / re-run / dispatch notify.yml (see job)
+    outputs:
+      stale: ${{ steps.dead.outputs.stale }}
+    steps:
+      - name: Re-enable the scheduled workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          for wf in upstream-watch.yml rot-matrix.yml keepalive.yml; do
+            if gh api --method PUT "repos/${REPO}/actions/workflows/${wf}/enable" > /dev/null; then
+              echo "enabled ${wf}"
+            else
+              echo "::warning::could not enable ${wf}"
+            fi
+          done
+      - name: Dead-man check on upstream-watch
+        id: dead
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          last="$(gh run list --repo "$REPO" --workflow upstream-watch.yml --status success --limit 1 \
+                  --json createdAt --jq '.[0].createdAt // empty' 2>/dev/null)"
+          stale=true
+          if [ -n "$last" ]; then
+            age=$(( $(date -u +%s) - $(date -u -d "$last" +%s) ))
+            if [ "$age" -lt 259200 ]; then stale=false; fi
+          fi
+          echo "stale=$stale" >> "$GITHUB_OUTPUT"
+          echo "last successful upstream-watch: ${last:-never}; stale=$stale"
+
+  notify:
+    name: Alert
+    needs: keepalive
+    if: needs.keepalive.outputs.stale == 'true'
+    permissions:
+      issues: write  # open/update the single alert issue
+      contents: read
+    uses: ./.github/workflows/notify.yml
+    with:
+      kind: deadman
+      run_id: ${{ github.run_id }}
+      detail: no successful upstream-watch run in 3 days
+    secrets:
+      GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}

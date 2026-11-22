@@ -1,0 +1,4 @@
+# Upstream tags the patch series is KNOWN not to apply to (one per line).
+# Entries here do not fail the rot matrix; keep this list explicit and short.
+# Tags below the policy x-supported_floor_tag (v6.2.0-daily.201) are not candidates at all
+# (daily.198-200 predate upstream commit 17c572d7, the console UI rewrite of SettingsView.qml).

@@ -1,0 +1,80 @@
+# Weekly (and on every patch change) dry-run of patches/series against the last 5 upstream
+# releases.  Fails (-> alert issue) when any tag NOT listed in ci/rot-known-fail.txt does not apply.
+name: Patch Rot Matrix
+
+on:
+  schedule:
+    - cron: '37 5 * * 1'
+  push:
+    branches: [automation]
+    paths:
+      - 'patches/**'
+      - 'ci/rot_matrix.py'
+      - 'ci/apply_series.py'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: rot-matrix
+  cancel-in-progress: true
+
+env:
+  UP_REPO: Nonary/moonlight-qt
+
+jobs:
+  matrix:
+    name: Apply series to last 5 releases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse to run anywhere but the default branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = "refs/heads/automation" ] || { echo "::error::rot-matrix runs only on refs/heads/automation"; exit 1; }
+      - name: Checkout automation branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select the last five daily releases (at or above the supported floor)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          allow="$(python3 ci/policy.py --policy policy.yml | sed -n 's/^allow_owners=//p')"
+          floor="$(python3 ci/policy.py --policy policy.yml | sed -n 's/^floor_tag=//p')"
+          args=()
+          if [ -n "$floor" ]; then args+=(--floor "$floor"); fi
+          gh api "repos/${UP_REPO}/releases?per_page=30" > up-releases.json
+          python3 ci/select_release.py --releases up-releases.json --repo "$UP_REPO" --allow "$allow" --top 5 "${args[@]}" > candidates.json
+      - name: Scratch clone for apply tests
+        run: |
+          set -euo pipefail
+          git init -q scratch
+          git -C scratch config user.name ml-automation
+          git -C scratch config user.email ml-automation@users.noreply.github.com
+      - name: Run the matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 ci/rot_matrix.py --src scratch --repo "$UP_REPO" --candidates candidates.json \
+            --series patches/series --patches-dir patches --known-fail ci/rot-known-fail.txt \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Alert
+    needs: matrix
+    if: always() && needs.matrix.result == 'failure'
+    permissions:
+      issues: write  # open/update the single alert issue
+      contents: read
+    uses: ./.github/workflows/notify.yml
+    with:
+      kind: failure
+      run_id: ${{ github.run_id }}
+      detail: patch series does not apply to a recent upstream release
+    secrets:
+      GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}

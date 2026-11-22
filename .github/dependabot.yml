@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Keeps the SHA pins in .github/workflows current.  The wrapper template ci/wrapper/ is NOT
+  # scanned by Dependabot; ci/tests/test_workflows.py fails when its pins drift from the workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]

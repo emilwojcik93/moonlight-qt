@@ -1,0 +1,127 @@
+# Alerting: opens/updates ONE issue (label automation-alert) and posts a sanitized message to
+# Google Chat when the secret GCHAT_WEBHOOK_URL exists.  Called by upstream-watch / keepalive
+# (workflow_call) and dispatched by the build wrapper on build/* branches (workflow_dispatch;
+# the wrapper job only holds actions:write and passes just kind/run_id/tag).
+#
+# Every input is untrusted: validated by ci/notify_text.py, passed via env, never interpolated
+# into a shell script.  Requires Issues to be enabled in the repository settings.
+name: Notify
+
+on:
+  workflow_call:
+    inputs:
+      kind:
+        type: string
+        required: true
+      tag:
+        type: string
+        default: ''
+      run_id:
+        type: string
+        default: ''
+      detail:
+        type: string
+        default: ''
+    secrets:
+      GCHAT_WEBHOOK_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'failure | success | halt | stuck | deadman'
+        type: string
+        required: true
+      tag:
+        type: string
+        default: ''
+      run_id:
+        type: string
+        default: ''
+      detail:
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: notify
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    name: Issue and chat alert
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write  # open/update the single alert issue
+      contents: read
+    steps:
+      - name: Refuse to run anywhere but the default branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = "refs/heads/automation" ] || { echo "::error::notify runs only on refs/heads/automation"; exit 1; }
+      - name: Checkout helper scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ci
+          persist-credentials: false
+      - name: Compose sanitized messages
+        id: msg
+        env:
+          KIND: ${{ inputs.kind }}
+          TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
+          DETAIL: ${{ inputs.detail }}
+          REPO: ${{ github.repository }}
+        run: python3 ci/notify_text.py --gchat gchat.json --issue-body issue.md --marker marker.txt --github-output
+      - name: Find the open alert issue and suppress a repeat of the same alert within 24 hours
+        id: dedupe
+        if: steps.msg.outputs.alert == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          num="$(gh issue list --repo "$REPO" --label automation-alert --state open --json number --jq '.[0].number // empty' 2>/dev/null)"
+          case "$num" in ''|*[!0-9]*) num="" ;; esac
+          echo "num=${num}" >> "$GITHUB_OUTPUT"
+          if [ -n "$num" ] && gh issue view "$num" --repo "$REPO" --json createdAt,body,comments > issue.json 2>/dev/null; then
+            python3 ci/notify_dedupe.py --issue issue.json --marker-file marker.txt --github-output || echo "suppress=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "suppress=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open or update the single alert issue
+        if: steps.msg.outputs.alert == 'true' && steps.dedupe.outputs.suppress != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ steps.dedupe.outputs.num }}
+        run: |
+          set -uo pipefail
+          title="[automation] moonlight-qt patch pipeline needs attention"
+          if ! gh label create automation-alert --repo "$REPO" --color B60205 \
+                 --description "Patch pipeline alert" --force > /dev/null 2>&1; then
+            echo "::warning::could not create the label (Issues disabled? enable them in repository settings)"
+          fi
+          num="$NUM"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$REPO" --body-file issue.md || echo "::warning::could not comment on issue #$num"
+          else
+            gh issue create --repo "$REPO" --title "$title" --label automation-alert --body-file issue.md \
+              || echo "::warning::could not create the alert issue (Issues must be enabled in repository settings)"
+          fi
+          exit 0
+      - name: Post to Google Chat when the webhook secret exists
+        if: steps.dedupe.outputs.suppress != 'true'
+        env:
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: |
+          set -uo pipefail
+          if [ -z "$GCHAT_WEBHOOK_URL" ]; then echo "GCHAT_WEBHOOK_URL not set; skipping chat"; exit 0; fi
+          # URL goes through stdin (-K -) so it never appears in a process list.
+          printf 'url = "%s"\n' "$GCHAT_WEBHOOK_URL" | curl -sS --fail-with-body -m 20 -K - \
+            -H 'Content-Type: application/json; charset=UTF-8' --data-binary @gchat.json > /dev/null \
+            || echo "::warning::chat post failed"
+          exit 0

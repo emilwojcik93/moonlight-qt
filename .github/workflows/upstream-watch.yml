@@ -1,0 +1,393 @@
+# Polls Nonary/moonlight-qt for new v6.2.0-daily.U pre-releases and turns the newest one into a build branch
+# build/<tag>-n<N> = upstream tag + patches/series (+ wrapper workflow).  Pushing that branch (with a
+# GitHub App token, which triggers workflows) starts patched-windows-release.yml.
+#
+# Runs only from the default branch (automation).  See docs/CI.md.
+name: Upstream Watch
+
+on:
+  schedule:
+    # Upstream dailies are cut at 06:47 UTC and published once Windows/AppImage/Flatpak succeed
+    # (observed 07:05-10:00 UTC, occasionally late evening); poll hourly then, plus a 6-hourly net.
+    - cron: '23 7-11 * * *'
+    - cron: '23 0,6,12,18 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag v6.2.0-daily.U to build (empty = newest daily release)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Resolve, apply the series and assemble locally; push nothing, record nothing'
+        type: boolean
+        default: false
+      override_hold:
+        description: 'Ignore policy.yml hold and the HOLD variable for this run'
+        type: boolean
+        default: false
+      force_rebuild:
+        description: 'Create a new build number even if this series was already built'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  UP_REPO: Nonary/moonlight-qt
+
+jobs:
+  resolve:
+    name: Resolve upstream release and plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read  # read workflow runs / artifacts of this run
+    outputs:
+      found: ${{ steps.sel.outputs.found }}
+      tag: ${{ steps.sel.outputs.tag }}
+      release_id: ${{ steps.sel.outputs.release_id }}
+      published_at: ${{ steps.sel.outputs.published_at }}
+      prev_tag: ${{ steps.base.outputs.diff_base }}
+      commit: ${{ steps.deref.outputs.commit }}
+      series_sha256: ${{ steps.series.outputs.series_sha256 }}
+      patch_count: ${{ steps.series.outputs.patch_count }}
+      patch_groups: ${{ steps.series.outputs.patch_groups }}
+      action: ${{ steps.plan.outputs.action }}
+      n: ${{ steps.plan.outputs.n }}
+      reason: ${{ steps.plan.outputs.reason }}
+      record_lock: ${{ steps.plan.outputs.record_lock }}
+      rerun_run_id: ${{ steps.plan.outputs.rerun_run_id }}
+      stuck: ${{ steps.plan.outputs.stuck }}
+      manual: ${{ steps.in.outputs.manual }}
+    steps:
+      - name: Refuse to run anywhere but the default branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = "refs/heads/automation" ] || { echo "::error::upstream-watch runs only on refs/heads/automation"; exit 1; }
+      - name: Checkout automation branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate manual inputs
+        id: in
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          manual=false
+          if [ -n "$INPUT_TAG" ]; then
+            python3 ci/validate_tag.py upstream-tag "$INPUT_TAG"
+            manual=true
+          fi
+          echo "manual=$manual" >> "$GITHUB_OUTPUT"
+      - name: Read policy.yml
+        id: policy
+        run: python3 ci/policy.py --policy policy.yml --github-output
+      - name: List upstream releases and select the newest daily one
+        id: sel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          ALLOW: ${{ steps.policy.outputs.allow_owners }}
+          FLOOR: ${{ steps.policy.outputs.floor_tag }}
+        run: |
+          set -euo pipefail
+          per_page=20
+          args=()
+          if [ -n "$INPUT_TAG" ]; then per_page=100; args+=(--tag "$INPUT_TAG"); fi
+          if [ -n "$FLOOR" ]; then args+=(--floor "$FLOOR"); fi
+          gh api "repos/${UP_REPO}/releases?per_page=${per_page}" > up-releases.json
+          python3 ci/select_release.py --releases up-releases.json --repo "$UP_REPO" --allow "$ALLOW" \
+            --top 20 "${args[@]}" --github-output > select.json
+      - name: Resolve the commit behind the tag (annotated tags dereferenced)
+        id: deref
+        if: steps.sel.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.sel.outputs.tag }}
+        run: python3 ci/deref_commit.py --repo "$UP_REPO" --tag "$TAG" --github-output
+      - name: Diff base for the sensitive-path report (last built tag, else previous upstream release)
+        id: base
+        if: steps.sel.outputs.found == 'true'
+        env:
+          TAG: ${{ steps.sel.outputs.tag }}
+          FALLBACK: ${{ steps.sel.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          base="$(python3 ci/lock_update.py last-built --lock upstream-seen.json --tag "$TAG")"
+          if [ -z "$base" ]; then base="$FALLBACK"; fi
+          echo "diff_base=$base" >> "$GITHUB_OUTPUT"
+      - name: Fingerprint the patch series
+        id: series
+        if: steps.sel.outputs.found == 'true'
+        run: python3 ci/series.py --series patches/series --patches-dir patches --github-output
+      - name: Gather our releases and recent wrapper runs
+        if: steps.sel.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 ci/validate_tag.py repo-slug "$REPO"
+          gh api "repos/${REPO}/releases?per_page=100" > our-releases.json
+          if ! gh run list --repo "$REPO" --workflow patched-windows-release.yml --limit 100 \
+                 --json databaseId,headBranch,status,conclusion,attempt > runs.json 2> runs.err; then
+            echo "::notice::no wrapper runs found yet"
+            echo '[]' > runs.json
+          fi
+      - name: Plan
+        id: plan
+        if: steps.sel.outputs.found == 'true'
+        env:
+          TAG: ${{ steps.sel.outputs.tag }}
+          COMMIT: ${{ steps.deref.outputs.commit }}
+          SERIES_SHA: ${{ steps.series.outputs.series_sha256 }}
+          HOLD_POLICY: ${{ steps.policy.outputs.hold }}
+          HOLD_VAR: ${{ vars.HOLD }}
+          OVERRIDE_HOLD: ${{ inputs.override_hold }}
+          FORCE: ${{ inputs.force_rebuild }}
+          MANUAL: ${{ steps.in.outputs.manual }}
+        run: |
+          set -euo pipefail
+          hold=false
+          if [ "$HOLD_POLICY" = "true" ] || [ "$HOLD_VAR" = "true" ]; then hold=true; fi
+          python3 ci/plan_build.py --tag "$TAG" --commit "$COMMIT" --lock upstream-seen.json --pin-file upstream.lock \
+            --our-releases our-releases.json --runs runs.json --series-sha "$SERIES_SHA" \
+            --hold "$hold" --override-hold "${OVERRIDE_HOLD:-false}" --force-rebuild "${FORCE:-false}" \
+            --manual-tag "$MANUAL" --github-output
+      - name: Summary
+        if: always() && steps.plan.outcome != 'skipped'
+        env:
+          TAG: ${{ steps.sel.outputs.tag }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          N: ${{ steps.plan.outputs.n }}
+          REASON: ${{ steps.plan.outputs.reason }}
+        run: |
+          echo "### Upstream watch: \`${TAG}\` -> **${ACTION}** (n=${N}) ${REASON}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Halt on a moved upstream tag
+        if: steps.plan.outputs.action == 'halt'
+        env:
+          REASON: ${{ steps.plan.outputs.reason }}
+        run: |
+          echo "::error::HALT: ${REASON}"
+          exit 1
+
+  prepare:
+    name: Create build branch
+    needs: resolve
+    if: needs.resolve.outputs.action == 'build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Environment scoping: keep PUSH_APP_PRIVATE_KEY as an *environment* secret here and restrict
+    # the environment to the automation branch so build/* branches can never read it.
+    environment: build-push
+    permissions:
+      contents: write   # records upstream-seen.json on automation (GITHUB_TOKEN); branch push uses the App token
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      N: ${{ needs.resolve.outputs.n }}
+      RELEASE_ID: ${{ needs.resolve.outputs.release_id }}
+      PUBLISHED_AT: ${{ needs.resolve.outputs.published_at }}
+      PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+      SERIES_SHA: ${{ needs.resolve.outputs.series_sha256 }}
+      PATCH_COUNT: ${{ needs.resolve.outputs.patch_count }}
+      PATCH_GROUPS: ${{ needs.resolve.outputs.patch_groups }}
+      RECORD_LOCK: ${{ needs.resolve.outputs.record_lock }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Refuse to run anywhere but the default branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = "refs/heads/automation" ] || { echo "::error::must run on refs/heads/automation"; exit 1; }
+      - name: Require GitHub App credentials (there is deliberately no fallback token)
+        if: env.DRY_RUN != 'true'
+        env:
+          APP_ID: ${{ vars.PUSH_APP_ID }}
+          KEY_PRESENT: ${{ secrets.PUSH_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ -z "$APP_ID" ] || [ "$KEY_PRESENT" != "true" ]; then
+            echo "::error::PUSH_APP_ID (variable) and PUSH_APP_PRIVATE_KEY (secret) are not configured. Create the GitHub App described in docs/CI.md and add both to the 'build-push' environment. Refusing to fall back to GITHUB_TOKEN or any broader credential."
+            exit 1
+          fi
+      - name: Mint a short-lived App installation token (contents + workflows on this repo only)
+        id: app
+        if: env.DRY_RUN != 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PUSH_APP_ID }}
+          private-key: ${{ secrets.PUSH_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+      - name: Checkout automation branch (patches, scripts, lock)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: auto
+          persist-credentials: false
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          cd auto/ci
+          python3 validate_tag.py upstream-tag "$TAG"
+          python3 validate_tag.py sha1 "$COMMIT"
+          python3 validate_tag.py sha256 "$SERIES_SHA"
+          python3 validate_tag.py run-id "$RELEASE_ID"
+          python3 validate_tag.py run-id "$N"
+          if [ -n "$PREV_TAG" ]; then python3 validate_tag.py upstream-tag "$PREV_TAG"; fi
+      - name: Fetch the upstream tag and verify it still points at the planned commit
+        run: |
+          set -euo pipefail
+          git init -q src
+          cd src
+          git remote add upstream "https://github.com/${UP_REPO}.git"
+          git fetch -q --no-tags upstream "refs/tags/${TAG}:refs/tags/upstream-${TAG}"
+          [ "$(git rev-parse "refs/tags/upstream-${TAG}^{commit}")" = "$COMMIT" ] || { echo "::error::upstream tag moved while preparing the build"; exit 1; }
+          git checkout -q --detach "$COMMIT"
+      - name: Sensitive-path diff against the previous upstream release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENFORCE: ${{ vars.ENFORCE_SENSITIVE_GATE }}
+        run: |
+          set -euo pipefail
+          gate=auto; count=0
+          : > sensitive.md
+          if [ -n "$PREV_TAG" ]; then
+            prev_commit="$(python3 auto/ci/deref_commit.py --repo "$UP_REPO" --tag "$PREV_TAG")"
+            git -C src fetch -q --no-tags upstream "refs/tags/${PREV_TAG}:refs/tags/upstream-${PREV_TAG}"
+            git -C src diff --name-only "$prev_commit" "$COMMIT" > names.txt
+            summary_line="$(python3 auto/ci/sensitive_paths.py --names names.txt --summary sensitive.md)"
+            count="${summary_line##*count=}"
+            if [ "$count" != "0" ]; then
+              echo "::warning::SENSITIVE upstream paths changed since ${PREV_TAG}: ${count} file(s); enforce=${ENFORCE:-false}; listed in the run summary, release notes and manifest.json"
+              { echo "### SENSITIVE upstream paths changed since ${PREV_TAG} (${count} files; enforce=${ENFORCE:-false})"; cat sensitive.md; } >> "$GITHUB_STEP_SUMMARY"
+              if [ "$ENFORCE" = "true" ]; then gate=approval; fi
+            fi
+          fi
+          echo "gate=$gate" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Apply the patch series (git am --3way, pinned identity and dates)
+        run: |
+          set -euo pipefail
+          python3 auto/ci/apply_series.py --repo src --base "$COMMIT" --series auto/patches/series \
+            --patches-dir auto/patches --report conflict.md
+      - name: Publish the conflict report
+        if: failure()
+        run: |
+          if [ -s conflict.md ]; then cat conflict.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Upload conflict report
+        if: failure() && hashFiles('conflict.md') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: conflict-report
+          path: conflict.md
+          retention-days: 14
+      - name: Assemble the build commit (strip upstream workflows, add wrapper and metadata)
+        id: assemble
+        env:
+          GATE: ${{ steps.gate.outputs.gate }}
+          SENSITIVE_COUNT: ${{ steps.gate.outputs.count }}
+        run: |
+          set -euo pipefail
+          tip="$(python3 auto/ci/assemble_build.py --repo src --ci-dir auto/ci --base "$COMMIT" --tag "$TAG" \
+            --n "$N" --branch "build/${TAG}-n${N}" --release-id "$RELEASE_ID" --published-at "$PUBLISHED_AT" \
+            --series-sha "$SERIES_SHA" --patch-count "$PATCH_COUNT" --groups "$PATCH_GROUPS" \
+            --gate "$GATE" --sensitive-count "$SENSITIVE_COUNT" --sensitive-since "$PREV_TAG" --repo-slug "$UP_REPO" --sensitive-file "$GITHUB_WORKSPACE/sensitive.md" | tail -n 1)"
+          python3 auto/ci/validate_tag.py sha1 "$tip"
+          echo "tip=$tip" >> "$GITHUB_OUTPUT"
+          echo "### Build branch \`build/${TAG}-n${N}\` assembled at \`${tip}\` (dry run: ${DRY_RUN})" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record the upstream pin and the build in upstream-seen.json (local commit)
+        if: env.DRY_RUN != 'true'
+        env:
+          TIP: ${{ steps.assemble.outputs.tip }}
+        run: |
+          set -euo pipefail
+          cd auto
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ "$RECORD_LOCK" = "true" ]; then
+            python3 ci/lock_update.py record --lock upstream-seen.json --repo "$UP_REPO" --tag "$TAG" --commit "$COMMIT" \
+              --release-id "$RELEASE_ID" --published-at "$PUBLISHED_AT" --now "$now"
+          fi
+          python3 ci/lock_update.py add-build --lock upstream-seen.json --tag "$TAG" --n "$N" --series-sha "$SERIES_SHA" \
+            --source-sha "$TIP"
+          git config user.name "ml-automation"
+          git config user.email "ml-automation@users.noreply.github.com"
+          git add upstream-seen.json
+          git commit -q -m "lock: pin upstream ${TAG} and record build n${N}"
+      - name: Persist upstream-seen.json BEFORE the branch push (a failed push here fails the job and alerts)
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          cd auto
+          for _ in 1 2 3; do
+            if git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+                 push "https://github.com/${REPO}.git" HEAD:refs/heads/automation; then exit 0; fi
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+              pull -q --rebase "https://github.com/${REPO}.git" automation
+          done
+          echo "::error::could not push upstream-seen.json (is the automation ruleset blocking github-actions?)"
+          exit 1
+      - name: Push the build branch (App token; triggers patched-windows-release.yml)
+        if: env.DRY_RUN != 'true'
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TIP: ${{ steps.assemble.outputs.tip }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 auto/ci/validate_tag.py repo-slug "$REPO"
+          auth="$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          # No --force: an existing branch means a collision and must fail loudly.
+          git -C src -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push "https://github.com/${REPO}.git" "${TIP}:refs/heads/build/${TAG}-n${N}"
+
+  rerun:
+    name: Re-run failed build
+    needs: resolve
+    if: needs.resolve.outputs.action == 'rerun' && inputs.dry_run != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write  # enable workflows / re-run / dispatch notify.yml (see job)
+    steps:
+      - name: Re-run the failed jobs of the earlier attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ needs.resolve.outputs.rerun_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]{1,20}$ ]] || { echo "::error::bad run id"; exit 1; }
+          gh run rerun "$RUN_ID" --failed --repo "$REPO"
+
+  notify:
+    name: Alert
+    needs: [resolve, prepare, rerun]
+    if: >-
+      always() && (needs.resolve.result == 'failure' || needs.prepare.result == 'failure' ||
+      needs.rerun.result == 'failure' || needs.resolve.outputs.stuck == 'true')
+    permissions:
+      issues: write  # open/update the single alert issue
+      contents: read
+      actions: read  # read workflow runs / artifacts of this run
+    uses: ./.github/workflows/notify.yml
+    with:
+      kind: ${{ needs.resolve.outputs.action == 'halt' && 'halt' || (needs.resolve.outputs.stuck == 'true' && 'stuck' || 'failure') }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      run_id: ${{ github.run_id }}
+      detail: ${{ needs.resolve.outputs.reason }}
+    secrets:
+      GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}

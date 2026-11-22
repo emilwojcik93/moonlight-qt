@@ -1,0 +1,155 @@
+[
+ {
+  "id": 202,
+  "tag_name": "v6.2.0-daily.202",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.202"
+ },
+ {
+  "id": 201,
+  "tag_name": "v6.2.0-daily.201",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.201"
+ },
+ {
+  "id": 200,
+  "tag_name": "v6.2.0-daily.200",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.200"
+ },
+ {
+  "id": 203,
+  "tag_name": "v6.2.0-daily.203",
+  "draft": true,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.203"
+ },
+ {
+  "id": 204,
+  "tag_name": "v6.2.0-daily.204",
+  "draft": false,
+  "prerelease": true,
+  "published_at": null,
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.204"
+ },
+ {
+  "id": 999,
+  "tag_name": "v6.2.0-daily.692",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.692"
+ },
+ {
+  "id": 1,
+  "tag_name": "v6.1.0-vrr18",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.1.0-vrr18"
+ },
+ {
+  "id": 2,
+  "tag_name": "v6.2.0-daily.0205",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.0205"
+ },
+ {
+  "id": 3,
+  "tag_name": "v6.2.0-daily.202-vp.1",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.202-vp.1"
+ },
+ {
+  "id": 4,
+  "tag_name": "v6.2.0-daily.205\n",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.205\n"
+ },
+ {
+  "id": 5,
+  "tag_name": "v6.2.0-daily.206;rm -rf /",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.206;rm -rf /"
+ },
+ {
+  "id": 6,
+  "tag_name": "v6.2.0-daily.$(id)",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.$(id)"
+ },
+ {
+  "id": 7,
+  "tag_name": "v6.2.0-daily.\u0662\u0660\u0667",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.\u0662\u0660\u0667"
+ },
+ {
+  "id": 8,
+  "tag_name": "v6.2.0-daily.208\u202e",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.208\u202e"
+ },
+ {
+  "id": 9,
+  "tag_name": "../v6.2.0-daily.209",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly ../v6.2.0-daily.209"
+ },
+ {
+  "id": 10,
+  "tag_name": "V6.2.0-DAILY.210",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly V6.2.0-DAILY.210"
+ },
+ {
+  "id": 11,
+  "tag_name": "v6.2.0-daily.100000",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-22T07:17:53Z",
+  "target_commitish": "master",
+  "name": "Nightly v6.2.0-daily.100000"
+ }
+]
