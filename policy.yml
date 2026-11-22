@@ -1,0 +1,49 @@
+# Policy for the moonlight-qt patch pipeline. Read by the automation workflows.
+# Keep it flat: simple "key: value" and "- item" lists only.
+
+upstream:
+  owner_allowlist:
+    - Nonary
+  repo: moonlight-qt
+  # Only tags matching this regex are considered (R-TRK-2). Validate before use.
+  tag_regex: '^v6\.2\.0-daily\.[0-9]{1,5}$'
+  # Poll releases?per_page=20, draft == false, tags containing "-daily.".
+  poll_interval_hours: 6
+
+# Lowest upstream tag the series is expected to apply to. daily.200 and older
+# predate the console-UI rewrite of SettingsView.qml, so patch 0002 conflicts there.
+supported_floor_tag: v6.2.0-daily.201
+
+channels:
+  # canary = the Ally X Windows client: pre-release feed, no waiting.
+  canary:
+    cooling_off_hours: 0
+  # stable = anything else that consumes the feed (e.g. a Linux package repo).
+  stable:
+    cooling_off_hours: 24
+
+# Emergency brake: true stops building new releases (R-TRK-4). Keep last good.
+hold: false
+
+# Patch groups from patches/series that are applied. Remove a name to switch it off
+# (apply-series.sh --skip-group <name>).
+groups_enabled:
+  - posture-core
+  - touch-menu
+
+rot_matrix:
+  last_n_tags: 5
+  include_master: true
+
+# Version scheme (ADR-3 / R-BLD-2). U = upstream daily number, N = rebuild counter.
+#   upstream:  v6.2.0-daily.U           -> product version 6.2.U
+#   ci build:  ci_version = 6.2.0-daily.(60000 + U)   -> FileVersion 6.2.(60000+U).0
+#   human tag: v6.2.0-daily.U-vp.N
+# 60000+U must stay <= 65535 (MSI limit) and above every upstream daily, so the
+# in-app updater (Nonary releases, 6.2.N compare) never offers an upstream
+# nightly over this build. Bump N on every rebuild of the same U.
+version_scheme:
+  ci_version: '6.2.0-daily.(60000+U)'
+  tag: 'v6.2.0-daily.U-vp.N'
+  ci_offset: 60000
+  max_build_number: 65535

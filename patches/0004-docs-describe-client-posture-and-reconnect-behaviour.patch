@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Tue, 17 Nov 2026 23:52:09 +0100
+Subject: [PATCH 4/7] docs: describe client posture and reconnect behaviour
+
+docs: describe client posture and reconnect behaviour
+
+Document what the client sends (clientPosture, clientTouch), how Auto mode
+decides, the live /posture sync and the safety rules of the automatic resume
+(60 s cooldown, 5 s startup guard, no loops, only on a touch-class change).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/client-posture.md | 48 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+ create mode 100644 docs/client-posture.md
+
+diff --git a/docs/client-posture.md b/docs/client-posture.md
+new file mode 100644
+index 00000000..676200fd
+--- /dev/null
++++ b/docs/client-posture.md
+@@ -0,0 +1,48 @@
++# Client posture and reconnect on posture change
++
++Moonlight tells a posture-aware host (Vibepollo with the stream-posture-sync
++patches) whether this client is in a touch-primary state, so the host can adapt
++its virtual display, for example to dock the Windows touch keyboard. Hosts that
++do not know the arguments ignore them.
++
++## What is sent
++
++`clientPosture` (`desktop`, `laptop`, `tablet`) and `clientTouch` (`0`/`1`) on
++the launch and resume request, and on `/posture` while streaming. Nothing about
++the screen size or DPI is sent; this client reports every touch-primary state as
++`tablet`. Setting **Touch tablet posture** (`--client-posture auto|tablet|never`)
++overrides detection.
++
++Auto mode on a 2-in-1 reports `tablet` while the OS tablet mode is on (KDE
++`tabletMode`, Windows `SM_CONVERTIBLESLATEMODE` == 0), that is while the keyboard
++is detached or flipped, and `laptop` while it is attached.
++
++## Live sync and reconnect
++
++While streaming, a worker thread watches the posture. On Linux/KDE it
++subscribes to the KWin `org.kde.KWin.TabletModeManager` `tabletModeChanged`
++D-Bus signal and also samples once a second as a fallback; on Windows it
++samples once a second. A change is debounced for 1 second and sent to the host
++as `/posture`.
++
++The host only rebuilds its virtual display on a resume. When the host accepted a
++change that crosses the touch boundary (tablet <-> laptop/desktop), the client
++therefore resumes the same app: it tears the stream down without quitting the
++host app and starts it again with `resume`. This is the same segue that replaces
++the stream view when a game is quit and another started, so it works for GUI and
++`moonlight stream` launches alike; a CLI launch relaunches the stream instead of
++exiting.
++
++Setting **Reconnect when posture changes** (default on, `--reconnect-on-posture`
++/ `--no-reconnect-on-posture`) controls this. Safety rules:
++
++- at most one automatic restart per 60 seconds; a flip blocked by that cooldown
++  is applied when it ends, but only if the posture still differs from the one
++  the running display was created for
++- never while connecting: nothing happens in the first 5 seconds of a stream
++- never loops: the restarted stream starts from the current posture, so that is
++  its baseline
++- skipped when the stream is already ending (quit, signal, connection loss)
++- changes between touch classes, or touch-ness changes alone, never restart
++
++If the resume fails, the usual launch error is shown.

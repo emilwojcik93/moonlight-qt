@@ -1,0 +1,1388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Tue, 17 Nov 2026 23:52:09 +0100
+Subject: [PATCH 1/7] posture: add client posture classifier and OS signal
+ detectors
+
+posture: add client posture classifier and OS signal detectors
+
+Add the pure-logic half of the client posture feature: decide whether this
+client is a desktop, laptop, tablet or handheld, and gather the signals that
+decision needs.
+
+postureclassifier.{h,cpp} is deliberately free of OS and Qt GUI calls so it can
+be unit tested everywhere. It classifies a Signals struct into a class plus a
+confidence, builds the clientPosture/clientTouch query string for the host,
+parses the host's display_change answer, and holds the two pure decision
+gates used later: UpdateGate (when a live change is worth reporting) and
+RestartGate (when the stream may be resumed: setting on, 5 s arm delay, 60 s
+cooldown, deferred flips are kept, baseline reset per session).
+
+posturedetector.{h,cpp} reads the real signals. Linux asks KWin's
+org.kde.KWin.TabletModeManager over D-Bus (behind HAVE_POSTURE_DBUS so builds
+without QtDBus still work) and trusts tabletMode=true even when
+tabletModeAvailable=false, which is what 2-in-1s report with the keyboard
+detached. Windows reads SM_CONVERTIBLESLATEMODE (0 means slate), SM_DIGITIZER,
+SM_MOUSEPRESENT, the chassis/DeviceForm and whether a game controller is
+present (handheld). TabletModeWatcher exposes the KWin tabletModeChanged signal.
+
+Nothing consumes this yet; it is wired in by later patches. Tests live in
+tests/posture and are part of the opt-in CONFIG+=tests tree.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ app/app.pro                       |  11 +
+ app/backend/postureclassifier.cpp | 251 ++++++++++++++
+ app/backend/postureclassifier.h   | 209 ++++++++++++
+ app/backend/posturedetector.cpp   | 217 +++++++++++++
+ app/backend/posturedetector.h     |  49 +++
+ tests/posture/posture.pro         |   9 +
+ tests/posture/tst_posture.cpp     | 520 ++++++++++++++++++++++++++++++
+ tests/tests.pro                   |   1 +
+ 8 files changed, 1267 insertions(+)
+ create mode 100644 app/backend/postureclassifier.cpp
+ create mode 100644 app/backend/postureclassifier.h
+ create mode 100644 app/backend/posturedetector.cpp
+ create mode 100644 app/backend/posturedetector.h
+ create mode 100644 tests/posture/posture.pro
+ create mode 100644 tests/posture/tst_posture.cpp
+
+diff --git a/app/app.pro b/app/app.pro
+index f34d4bd4..e9de6626 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -180,6 +180,8 @@ SOURCES += \
+     backend/identitymanager.cpp \
+     backend/nvcomputer.cpp \
+     backend/nvhttp.cpp \
++    backend/postureclassifier.cpp \
++    backend/posturedetector.cpp \
+     backend/pyrowaveudpprobe.cpp \
+     backend/nvpairingmanager.cpp \
+     backend/computermanager.cpp \
+@@ -230,6 +232,8 @@ SOURCES += \
+     wm.cpp
+ 
+ HEADERS += \
++    backend/postureclassifier.h \
++    backend/posturedetector.h \
+     streaming/video/videothreadpriority.h \
+     streaming/video/timinggraph.h \
+     streaming/input/dualsensehid.h \
+@@ -589,6 +593,13 @@ linux:!disable-kwin-scanout-guard:packagesExist(wayland-client) {
+     DEFINES += HAVE_H264BITSTREAM
+ }
+ 
++# Tablet-mode detection through KWin's TabletModeManager over D-Bus. Builds
++# without QtDBus still work; they just lack the OS tablet-mode signal.
++linux:!disable-posture-dbus:qtHaveModule(dbus) {
++    QT += dbus
++    DEFINES += HAVE_POSTURE_DBUS
++}
++
+ # PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
+ # presents the decoded planes through libplacebo. macOS exports MoltenVK images
+ # as Metal textures so decoding and presentation share the same GPU planes.
+diff --git a/app/backend/postureclassifier.cpp b/app/backend/postureclassifier.cpp
+new file mode 100644
+index 00000000..1863d9df
+--- /dev/null
++++ b/app/backend/postureclassifier.cpp
+@@ -0,0 +1,251 @@
++#include "postureclassifier.h"
++
++#include <cstring>
++
++namespace posture {
++
++const char* className(PostureClass cls)
++{
++    switch (cls) {
++    case PostureClass::Desktop:  return "desktop";
++    case PostureClass::Laptop:   return "laptop";
++    case PostureClass::Tablet:   return "tablet";
++    case PostureClass::Handheld: return "handheld";
++    case PostureClass::Phone:    return "phone";
++    }
++    return "desktop";
++}
++
++bool parseClassName(const std::string& name, PostureClass& out)
++{
++    static const PostureClass all[] = {
++        PostureClass::Desktop, PostureClass::Laptop, PostureClass::Tablet,
++        PostureClass::Handheld, PostureClass::Phone,
++    };
++    for (PostureClass cls : all) {
++        if (name == className(cls)) {
++            out = cls;
++            return true;
++        }
++    }
++    return false;
++}
++
++Result classify(const Signals& s)
++{
++    Result r;
++    r.touch = s.hasTouchscreen;
++
++    const bool tabletSignal = s.osTabletMode.has_value();
++    // KWin can report tabletModeAvailable=false even on a detachable 2-in-1
++    // whose tabletMode property follows the real state (checked on a Dell
++    // Latitude 5290 2-in-1: tabletMode=true with the keyboard detached).
++    // So tabletMode=true is believed when a touchscreen exists, at lower
++    // confidence if the OS says it cannot report tablet mode. tabletMode=false
++    // with available=false is only 'unknown' and falls back to input devices.
++    const bool conflict = tabletSignal && s.osTabletModeAvailable.has_value() &&
++                          !*s.osTabletModeAvailable;
++    const bool trustedTablet = tabletSignal && (!conflict || *s.osTabletMode);
++
++    if (!s.hasTouchscreen) {
++        // Nothing to touch: never a touch class, whatever the OS says
++        r.cls = (s.portable.value_or(false)) ? PostureClass::Laptop : PostureClass::Desktop;
++        r.confidence = (tabletSignal && *s.osTabletMode) ? Confidence::Low : Confidence::High;
++        return r;
++    }
++
++    if (s.handheldForm) {
++        // A handheld gaming device has no keyboard to fold away; a docked keyboard
++        // cannot be told apart reliably, so that case is left to the user override.
++        r.cls = PostureClass::Handheld;
++        r.confidence = Confidence::High;
++        return r;
++    }
++
++    if (trustedTablet) {
++        if (*s.osTabletMode) {
++            // Tablet posture with a controller in hand is used like a handheld
++            r.cls = s.hasGamepad ? PostureClass::Handheld : PostureClass::Tablet;
++        }
++        else {
++            r.cls = PostureClass::Laptop;
++        }
++        r.confidence = conflict ? Confidence::Medium : Confidence::High;
++        return r;
++    }
++
++    // No usable OS tablet signal: touchscreen presence plus input devices
++    if (!s.hasKeyboard && !s.hasPointer) {
++        r.cls = s.hasGamepad ? PostureClass::Handheld : PostureClass::Tablet;
++        r.confidence = Confidence::Medium;
++    }
++    else {
++        // Keyboard or pointer present: a touchscreen laptop, or a touch monitor
++        r.cls = (s.portable.value_or(true)) ? PostureClass::Laptop : PostureClass::Desktop;
++        // A tablet-mode claim that the devices contradict is worth flagging
++        r.confidence = (conflict && *s.osTabletMode) ? Confidence::Low : Confidence::Medium;
++    }
++    return r;
++}
++
++Result resolve(const Signals& sig, Mode mode)
++{
++    if (mode == Mode::AlwaysTablet) {
++        Result r;
++        r.cls = PostureClass::Tablet;
++        r.confidence = Confidence::High;
++        r.touch = true;
++        return r;
++    }
++    if (mode == Mode::AlwaysHandheld) {
++        Result r;
++        r.cls = PostureClass::Handheld;
++        r.confidence = Confidence::High;
++        r.touch = true;
++        return r;
++    }
++    if (mode == Mode::AlwaysDesktop) {
++        // Desktop mode on the host; touch stays a capability so the host keeps
++        // the touch-sized display.
++        Result r = classify(sig);
++        r.cls = PostureClass::Laptop;
++        r.confidence = Confidence::High;
++        return r;
++    }
++    return classify(sig);
++}
++
++Payload makePayload(const Signals& sig, Mode mode, bool runtimeUpdate)
++{
++    Payload p;
++    if (mode == Mode::Never) {
++        return p;
++    }
++
++    const Result r = resolve(sig, mode);
++    if (!runtimeUpdate && r.cls == PostureClass::Desktop && !r.touch) {
++        return p;
++    }
++
++    p.valid = true;
++    p.cls = r.cls;
++    p.touch = r.touch;
++    return p;
++}
++
++std::string buildQuery(const Payload& p)
++{
++    if (!p.valid) {
++        return std::string();
++    }
++
++    std::string q = "clientPosture=";
++    q += className(p.cls);
++    q += p.touch ? "&clientTouch=1" : "&clientTouch=0";
++    return q;
++}
++
++Payload UpdateGate::normalize(Payload p)
++{
++    // An omitted launch payload means desktop, no touch
++    if (!p.valid) {
++        p.valid = true;
++        p.cls = PostureClass::Desktop;
++        p.touch = false;
++    }
++    return p;
++}
++
++bool UpdateGate::differs(const Payload& a, const Payload& b)
++{
++    // The host mode decides: tablet <-> handheld (a controller attached or
++    // removed) matters although both are touch-primary.
++    return hostMode(a.cls) != hostMode(b.cls) || a.touch != b.touch;
++}
++
++std::optional<Payload> UpdateGate::observe(const Payload& current, Clock::time_point now)
++{
++    const Payload cur = normalize(current);
++
++    if (!differs(cur, m_Sent)) {
++        // Back at the last sent state (or a change that is not worth sending)
++        m_Candidate.reset();
++        return std::nullopt;
++    }
++
++    if (!m_Candidate || differs(cur, *m_Candidate)) {
++        m_Candidate = cur;
++        m_CandidateSince = now;
++        return std::nullopt;
++    }
++    m_Candidate = cur;  // keep freshest size hints
++
++    if (now - m_CandidateSince < m_Debounce) {
++        return std::nullopt;
++    }
++
++    m_Sent = cur;
++    m_Candidate.reset();
++    return cur;
++}
++
++std::optional<bool> parseDisplayChange(const std::string& xml)
++{
++    static const std::string kAttr = "display_change=\"";
++    const auto rootEnd = xml.find('>', xml.find("<root"));
++    const auto at = xml.find(kAttr);
++    if (at == std::string::npos || rootEnd == std::string::npos || at > rootEnd) {
++        return std::nullopt;
++    }
++    const auto value = at + kAttr.size();
++    if (value + 1 >= xml.size() || xml[value + 1] != '"') {
++        return std::nullopt;
++    }
++    if (xml[value] == '1') {
++        return true;
++    }
++    if (xml[value] == '0') {
++        return false;
++    }
++    return std::nullopt;
++}
++
++RestartGate::RestartGate(bool enabled,
++                         const Payload& displayBaseline,
++                         Clock::time_point sessionStart,
++                         std::optional<Clock::time_point> lastRestart,
++                         std::chrono::milliseconds cooldown,
++                         std::chrono::milliseconds armDelay)
++    : m_Enabled(enabled),
++      m_BaselineTouch(touchPrimary(displayBaseline)),
++      m_LatestTouch(m_BaselineTouch),
++      m_ArmedAt(sessionStart + armDelay),
++      m_LastRestart(lastRestart),
++      m_Cooldown(cooldown)
++{
++}
++
++bool RestartGate::touchPrimary(const Payload& p)
++{
++    // An omitted payload (launch from a plain desktop) means not touch-primary
++    return p.valid && isTouchPrimary(p.cls);
++}
++
++void RestartGate::accepted(const Payload& sent, std::optional<bool> hostDisplayChange)
++{
++    m_LatestTouch = touchPrimary(sent);
++    m_HostDisplayChange = hostDisplayChange;
++}
++
++bool RestartGate::due(Clock::time_point now) const
++{
++    // The host knows whether its display still fits; trust it when it says so.
++    const bool displayChange = m_HostDisplayChange ? *m_HostDisplayChange
++                                                   : m_LatestTouch != m_BaselineTouch;
++    if (!m_Enabled || !displayChange || now < m_ArmedAt) {
++        return false;
++    }
++    return !m_LastRestart || now - *m_LastRestart >= m_Cooldown;
++}
++
++} // namespace posture
+diff --git a/app/backend/postureclassifier.h b/app/backend/postureclassifier.h
+new file mode 100644
+index 00000000..322337eb
+--- /dev/null
++++ b/app/backend/postureclassifier.h
+@@ -0,0 +1,209 @@
++#pragma once
++
++// Client posture classification for the stream-posture-sync feature.
++//
++// Pure logic, no Qt: maps locally observable signals to one of five classes
++// (desktop, laptop, tablet, handheld, phone) plus a confidence, decides what
++// goes on the wire and when a runtime change is worth reporting. Detection of
++// the signals lives in posturedetector.*; this file never touches the OS.
++//
++// Wire contract v2 (all optional, ignored by stock hosts):
++//   clientPosture=desktop|laptop|tablet|handheld|phone
++//   clientTouch=0|1
++// The class never depends on the screen size, DPI or aspect: only the device
++// type and keyboard state matter. Touch-primary means "docked touch keyboard
++// wanted". This client sends tablet for every touch-primary state; handheld and
++// phone exist for other clients and are only parsed here.
++
++#include <chrono>
++#include <optional>
++#include <string>
++
++namespace posture {
++
++enum class PostureClass {
++    Desktop,
++    Laptop,
++    Tablet,
++    Handheld,
++    Phone,
++};
++
++enum class Confidence {
++    Low,
++    Medium,
++    High,
++};
++
++// User choice (mirrors StreamingPreferences::PostureMode)
++enum class Mode {
++    Auto,
++    AlwaysTablet,
++    Never,
++    AlwaysHandheld,
++    AlwaysDesktop,
++};
++
++// What the host does with a class; several classes share one mode.
++enum class HostMode {
++    Desktop,
++    Tablet,
++    Handheld,
++};
++
++struct Signals {
++    // OS says the device is in tablet/slate mode (KWin tabletMode, Windows
++    // SM_CONVERTIBLESLATEMODE == 0). Unset when the OS has no such notion.
++    std::optional<bool> osTabletMode;
++    // OS says it can report tablet mode at all (KWin tabletModeAvailable).
++    // KWin on some 2-in-1s reports tabletMode=true with this false; the tablet
++    // signal is then not trustworthy.
++    std::optional<bool> osTabletModeAvailable;
++
++    bool hasTouchscreen = false;
++    bool hasKeyboard = false;
++    bool hasPointer = false;
++
++    // Chassis says portable (laptop, convertible, detachable). Unset = unknown.
++    std::optional<bool> portable;
++
++    // A game controller is present: built in (handheld) or attached.
++    bool hasGamepad = false;
++    // The OS or firmware declares a handheld gaming device (Windows DeviceForm,
++    // DMI product names of known handhelds).
++    bool handheldForm = false;
++};
++
++struct Result {
++    PostureClass cls = PostureClass::Desktop;
++    Confidence confidence = Confidence::Low;
++    bool touch = false;
++};
++
++// What goes on the wire. valid == false means "send nothing".
++struct Payload {
++    bool valid = false;
++    PostureClass cls = PostureClass::Desktop;
++    bool touch = false;
++};
++
++const char* className(PostureClass cls);
++bool parseClassName(const std::string& name, PostureClass& out);
++
++// Tablet, handheld and phone are the classes the host treats as touch-primary
++inline bool isTouchPrimary(PostureClass cls)
++{
++    return cls == PostureClass::Tablet || cls == PostureClass::Handheld || cls == PostureClass::Phone;
++}
++
++// The host mode a class maps to: handheld has its own, tablet and phone share
++// tablet, everything else is desktop.
++inline HostMode hostMode(PostureClass cls)
++{
++    if (cls == PostureClass::Handheld) {
++        return HostMode::Handheld;
++    }
++    return isTouchPrimary(cls) ? HostMode::Tablet : HostMode::Desktop;
++}
++
++// Classify from signals alone (the Auto path).
++Result classify(const Signals& sig);
++
++// Build the payload for a user mode: Never and (on launch) a non-touch desktop
++// yield an invalid payload, i.e. nothing is sent; callers must check
++// Payload::valid. AlwaysTablet overrides detection.
++//
++// For the launch/resume request (runtimeUpdate == false) a non-touch desktop
++// produces no payload. For a runtime update the new state is always explicit,
++// so the host can leave touch posture again.
++Payload makePayload(const Signals& sig, Mode mode, bool runtimeUpdate);
++
++// Result for a given mode (override-aware), used by makePayload and by callers
++// that want the class for logging.
++Result resolve(const Signals& sig, Mode mode);
++
++// Query string without leading '&', e.g.
++// "clientPosture=tablet&clientTouch=1".
++// Empty for an invalid payload.
++std::string buildQuery(const Payload& payload);
++
++// Decides whether a runtime posture change is worth sending: only when the
++// touch-primary boundary is crossed or the touch-ness changes, and only after
++// the new state has been stable for the debounce interval.
++class UpdateGate {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    UpdateGate(const Payload& lastSent, std::chrono::milliseconds debounce)
++        : m_Sent(normalize(lastSent)), m_Debounce(debounce) {}
++
++    // Feed the latest observation. Returns the payload to send, if any.
++    std::optional<Payload> observe(const Payload& current, Clock::time_point now);
++
++private:
++    static Payload normalize(Payload p);
++    static bool differs(const Payload& a, const Payload& b);
++
++    Payload m_Sent;
++    std::chrono::milliseconds m_Debounce;
++    std::optional<Payload> m_Candidate;
++    Clock::time_point m_CandidateSince{};
++};
++
++// Decides when an accepted runtime update should be followed by an automatic
++// resume of the stream. The host only rebuilds its virtual display on a
++// resume, so after /posture succeeded the client reconnects once, when the
++// touch-primary boundary was crossed relative to the posture the running
++// display was created for (the "baseline", i.e. the launch payload of the
++// current session).
++//
++// Safety rules, all pure logic so they can be tested:
++//   - setting off: never
++//   - nothing before the stream has run for armDelay (never while connecting)
++//   - at most one restart per cooldown, across sessions (lastRestart is carried
++//     into the next session's gate)
++//   - a flip that was blocked by the cooldown is not lost: due() turns true when
++//     the cooldown ends, but only if the latest accepted posture still differs
++//     from the baseline, so a flap back to the baseline needs no restart
++//   - never loops: the new session builds its gate from its own launch payload,
++//     so the posture it started in is the baseline and nothing is due
++// Reads display_change="0|1" from the root element of a /posture reply.
++// Empty when the host did not send it (older hosts).
++std::optional<bool> parseDisplayChange(const std::string& xml);
++
++class RestartGate {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    static constexpr std::chrono::milliseconds kDefaultCooldown{60000};
++    static constexpr std::chrono::milliseconds kDefaultArmDelay{5000};
++
++    RestartGate(bool enabled,
++                const Payload& displayBaseline,
++                Clock::time_point sessionStart,
++                std::optional<Clock::time_point> lastRestart = std::nullopt,
++                std::chrono::milliseconds cooldown = kDefaultCooldown,
++                std::chrono::milliseconds armDelay = kDefaultArmDelay);
++
++    // The host accepted this posture update. hostDisplayChange is the host's own
++    // answer (display_change in the /posture reply): true when the display made
++    // at launch no longer fits, false when it still does. Hosts that do not say
++    // leave it empty and the gate falls back to comparing touch-primary states.
++    void accepted(const Payload& sent, std::optional<bool> hostDisplayChange = std::nullopt);
++
++    // True when the session should be resumed now.
++    bool due(Clock::time_point now) const;
++
++private:
++    static bool touchPrimary(const Payload& p);
++
++    bool m_Enabled;
++    bool m_BaselineTouch;
++    bool m_LatestTouch;
++    std::optional<bool> m_HostDisplayChange;
++    Clock::time_point m_ArmedAt;
++    std::optional<Clock::time_point> m_LastRestart;
++    std::chrono::milliseconds m_Cooldown;
++};
++
++} // namespace posture
+diff --git a/app/backend/posturedetector.cpp b/app/backend/posturedetector.cpp
+new file mode 100644
+index 00000000..b8b02283
+--- /dev/null
++++ b/app/backend/posturedetector.cpp
+@@ -0,0 +1,217 @@
++#include "posturedetector.h"
++
++#include <QtGlobal>
++#include <utility>
++#include <QString>
++
++#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
++#include <QInputDevice>
++#endif
++
++#ifdef Q_OS_LINUX
++#include <QFile>
++#endif
++
++#ifdef HAVE_POSTURE_DBUS
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusVariant>
++#endif
++
++#ifdef Q_OS_WIN
++#include <windows.h>
++#endif
++
++#include "SDL_compat.h"
++
++namespace posture {
++
++// The SDL game controller subsystem is reference counted, so a short-lived
++// init here is safe whether or not the stream or the GUI already holds it.
++static bool gameControllerPresent()
++{
++    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
++        return false;
++    }
++    bool found = false;
++    const int count = SDL_NumJoysticks();
++    for (int i = 0; i < count && !found; i++) {
++        found = SDL_IsGameController(i) == SDL_TRUE;
++    }
++    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
++    return found;
++}
++
++#ifdef Q_OS_LINUX
++// SMBIOS chassis types: https://www.dmtf.org/standards/smbios (System Enclosure)
++static std::optional<bool> chassisIsPortable()
++{
++    QFile f("/sys/class/dmi/id/chassis_type");
++    if (!f.open(QIODevice::ReadOnly)) {
++        return std::nullopt;
++    }
++    bool ok = false;
++    const int type = QString::fromUtf8(f.readAll()).trimmed().toInt(&ok);
++    if (!ok) {
++        return std::nullopt;
++    }
++    switch (type) {
++    case 8:   // Portable
++    case 9:   // Laptop
++    case 10:  // Notebook
++    case 11:  // Handheld
++    case 14:  // Sub Notebook
++    case 30:  // Tablet
++    case 31:  // Convertible
++    case 32:  // Detachable
++        return true;
++    case 3:   // Desktop
++    case 4:   // Low Profile Desktop
++    case 5:   // Pizza Box
++    case 6:   // Mini Tower
++    case 7:   // Tower
++    case 13:  // All in One
++    case 15:  // Space-saving
++    case 16:  // Lunch Box
++    case 17:  // Main Server Chassis
++    case 23:  // Rack Mount Chassis
++    case 24:  // Sealed-case PC
++    case 34:  // Embedded PC
++    case 35:  // Mini PC
++    case 36:  // Stick PC
++        return false;
++    default:  // Other/Unknown/virtual
++        return std::nullopt;
++    }
++}
++#endif
++
++Signals collectLocalSignals()
++{
++    Signals s;
++
++#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
++    for (const QInputDevice* dev : QInputDevice::devices()) {
++        switch (dev->type()) {
++        case QInputDevice::DeviceType::TouchScreen:
++            s.hasTouchscreen = true;
++            break;
++        case QInputDevice::DeviceType::Keyboard:
++            s.hasKeyboard = true;
++            break;
++        case QInputDevice::DeviceType::Mouse:
++        case QInputDevice::DeviceType::TouchPad:
++            s.hasPointer = true;
++            break;
++        default:
++            break;
++        }
++    }
++#endif
++
++#ifdef Q_OS_LINUX
++    s.portable = chassisIsPortable();
++#endif
++
++#ifdef Q_OS_WIN
++    // Not compiled or run in the Linux development environment; checked by
++    // inspection against the Win32 documentation only.
++    constexpr int kSmDigitizer = 94;          // SM_DIGITIZER
++    constexpr int kNidIntegratedTouch = 0x1;  // NID_INTEGRATED_TOUCH
++    constexpr int kNidReady = 0x80;           // NID_READY
++    const int digitizer = GetSystemMetrics(kSmDigitizer);
++    s.hasTouchscreen = (digitizer & kNidIntegratedTouch) && (digitizer & kNidReady);
++    s.hasPointer = GetSystemMetrics(SM_MOUSEPRESENT) != 0;
++    // Windows has no cheap keyboard-presence query; a detached tablet has no
++    // mouse either, so treat the two together.
++    s.hasKeyboard = s.hasPointer;
++
++    SYSTEM_POWER_STATUS power = {};
++    if (GetSystemPowerStatus(&power)) {
++        // 128 = no system battery
++        s.portable = power.BatteryFlag != 128 && power.BatteryFlag != 255;
++    }
++
++    // DeviceForm is the OEM's declaration of the device type; 0x2E is a
++    // handheld gaming PC.
++    DWORD deviceForm = 0;
++    DWORD deviceFormSize = sizeof(deviceForm);
++    if (RegGetValueW(HKEY_LOCAL_MACHINE,
++                     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\OEM",
++                     L"DeviceForm",
++                     RRF_RT_REG_DWORD,
++                     nullptr,
++                     &deviceForm,
++                     &deviceFormSize) == ERROR_SUCCESS) {
++        s.handheldForm = deviceForm == 0x2E;
++    }
++#endif
++
++    s.hasGamepad = gameControllerPresent();
++
++    return s;
++}
++
++void collectOsTabletSignals(Signals& s)
++{
++#ifdef HAVE_POSTURE_DBUS
++    QDBusConnection bus = QDBusConnection::sessionBus();
++    if (bus.isConnected()) {
++        auto readBool = [&bus](const char* property) -> std::optional<bool> {
++            QDBusMessage call = QDBusMessage::createMethodCall(
++                QStringLiteral("org.kde.KWin"), QStringLiteral("/org/kde/KWin"),
++                QStringLiteral("org.freedesktop.DBus.Properties"), QStringLiteral("Get"));
++            call << QStringLiteral("org.kde.KWin.TabletModeManager") << QString::fromLatin1(property);
++            const QDBusMessage reply = bus.call(call, QDBus::Block, 500);
++            if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++                return std::nullopt;
++            }
++            const QVariant value = qvariant_cast<QDBusVariant>(reply.arguments().constFirst()).variant();
++            if (value.userType() != QMetaType::Bool) {
++                return std::nullopt;
++            }
++            return value.toBool();
++        };
++
++        s.osTabletMode = readBool("tabletMode");
++        s.osTabletModeAvailable = readBool("tabletModeAvailable");
++    }
++#endif
++
++#ifdef Q_OS_WIN
++    // SM_CONVERTIBLESLATEMODE (0x2003): 0 = slate, non-zero = laptop. Desktops
++    // and external touch monitors may report 0 as well, so only trust it on a
++    // portable machine with an integrated digitizer.
++    if (s.hasTouchscreen && s.portable.value_or(false)) {
++        constexpr int kSmConvertibleSlateMode = 0x2003;
++        s.osTabletMode = GetSystemMetrics(kSmConvertibleSlateMode) == 0;
++    }
++#endif
++
++    Q_UNUSED(s);
++}
++
++TabletModeWatcher::TabletModeWatcher(std::function<void(bool)> onChange)
++    : m_OnChange(std::move(onChange))
++{
++#ifdef HAVE_POSTURE_DBUS
++    QDBusConnection bus = QDBusConnection::sessionBus();
++    if (bus.isConnected()) {
++        m_Active = bus.connect(QStringLiteral("org.kde.KWin"),
++                               QStringLiteral("/org/kde/KWin"),
++                               QStringLiteral("org.kde.KWin.TabletModeManager"),
++                               QStringLiteral("tabletModeChanged"),
++                               this,
++                               SLOT(onTabletModeChanged(bool)));
++    }
++#endif
++}
++
++void TabletModeWatcher::onTabletModeChanged(bool tabletMode)
++{
++    if (m_OnChange) {
++        m_OnChange(tabletMode);
++    }
++}
++
++} // namespace posture
+diff --git a/app/backend/posturedetector.h b/app/backend/posturedetector.h
+new file mode 100644
+index 00000000..029aaa93
+--- /dev/null
++++ b/app/backend/posturedetector.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include "postureclassifier.h"
++
++#include <QObject>
++
++#include <functional>
++
++// Gathers the local signals that posture::classify() consumes. No monitor
++// model, EDID, size or host data is read; every value comes from the OS or Qt.
++namespace posture {
++
++// Non-blocking: Qt input devices and chassis type. Call from the GUI thread
++// (Qt's device list is not thread safe). Screen size and DPI are never read.
++Signals collectLocalSignals();
++
++// OS tablet/slate-mode state. May block briefly (KWin D-Bus, 500 ms cap), so
++// call it off the GUI/stream thread. Leaves the fields unset when the OS has
++// no such signal or the build lacks the feature.
++//   Linux/KDE: org.kde.KWin /org/kde/KWin org.kde.KWin.TabletModeManager
++//   Windows:   GetSystemMetrics(SM_CONVERTIBLESLATEMODE), 0 == slate
++void collectOsTabletSignals(Signals& out);
++
++// Event-driven tablet-mode source: calls onChange(tabletMode) from the thread
++// that owns this object (which must run a Qt event loop) whenever the OS says
++// tablet mode changed. Linux/KDE subscribes to the KWin TabletModeManager
++// tabletModeChanged D-Bus signal; elsewhere (and in builds without QtDBus) it
++// is inert and the caller's periodic sampling is the only source. Windows has
++// no cheap hook without a window of our own, so it samples
++// SM_CONVERTIBLESLATEMODE once a second instead of reacting to WM_SETTINGCHANGE.
++class TabletModeWatcher : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit TabletModeWatcher(std::function<void(bool)> onChange);
++
++    // True when an event subscription is active.
++    bool active() const { return m_Active; }
++
++private slots:
++    void onTabletModeChanged(bool tabletMode);
++
++private:
++    std::function<void(bool)> m_OnChange;
++    bool m_Active = false;
++};
++
++} // namespace posture
+diff --git a/tests/posture/posture.pro b/tests/posture/posture.pro
+new file mode 100644
+index 00000000..83eaa6ad
+--- /dev/null
++++ b/tests/posture/posture.pro
+@@ -0,0 +1,9 @@
++TEMPLATE = app
++TARGET = tst_posture
++QT = core testlib
++CONFIG += console testcase c++17
++CONFIG -= app_bundle
++INCLUDEPATH += $$PWD/../../app
++SOURCES += $$PWD/tst_posture.cpp \
++    $$PWD/../../app/backend/postureclassifier.cpp
++HEADERS += $$PWD/../../app/backend/postureclassifier.h
+diff --git a/tests/posture/tst_posture.cpp b/tests/posture/tst_posture.cpp
+new file mode 100644
+index 00000000..c5cfe496
+--- /dev/null
++++ b/tests/posture/tst_posture.cpp
+@@ -0,0 +1,520 @@
++#include <QtTest>
++
++#include "backend/postureclassifier.h"
++
++using namespace posture;
++using std::chrono::milliseconds;
++
++namespace {
++
++Signals touchOnly()
++{
++    Signals s;
++    s.hasTouchscreen = true;
++    return s;
++}
++
++Signals touchLaptop()
++{
++    Signals s;
++    s.hasTouchscreen = true;
++    s.hasKeyboard = true;
++    s.hasPointer = true;
++    s.portable = true;
++    return s;
++}
++
++} // namespace
++
++class PostureTest : public QObject
++{
++    Q_OBJECT
++
++private slots:
++    void classNames()
++    {
++        PostureClass c;
++        QVERIFY(parseClassName("handheld", c));
++        QCOMPARE(c, PostureClass::Handheld);
++        QVERIFY(!parseClassName("Tablet", c));  // lowercase only
++        QVERIFY(!parseClassName("", c));
++        QCOMPARE(QString(className(PostureClass::Phone)), QString("phone"));
++    }
++
++    void noTouchIsDesktop()
++    {
++        Signals s;
++        s.hasKeyboard = s.hasPointer = true;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Desktop);
++        QVERIFY(!r.touch);
++        QCOMPARE(r.confidence, Confidence::High);
++    }
++
++    void noTouchPortableIsLaptop()
++    {
++        Signals s;
++        s.hasKeyboard = s.hasPointer = true;
++        s.portable = true;
++        QCOMPARE(classify(s).cls, PostureClass::Laptop);
++    }
++
++    void noTouchIgnoresTabletMode()
++    {
++        Signals s;
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = true;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Desktop);
++        QCOMPARE(r.confidence, Confidence::Low);
++    }
++
++    void trustedTabletMode()
++    {
++        Signals s = touchLaptop();
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = true;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Tablet);
++        QCOMPARE(r.confidence, Confidence::High);
++        QVERIFY(r.touch);
++    }
++
++    void trustedLaptopMode()
++    {
++        Signals s = touchLaptop();
++        s.osTabletMode = false;
++        s.osTabletModeAvailable = true;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Laptop);
++        QCOMPARE(r.confidence, Confidence::High);
++    }
++
++    // Dell 5290: tabletMode=true, tabletModeAvailable=false while the keyboard
++    // is detached (measured on the device): believe tabletMode, medium confidence,
++    // even though the internal keyboard/touchpad nodes stay registered.
++    void kwinQuirkTabletModeTrueIsTabletEvenWithInputNodes()
++    {
++        Signals s = touchLaptop();
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = false;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Tablet);
++        QCOMPARE(r.confidence, Confidence::Medium);
++        QVERIFY(r.touch);
++    }
++
++    // tabletMode=false with available=false is 'unknown': use input devices
++    void kwinQuirkTabletModeFalseFallsBackToDevices()
++    {
++        Signals s = touchLaptop();
++        s.osTabletMode = false;
++        s.osTabletModeAvailable = false;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Laptop);
++        QVERIFY(r.touch);
++    }
++
++    void kwinQuirkWithKeyboardDetachedIsTablet()
++    {
++        Signals s = touchOnly();
++        s.portable = true;
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = false;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Tablet);
++        QCOMPARE(r.confidence, Confidence::Medium);
++    }
++
++    // Contract v2: no signal may depend on size, DPI or aspect. A touch-only
++    // device is a tablet whatever it is; the classifier has no size input.
++    void touchOnlyIsTabletWithoutSizeInput()
++    {
++        QCOMPARE(classify(touchOnly()).cls, PostureClass::Tablet);
++        QCOMPARE(classify(touchOnly()).confidence, Confidence::Medium);
++        Signals s = touchOnly();
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = true;
++        QCOMPARE(classify(s).cls, PostureClass::Tablet);
++    }
++
++    // Only tablet is ever produced; phone and handheld are parse-only here
++    void gamepadInTabletPostureIsHandheld()
++    {
++        Signals s = touchLaptop();
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = true;
++        s.hasGamepad = true;
++        QCOMPARE(classify(s).cls, PostureClass::Handheld);
++
++        // Keyboard folded out: the controller does not change desktop mode
++        s.osTabletMode = false;
++        QCOMPARE(classify(s).cls, PostureClass::Laptop);
++
++        // No OS signal, nothing but touch and a controller
++        Signals bare = touchOnly();
++        bare.hasGamepad = true;
++        QCOMPARE(classify(bare).cls, PostureClass::Handheld);
++
++        // A controller on a machine without a touchscreen changes nothing
++        Signals desktop;
++        desktop.hasKeyboard = true;
++        desktop.hasPointer = true;
++        desktop.hasGamepad = true;
++        QCOMPARE(classify(desktop).cls, PostureClass::Desktop);
++    }
++
++    void handheldDeviceFormIsHandheld()
++    {
++        // ROG Ally style: touch, battery, a mouse device, OEM says handheld
++        Signals s = touchLaptop();
++        s.handheldForm = true;
++        const Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Handheld);
++        QCOMPARE(r.confidence, Confidence::High);
++        QVERIFY(r.touch);
++
++        // Without a touchscreen the form alone is not enough
++        Signals noTouch;
++        noTouch.handheldForm = true;
++        QCOMPARE(classify(noTouch).cls, PostureClass::Desktop);
++    }
++
++    void overrideAlwaysHandheldAndAlwaysDesktop()
++    {
++        const Result handheld = resolve(touchLaptop(), Mode::AlwaysHandheld);
++        QCOMPARE(handheld.cls, PostureClass::Handheld);
++        QVERIFY(handheld.touch);
++
++        Signals tablet = touchOnly();
++        const Result desktop = resolve(tablet, Mode::AlwaysDesktop);
++        QCOMPARE(desktop.cls, PostureClass::Laptop);
++        QVERIFY(desktop.touch);
++    }
++
++    void hostModeMapping()
++    {
++        QCOMPARE(hostMode(PostureClass::Desktop), HostMode::Desktop);
++        QCOMPARE(hostMode(PostureClass::Laptop), HostMode::Desktop);
++        QCOMPARE(hostMode(PostureClass::Tablet), HostMode::Tablet);
++        QCOMPARE(hostMode(PostureClass::Phone), HostMode::Tablet);
++        QCOMPARE(hostMode(PostureClass::Handheld), HostMode::Handheld);
++    }
++
++    void gateSendsWhenAControllerMakesItAHandheld()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        Payload tablet{true, PostureClass::Tablet, true};
++        Payload handheld{true, PostureClass::Handheld, true};
++        UpdateGate gate(tablet, milliseconds(3000));
++        QVERIFY(!gate.observe(handheld, t0));
++        const auto sent = gate.observe(handheld, t0 + std::chrono::seconds(4));
++        QVERIFY(sent.has_value());
++        QCOMPARE(sent->cls, PostureClass::Handheld);
++    }
++
++    void neverProducesPhoneOrHandheldWithoutGamepadSignals()
++    {
++        for (int bits = 0; bits < 64; ++bits) {
++            Signals s;
++            s.hasTouchscreen = bits & 1;
++            s.hasKeyboard = bits & 2;
++            s.hasPointer = bits & 4;
++            if (bits & 8) s.portable = true;
++            if (bits & 16) s.osTabletMode = true;
++            if (bits & 32) s.osTabletModeAvailable = false;
++            const PostureClass c = classify(s).cls;
++            QVERIFY(c != PostureClass::Phone && c != PostureClass::Handheld);
++        }
++    }
++
++    void touchMonitorIsDesktopWhenNotPortable()
++    {
++        Signals s = touchLaptop();
++        s.portable = false;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Desktop);
++        QVERIFY(r.touch);
++    }
++
++    void windowsSlateMode()
++    {
++        // SM_CONVERTIBLESLATEMODE == 0 with an integrated digitizer
++        Signals s = touchLaptop();
++        s.osTabletMode = true;
++        QCOMPARE(classify(s).cls, PostureClass::Tablet);
++        s.osTabletMode = false;
++        QCOMPARE(classify(s).cls, PostureClass::Laptop);
++    }
++
++    void overrideNeverSendsNothing()
++    {
++        Signals s = touchOnly();
++        QVERIFY(!makePayload(s, Mode::Never, false).valid);
++        QVERIFY(!makePayload(s, Mode::Never, true).valid);
++        QVERIFY(buildQuery(makePayload(s, Mode::Never, false)).empty());
++    }
++
++    void overrideAlwaysTabletWinsOverDetection()
++    {
++        Signals s;  // plain desktop
++        s.hasKeyboard = s.hasPointer = true;
++        Payload p = makePayload(s, Mode::AlwaysTablet, false);
++        QVERIFY(p.valid);
++        QCOMPARE(p.cls, PostureClass::Tablet);
++        QVERIFY(p.touch);
++        QCOMPARE(QString::fromStdString(buildQuery(p)), QString("clientPosture=tablet&clientTouch=1"));
++    }
++
++    void desktopWithoutTouchOmitsParamsOnLaunch()
++    {
++        Signals s;
++        s.hasKeyboard = s.hasPointer = true;
++        QVERIFY(!makePayload(s, Mode::Auto, false).valid);
++        // A runtime update must be explicit so the host can leave touch posture
++        Payload u = makePayload(s, Mode::Auto, true);
++        QVERIFY(u.valid);
++        QCOMPARE(QString::fromStdString(buildQuery(u)), QString("clientPosture=desktop&clientTouch=0"));
++    }
++
++    void queryBuilding()
++    {
++        // No size or DPI hints on the wire, whatever the screen is
++        Signals s = touchOnly();
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = true;
++        QCOMPARE(QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, false))),
++                 QString("clientPosture=tablet&clientTouch=1"));
++        QVERIFY(!QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, true))).contains("Diagonal"));
++        QVERIFY(!QString::fromStdString(buildQuery(makePayload(s, Mode::Auto, true))).contains("Dpi"));
++
++        // Laptop is sent (host ignores it); touch=1 only when a touchscreen exists
++        Signals l;
++        l.hasKeyboard = l.hasPointer = true;
++        l.portable = true;
++        QCOMPARE(QString::fromStdString(buildQuery(makePayload(l, Mode::Auto, false))),
++                 QString("clientPosture=laptop&clientTouch=0"));
++
++        QVERIFY(buildQuery(Payload{}).empty());
++    }
++
++    void gateIgnoresUnchangedAndSameBoundaryChanges()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        Payload tablet{true, PostureClass::Tablet, true};
++        Payload phone{true, PostureClass::Phone, true};
++        UpdateGate gate(tablet, milliseconds(3000));
++        QVERIFY(!gate.observe(tablet, t0));
++        // Touch class to touch class never crosses the boundary
++        for (int i = 0; i < 10; ++i)
++            QVERIFY(!gate.observe(phone, t0 + std::chrono::seconds(i * 2)));
++    }
++
++    void gateOmittedLaunchMeansDesktop()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        UpdateGate gate(Payload{}, milliseconds(3000));
++        Payload desktop{true, PostureClass::Desktop, false};
++        QVERIFY(!gate.observe(desktop, t0));
++        Payload laptop{true, PostureClass::Laptop, false};
++        QVERIFY(!gate.observe(laptop, t0 + std::chrono::seconds(10)));
++    }
++
++    void gateDebouncesAndSendsOnceOnBoundary()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        Payload laptop{true, PostureClass::Laptop, true};
++        Payload tablet{true, PostureClass::Tablet, true};
++        UpdateGate gate(laptop, milliseconds(3000));
++
++        QVERIFY(!gate.observe(tablet, t0));
++        QVERIFY(!gate.observe(tablet, t0 + milliseconds(2900)));
++        auto sent = gate.observe(tablet, t0 + milliseconds(3000));
++        QVERIFY(sent.has_value());
++        QCOMPARE(sent->cls, PostureClass::Tablet);
++        // Now sent: staying tablet sends nothing more
++        QVERIFY(!gate.observe(tablet, t0 + milliseconds(9000)));
++        // And flipping back is a new change that needs its own debounce
++        QVERIFY(!gate.observe(laptop, t0 + milliseconds(10000)));
++        QVERIFY(gate.observe(laptop, t0 + milliseconds(13000)).has_value());
++    }
++
++    void gateFlappingSendsOnlyFinalState()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        Payload laptop{true, PostureClass::Laptop, true};
++        Payload tablet{true, PostureClass::Tablet, true};
++        UpdateGate gate(laptop, milliseconds(3000));
++
++        // Flip back and forth inside the window: nothing is sent, even once
++        // the total time exceeds the debounce interval.
++        QVERIFY(!gate.observe(tablet, t0));
++        QVERIFY(!gate.observe(laptop, t0 + milliseconds(1000)));
++        QVERIFY(!gate.observe(tablet, t0 + milliseconds(2000)));
++        QVERIFY(!gate.observe(laptop, t0 + milliseconds(3000)));
++        QVERIFY(!gate.observe(tablet, t0 + milliseconds(4000)));
++        QVERIFY(!gate.observe(tablet, t0 + milliseconds(6999)));
++        auto sent = gate.observe(tablet, t0 + milliseconds(7000));
++        QVERIFY(sent.has_value());
++        QCOMPARE(sent->cls, PostureClass::Tablet);
++    }
++
++    void gateTouchnessChangeCounts()
++    {
++        const auto t0 = UpdateGate::Clock::time_point{} + std::chrono::seconds(100);
++        Payload noTouch{true, PostureClass::Laptop, false};
++        Payload touch{true, PostureClass::Laptop, true};
++        UpdateGate gate(noTouch, milliseconds(3000));
++        QVERIFY(!gate.observe(touch, t0));
++        QVERIFY(gate.observe(touch, t0 + milliseconds(3000)).has_value());
++    }
++
++    // --- RestartGate -----------------------------------------------------
++
++    void restartGateNeedsAcceptedBoundaryCrossing()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        Payload laptop{true, PostureClass::Laptop, true};
++        Payload tablet{true, PostureClass::Tablet, true};
++        RestartGate gate(true, laptop, t0);
++        const auto later = t0 + std::chrono::seconds(30);
++        QVERIFY(!gate.due(later));          // nothing accepted yet
++        gate.accepted(tablet);
++        QVERIFY(gate.due(later));
++    }
++
++    void restartGateIgnoresTouchToTouchAndTouchnessOnly()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        const auto later = t0 + std::chrono::seconds(30);
++        Payload tablet{true, PostureClass::Tablet, true};
++        Payload phone{true, PostureClass::Phone, true};
++        RestartGate touch(true, tablet, t0);
++        touch.accepted(phone);
++        QVERIFY(!touch.due(later));
++
++        // laptop with touch <-> laptop without: the host sees no size boundary
++        Payload laptopNoTouch{true, PostureClass::Laptop, false};
++        Payload laptopTouch{true, PostureClass::Laptop, true};
++        RestartGate lap(true, laptopNoTouch, t0);
++        lap.accepted(laptopTouch);
++        QVERIFY(!lap.due(later));
++    }
++
++    void restartGateFollowsTheHostAnswer()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        const auto later = t0 + std::chrono::seconds(30);
++        Payload laptop{true, PostureClass::Laptop, true};
++        Payload tablet{true, PostureClass::Tablet, true};
++
++        // Keyboard flip, host keeps its display: never restart
++        RestartGate keep(true, laptop, t0);
++        keep.accepted(tablet, false);
++        QVERIFY(!keep.due(later));
++
++        // Host says the display no longer fits: restart, even touch to touch
++        RestartGate change(true, tablet, t0);
++        change.accepted(Payload{true, PostureClass::Phone, true}, true);
++        QVERIFY(change.due(later));
++
++        // The host answer of the latest update wins
++        RestartGate back(true, laptop, t0);
++        back.accepted(tablet, true);
++        back.accepted(laptop, false);
++        QVERIFY(!back.due(later));
++    }
++
++    void parseDisplayChangeReadsTheRootAttribute()
++    {
++        QCOMPARE(parseDisplayChange("<?xml version=\"1.0\"?>\n<root display_change=\"0\" status_code=\"200\"/>"), std::optional<bool>(false));
++        QCOMPARE(parseDisplayChange("<root status_code=\"200\" display_change=\"1\"/>"), std::optional<bool>(true));
++        QVERIFY(!parseDisplayChange("<root status_code=\"200\"/>"));
++        QVERIFY(!parseDisplayChange("<root display_change=\"x\"/>"));
++        QVERIFY(!parseDisplayChange("<root status_code=\"200\"><a display_change=\"1\"/></root>"));
++        QVERIFY(!parseDisplayChange(""));
++    }
++
++    void restartGateOmittedLaunchPayloadIsDesktop()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        RestartGate gate(true, Payload{}, t0);
++        gate.accepted(Payload{true, PostureClass::Tablet, true});
++        QVERIFY(gate.due(t0 + std::chrono::seconds(10)));
++    }
++
++    void restartGateSettingOffNeverRestarts()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        RestartGate gate(false, Payload{true, PostureClass::Laptop, false}, t0);
++        gate.accepted(Payload{true, PostureClass::Tablet, true});
++        QVERIFY(!gate.due(t0 + std::chrono::hours(1)));
++    }
++
++    void restartGateNotWhileConnecting()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        RestartGate gate(true, Payload{true, PostureClass::Laptop, false}, t0);
++        gate.accepted(Payload{true, PostureClass::Tablet, true});
++        QVERIFY(!gate.due(t0));
++        QVERIFY(!gate.due(t0 + RestartGate::kDefaultArmDelay - milliseconds(1)));
++        QVERIFY(gate.due(t0 + RestartGate::kDefaultArmDelay));
++    }
++
++    void restartGateCooldownAcrossSessions()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        Payload laptop{true, PostureClass::Laptop, false};
++        Payload tablet{true, PostureClass::Tablet, true};
++        // A restart happened at t0; the next session starts 8 s later
++        const auto start = t0 + std::chrono::seconds(8);
++        RestartGate gate(true, tablet, start, t0);
++        gate.accepted(laptop);  // flipped straight back
++        QVERIFY(!gate.due(start + std::chrono::seconds(10)));
++        QVERIFY(!gate.due(t0 + milliseconds(59999)));
++        QVERIFY(gate.due(t0 + milliseconds(60000)));  // deferred, not lost
++    }
++
++    // Baseline reset: the new session starts in the posture the user is in, so
++    // the restart cannot immediately trigger another one (no loop).
++    void restartGateBaselineResetPreventsLoop()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        Payload laptop{true, PostureClass::Laptop, false};
++        Payload tablet{true, PostureClass::Tablet, true};
++        RestartGate first(true, laptop, t0);
++        first.accepted(tablet);
++        const auto restartAt = t0 + std::chrono::seconds(20);
++        QVERIFY(first.due(restartAt));
++
++        // The restarted session launches as tablet; its gate is fresh
++        RestartGate second(true, tablet, restartAt + std::chrono::seconds(2), restartAt);
++        for (int i = 0; i < 200; ++i)
++            QVERIFY(!second.due(restartAt + std::chrono::seconds(2 + i)));
++        // Same posture re-reported (host accepted again): still nothing
++        second.accepted(tablet);
++        QVERIFY(!second.due(restartAt + std::chrono::minutes(10)));
++    }
++
++    // Flap during the cooldown: laptop -> tablet (restart) -> laptop -> tablet.
++    // Only the state at cooldown end matters.
++    void restartGateFlapDuringCooldown()
++    {
++        const auto t0 = RestartGate::Clock::time_point{} + std::chrono::seconds(1000);
++        Payload laptop{true, PostureClass::Laptop, false};
++        Payload tablet{true, PostureClass::Tablet, true};
++        const auto restartAt = t0;
++        RestartGate gate(true, tablet, restartAt + std::chrono::seconds(2), restartAt);
++
++        gate.accepted(laptop);
++        QVERIFY(!gate.due(restartAt + std::chrono::seconds(20)));   // cooldown
++        gate.accepted(tablet);                                     // flapped back
++        QVERIFY(!gate.due(restartAt + std::chrono::seconds(61)));  // baseline again
++
++        gate.accepted(laptop);
++        QVERIFY(gate.due(restartAt + std::chrono::seconds(61)));   // genuinely differs
++    }
++};
++
++QTEST_APPLESS_MAIN(PostureTest)
++#include "tst_posture.moc"
+diff --git a/tests/tests.pro b/tests/tests.pro
+index ba5e5663..fbdcc383 100644
+--- a/tests/tests.pro
++++ b/tests/tests.pro
+@@ -10,6 +10,7 @@ contains(CONFIG, tests) {
+     launchWarning.file = $$PWD/backend/launchwarning.pro
+     SUBDIRS += launchWarning
+     SUBDIRS += updates
++    SUBDIRS += posture
+     SUBDIRS += vrr
+     SUBDIRS += haptics
+     SUBDIRS += steamcontroller

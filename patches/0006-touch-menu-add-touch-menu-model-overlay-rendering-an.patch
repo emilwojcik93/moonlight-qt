@@ -1,0 +1,1978 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Wed, 18 Nov 2026 11:08:58 +0100
+Subject: [PATCH 6/7] touch-menu: add touch menu model, overlay rendering and
+ tests
+
+touch-menu: add touch menu model, overlay rendering and tests
+
+A tablet or 2-in-1 without its keyboard has no way to leave a stream: the quit
+shortcut and the gamepad chord need physical keys. Add the menu itself.
+
+touchmenu.{h,cpp} is a pure class (gesture recognizer plus layout) with unit
+tests: holding 3+ fingers still for 800 ms, a two-finger swipe from the right
+edge (one finger from the right edge stays free for the host, three fingers
+never reach the client on KDE) and a small corner handle that appears on touch
+activity and hides after 6 s all open it; items are Disconnect, Quit session,
+Toggle statistics and Close menu.
+
+OverlayManager draws the menu on the existing bottom-left status overlay, which
+every renderer already places 1:1, so no renderer changes are needed. The right
+hand panel is a full-width surface that is transparent outside the panel;
+renderers can opt out through supportsWideOverlay().
+
+Not yet reachable: input handling and session wiring follow in the next patch.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ app/app.pro                            |   2 +
+ app/streaming/input/touchmenu.cpp      | 523 +++++++++++++++
+ app/streaming/input/touchmenu.h        | 220 +++++++
+ app/streaming/video/overlaymanager.cpp | 155 ++++-
+ app/streaming/video/overlaymanager.h   |  18 +
+ tests/tests.pro                        |   1 +
+ tests/touchmenu/touchmenu.pro          |   9 +
+ tests/touchmenu/tst_touchmenu.cpp      | 849 +++++++++++++++++++++++++
+ tests/vrr/overlay.pro                  |   2 +-
+ 9 files changed, 1771 insertions(+), 8 deletions(-)
+ create mode 100644 app/streaming/input/touchmenu.cpp
+ create mode 100644 app/streaming/input/touchmenu.h
+ create mode 100644 tests/touchmenu/touchmenu.pro
+ create mode 100644 tests/touchmenu/tst_touchmenu.cpp
+
+diff --git a/app/app.pro b/app/app.pro
+index ea6c3b91..57603e70 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -211,6 +211,7 @@ SOURCES += \
+     streaming/input/keyboard.cpp \
+     streaming/input/mouse.cpp \
+     streaming/input/reltouch.cpp \
++    streaming/input/touchmenu.cpp \
+     streaming/session.cpp \
+     streaming/gpuperformancehold.cpp \
+     streaming/gamescopecomposition.cpp \
+@@ -279,6 +280,7 @@ HEADERS += \
+     diagnostics/diagnosticzip.h \
+     streaming/input/dualsensehaptics.h \
+     streaming/input/input.h \
++    streaming/input/touchmenu.h \
+     streaming/session.h \
+     streaming/gpuperformancehold.h \
+     streaming/video/amddecodepolicy.h \
+diff --git a/app/streaming/input/touchmenu.cpp b/app/streaming/input/touchmenu.cpp
+new file mode 100644
+index 00000000..07a0e433
+--- /dev/null
++++ b/app/streaming/input/touchmenu.cpp
+@@ -0,0 +1,523 @@
++#include "touchmenu.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace touchmenu {
++
++namespace {
++
++// Share of the output height used by one item, a little above the minimum
++constexpr float ItemHeightFraction = 0.13f;
++
++// Longest label, used to size the font so that every label fits its item
++constexpr int LongestLabelChars = 17; // "Toggle statistics"
++
++}
++
++const char* itemLabel(int item)
++{
++    switch (item) {
++    case ItemDisconnect:  return "Disconnect";
++    case ItemQuitSession: return "Quit session";
++    case ItemToggleStats: return "Toggle statistics";
++    case ItemCloseMenu:   return "Close menu";
++    }
++    return "";
++}
++
++Layout computeLayout(int outputWidth, int outputHeight, Side side)
++{
++    Layout layout;
++    if (outputWidth <= 0 || outputHeight <= 0) {
++        return layout;
++    }
++
++    int pad = std::max(4, (int)std::lround(outputHeight * 0.02));
++    int itemHeight = (int)std::ceil(outputHeight * ItemHeightFraction);
++    int minHeight = (int)std::ceil(outputHeight * MinItemHeightFraction);
++    itemHeight = std::max(itemHeight, minHeight);
++
++    int surfaceWidth = std::min(outputWidth, std::max(outputWidth * 45 / 100, 480));
++    int surfaceHeight = ItemCount * itemHeight + (ItemCount + 1) * pad;
++    if (surfaceHeight > outputHeight) {
++        // Degenerate (tiny) output: shrink to fit, the items may get shorter
++        // than the minimum there.
++        pad = std::max(1, outputHeight / 40);
++        itemHeight = (outputHeight - (ItemCount + 1) * pad) / ItemCount;
++        surfaceHeight = ItemCount * itemHeight + (ItemCount + 1) * pad;
++    }
++    if (itemHeight <= 0 || surfaceWidth <= 2 * pad) {
++        return layout;
++    }
++
++    int itemWidth = surfaceWidth - 2 * pad;
++    int panelX = side == Side::Right ? outputWidth - surfaceWidth : 0;
++    layout.valid = true;
++    layout.panelWidth = surfaceWidth;
++    layout.panelX = panelX;
++    layout.surfaceWidth = side == Side::Right ? outputWidth : surfaceWidth;
++    layout.surfaceHeight = surfaceHeight;
++    layout.originY = outputHeight - surfaceHeight;
++    layout.border = std::max(2, itemHeight / 24);
++    for (int i = 0; i < ItemCount; i++) {
++        layout.items[i].x = panelX + pad;
++        layout.items[i].y = pad + i * (itemHeight + pad);
++        layout.items[i].w = itemWidth;
++        layout.items[i].h = itemHeight;
++    }
++
++    int byHeight = (int)std::lround(itemHeight * 0.40);
++    int byWidth = (int)std::lround(itemWidth / (LongestLabelChars * 0.70));
++    layout.fontPixels = std::max(12, std::min(byHeight, byWidth));
++    return layout;
++}
++
++int handleSize(int outputWidth, int outputHeight)
++{
++    if (outputWidth <= 0 || outputHeight <= 0) {
++        return 0;
++    }
++
++    int size = std::max(HandleMinPixels, (int)std::lround(outputHeight * HandleHeightFraction));
++    return std::min(size, std::min(outputWidth, outputHeight));
++}
++
++Rect handleRect(int outputWidth, int outputHeight)
++{
++    Rect rect;
++    int size = handleSize(outputWidth, outputHeight);
++    rect.x = 0;
++    rect.y = outputHeight - size;
++    rect.w = rect.h = size;
++    return rect;
++}
++
++void TouchMenu::setOutputSize(int width, int height)
++{
++    m_OutputWidth = width;
++    m_OutputHeight = height;
++}
++
++TouchMenu::Finger* TouchMenu::find(int64_t id)
++{
++    for (auto& finger : m_Fingers) {
++        if (finger.id == id) {
++            return &finger;
++        }
++    }
++    return nullptr;
++}
++
++bool TouchMenu::moved(const Finger& finger) const
++{
++    float w = m_OutputWidth > 0 ? (float)m_OutputWidth : 1.0f;
++    float h = m_OutputHeight > 0 ? (float)m_OutputHeight : 1.0f;
++    float dx = (finger.x - finger.startX) * w;
++    float dy = (finger.y - finger.startY) * h;
++    float limit = MoveFraction * std::min(w, h);
++    return std::sqrt(dx * dx + dy * dy) >= limit;
++}
++
++void TouchMenu::ignoreAllFingers()
++{
++    for (auto& finger : m_Fingers) {
++        finger.ignored = true;
++    }
++}
++
++bool TouchMenu::inHandle(float x, float y) const
++{
++    if (m_OutputWidth <= 0 || m_OutputHeight <= 0) {
++        return false;
++    }
++
++    Rect r = handleRect(m_OutputWidth, m_OutputHeight);
++    int px = (int)std::floor(x * m_OutputWidth);
++    int py = (int)std::floor(y * m_OutputHeight);
++    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
++}
++
++void TouchMenu::setTriggers(bool gestures, bool handle)
++{
++    m_GesturesEnabled = gestures;
++    m_HandleEnabled = handle;
++    if (!gestures) {
++        m_Armed = false;
++        cancelEdge();
++    }
++}
++
++void TouchMenu::noteActivity(uint32_t nowMs)
++{
++    m_RecentActivity = true;
++    m_LastActivityMs = nowMs;
++}
++
++void TouchMenu::openMenu(uint32_t nowMs, Side side)
++{
++    cancelEdge();
++    m_Side = side == Side::Right && !m_RightPanelAllowed ? Side::Left : side;
++    m_Armed = false;
++    m_Open = true;
++    m_RecentActivity = false;
++    m_LastTouchMs = nowMs;
++    m_HaveActive = false;
++    m_PressItem = m_CurrentItem = -1;
++    ignoreAllFingers();
++}
++
++void TouchMenu::closeMenu()
++{
++    cancelEdge();
++    m_Open = false;
++    m_RecentActivity = false;
++    m_Armed = false;
++    m_Cancelled = false; // Remaining fingers are ignored, so they cannot re-arm
++    m_HaveActive = false;
++    m_PressItem = -1;
++    m_CurrentItem = -1;
++    ignoreAllFingers();
++}
++
++int TouchMenu::gestureFingerCount() const
++{
++    int count = 0;
++    for (const auto& finger : m_Fingers) {
++        if (!finger.ignored) {
++            count++;
++        }
++    }
++    return count;
++}
++
++int TouchMenu::hitTest(float x, float y) const
++{
++    Layout layout = computeLayout(m_OutputWidth, m_OutputHeight, m_Side);
++    if (!layout.valid) {
++        return -1;
++    }
++
++    int px = (int)std::floor(x * m_OutputWidth);
++    int py = (int)std::floor(y * m_OutputHeight);
++    int localX = px;
++    int localY = py - (m_OutputHeight - layout.surfaceHeight);
++    for (int i = 0; i < ItemCount; i++) {
++        const Rect& r = layout.items[i];
++        if (localX >= r.x && localX < r.x + r.w && localY >= r.y && localY < r.y + r.h) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++int TouchMenu::highlightedItem() const
++{
++    if (m_Open && m_HaveActive && m_PressItem >= 0 && m_CurrentItem == m_PressItem) {
++        return m_PressItem;
++    }
++    return -1;
++}
++
++// Checks the running edge swipe attempt. Returns true when it completes.
++bool TouchMenu::evaluateEdge(uint32_t nowMs)
++{
++    if (!m_EdgeActive) {
++        return false;
++    }
++
++    if ((uint32_t)(nowMs - m_EdgeFirstMs) > EdgeSwipeWindowMs) {
++        cancelEdge();
++        return false;
++    }
++
++    const Finger* a = nullptr;
++    const Finger* b = nullptr;
++    for (const auto& f : m_Fingers) {
++        if (f.id == m_EdgeA) a = &f;
++        if (m_EdgeHaveB && f.id == m_EdgeB) b = &f;
++    }
++    if (a == nullptr || (m_EdgeHaveB && b == nullptr)) {
++        cancelEdge();
++        return false;
++    }
++
++    float w = m_OutputWidth > 0 ? (float)m_OutputWidth : 1.0f;
++    float h = m_OutputHeight > 0 ? (float)m_OutputHeight : 1.0f;
++    float rightLimit = MoveFraction * std::min(w, h) / w; // Normalized x
++    const Finger* swipers[2] = { a, b };
++    bool complete = m_EdgeHaveB;
++    for (const Finger* f : swipers) {
++        if (f == nullptr) {
++            continue;
++        }
++        if (f->x - f->startX > rightLimit) {
++            cancelEdge();
++            return false;
++        }
++        if (f->startX - f->x < EdgeSwipeFraction) {
++            complete = false;
++        }
++    }
++    return complete;
++}
++
++Event TouchMenu::fingerDown(int64_t id, float x, float y, uint32_t nowMs)
++{
++    Event result;
++
++    // A repeated down for a known id replaces the old record (the platform
++    // lost the old contact)
++    if (edgeFinger(id)) {
++        cancelEdge();
++    }
++    m_Fingers.erase(std::remove_if(m_Fingers.begin(), m_Fingers.end(),
++                                   [id](const Finger& f) { return f.id == id; }),
++                    m_Fingers.end());
++    if (m_HaveActive && m_ActiveId == id) {
++        m_HaveActive = false;
++    }
++
++    // Decided before this touch makes the handle visible
++    bool onHandle = !m_Open && m_HandleEnabled && m_RecentActivity && inHandle(x, y);
++
++    Finger finger = { id, x, y, x, y, m_Open || onHandle, onHandle };
++    m_Fingers.push_back(finger);
++
++    if (m_Open) {
++        m_LastTouchMs = nowMs;
++        if (!m_HaveActive) {
++            m_HaveActive = true;
++            m_ActiveId = id;
++            m_PressItem = m_CurrentItem = hitTest(x, y);
++        }
++        result.swallow = true;
++        return result;
++    }
++
++    noteActivity(nowMs);
++    result.swallow = onHandle;
++
++    // Edge swipe: first finger in the zone starts an attempt, a second one
++    // within the pair time joins it, anything else ends it.
++    bool inEdgeZone = x >= 1.0f - EdgeZoneFraction;
++    int gestureFingers = gestureFingerCount();
++    if (m_EdgeActive) {
++        if (!m_EdgeHaveB && gestureFingers == 2 && inEdgeZone && !onHandle &&
++                (uint32_t)(nowMs - m_EdgeFirstMs) <= EdgePairMs) {
++            m_EdgeHaveB = true;
++            m_EdgeB = id;
++        }
++        else {
++            cancelEdge();
++        }
++    }
++    else if (m_GesturesEnabled && gestureFingers == 1 && inEdgeZone && !onHandle) {
++        m_EdgeActive = true;
++        m_EdgeHaveB = false;
++        m_EdgeA = id;
++        m_EdgeFirstMs = nowMs;
++    }
++
++    if (m_GesturesEnabled && !m_Armed && !m_Cancelled && gestureFingerCount() >= HoldFingers) {
++        // Fingers that already travelled too far (a scroll in progress)
++        // do not start a hold.
++        bool anyMoved = false;
++        for (const auto& f : m_Fingers) {
++            if (!f.ignored && moved(f)) {
++                anyMoved = true;
++            }
++        }
++        if (anyMoved) {
++            m_Cancelled = true;
++        }
++        else {
++            m_Armed = true;
++            m_ArmedAtMs = nowMs;
++        }
++    }
++    return result;
++}
++
++Event TouchMenu::fingerMove(int64_t id, float x, float y, uint32_t nowMs)
++{
++    Event result;
++    Finger* finger = find(id);
++
++    if (finger != nullptr) {
++        finger->x = x;
++        finger->y = y;
++    }
++
++    if (m_Open) {
++        m_LastTouchMs = nowMs;
++        if (m_HaveActive && m_ActiveId == id) {
++            m_CurrentItem = hitTest(x, y);
++        }
++        result.swallow = true;
++        return result;
++    }
++
++    noteActivity(nowMs);
++    if (finger == nullptr) {
++        return result;
++    }
++
++    result.swallow = finger->ignored;
++    if (!finger->ignored && m_Armed && moved(*finger)) {
++        m_Armed = false;
++        m_Cancelled = true;
++    }
++
++    if (edgeFinger(id) && evaluateEdge(nowMs)) {
++        openMenu(nowMs, Side::Right);
++        result.type = EventType::Open;
++        result.side = m_Side;
++        result.swallow = true;
++    }
++    return result;
++}
++
++Event TouchMenu::fingerUp(int64_t id, float x, float y, uint32_t nowMs)
++{
++    Event result;
++    Finger* finger = find(id);
++    bool wasIgnored = finger != nullptr ? finger->ignored : false;
++    bool tappedHandle = false;
++
++    if (finger != nullptr) {
++        finger->x = x;
++        finger->y = y;
++        tappedHandle = !m_Open && finger->onHandle && inHandle(x, y) && !moved(*finger);
++        m_Fingers.erase(m_Fingers.begin() + (finger - m_Fingers.data()));
++    }
++
++    if (m_Open) {
++        m_LastTouchMs = nowMs;
++        result.swallow = true;
++        if (m_HaveActive && m_ActiveId == id) {
++            int pressItem = m_PressItem;
++            int upItem = hitTest(x, y);
++            m_HaveActive = false;
++            m_PressItem = m_CurrentItem = -1;
++
++            if (pressItem >= 0 && upItem == pressItem) {
++                if (pressItem == ItemCloseMenu) {
++                    result.type = EventType::Close;
++                }
++                else {
++                    result.type = EventType::Activate;
++                    result.item = pressItem;
++                }
++                closeMenu();
++            }
++            else if (pressItem < 0 && upItem < 0) {
++                result.type = EventType::Close;
++                closeMenu();
++            }
++        }
++        return result;
++    }
++
++    result.swallow = wasIgnored;
++    if (edgeFinger(id)) {
++        cancelEdge();
++    }
++    if (gestureFingerCount() < HoldFingers) {
++        m_Armed = false;
++        m_Cancelled = false;
++    }
++
++    if (tappedHandle) {
++        openMenu(nowMs, Side::Left);
++        result.type = EventType::Open;
++        result.side = m_Side;
++        result.swallow = true;
++    }
++    else {
++        noteActivity(nowMs);
++    }
++    return result;
++}
++
++Event TouchMenu::fingerCancel(int64_t id, uint32_t nowMs)
++{
++    Event result;
++    Finger* finger = find(id);
++    bool wasIgnored = finger != nullptr ? finger->ignored : false;
++
++    if (finger != nullptr) {
++        m_Fingers.erase(m_Fingers.begin() + (finger - m_Fingers.data()));
++    }
++
++    if (m_Open) {
++        m_LastTouchMs = nowMs;
++        result.swallow = true;
++        if (m_HaveActive && m_ActiveId == id) {
++            m_HaveActive = false;
++            m_PressItem = m_CurrentItem = -1;
++        }
++        return result;
++    }
++
++    result.swallow = wasIgnored;
++    if (edgeFinger(id)) {
++        cancelEdge();
++    }
++    if (gestureFingerCount() < HoldFingers) {
++        m_Armed = false;
++        m_Cancelled = false;
++    }
++    noteActivity(nowMs);
++    return result;
++}
++
++Event TouchMenu::tick(uint32_t nowMs)
++{
++    Event result;
++
++    if (m_Open) {
++        if ((uint32_t)(nowMs - m_LastTouchMs) >= IdleMs) {
++            closeMenu();
++            result.type = EventType::Close;
++            result.swallow = true;
++        }
++    }
++    else if (m_EdgeActive && (uint32_t)(nowMs - m_EdgeFirstMs) > EdgeSwipeWindowMs) {
++        // Edge swipe timed out. The remaining timers are checked on the next tick.
++        cancelEdge();
++    }
++    else if (m_Armed && (uint32_t)(nowMs - m_ArmedAtMs) >= HoldMs) {
++        openMenu(nowMs, Side::Left);
++        result.type = EventType::Open;
++        result.side = m_Side;
++        result.swallow = true;
++    }
++    else if (m_RecentActivity && (uint32_t)(nowMs - m_LastActivityMs) >= HandleHideMs) {
++        m_RecentActivity = false;
++        // Whatever is still tracked has had no event for a long time: its up
++        // was probably lost. Swallowed fingers stay until they lift.
++        m_Fingers.erase(std::remove_if(m_Fingers.begin(), m_Fingers.end(),
++                                       [](const Finger& f) { return !f.ignored; }),
++                        m_Fingers.end());
++        m_Armed = false;
++        m_Cancelled = false;
++        cancelEdge();
++    }
++    return result;
++}
++
++void TouchMenu::reset()
++{
++    cancelEdge();
++    m_Fingers.clear();
++    m_Open = false;
++    m_RecentActivity = false;
++    m_Armed = false;
++    m_Cancelled = false;
++    m_HaveActive = false;
++    m_PressItem = -1;
++    m_CurrentItem = -1;
++}
++
++}
+diff --git a/app/streaming/input/touchmenu.h b/app/streaming/input/touchmenu.h
+new file mode 100644
+index 00000000..0a9ac1c0
+--- /dev/null
++++ b/app/streaming/input/touchmenu.h
+@@ -0,0 +1,220 @@
++#pragma once
++
++// Touch-only in-stream menu for the stream-posture-sync feature.
++//
++// Pure logic, no SDL and no Qt GUI: recognizes the "three fingers held still"
++// gesture, tracks the menu while it is open and lays the menu out. Finger
++// positions are normalized 0..1 window coordinates, time is passed in as
++// milliseconds (any monotonic uint32 clock, wrap-around safe). The caller
++// (SdlInputHandler) owns the clock and a periodic tick, sends the events to the
++// host or swallows them, and draws the menu (OverlayManager).
++//
++// Gesture rule: the hold starts when the third finger lands. A fourth finger
++// joining while the hold runs does not restart it. The hold is cancelled when
++// fewer than three fingers are down or when any finger (including a joined
++// one) has moved 3 % of the shorter window side or more from where it landed.
++// Corner handle: the second trigger, for platforms where the compositor keeps
++// a third finger from reaching the client. Any finger event shows a small
++// handle at the bottom-left corner of the output; it hides after HandleHideMs
++// without a finger event. A tap on the visible handle (down and up inside it,
++// moved less than MoveFraction) opens the menu. A touch that starts inside the
++// visible handle never reaches the host, whether or not it ends as a tap. A
++// touch that starts on the corner while the handle is hidden is a normal
++// touch and only makes the handle appear.
++//
++// Lost contacts: a down for an id that is already tracked replaces the old
++// record. When the handle hides after HandleHideMs without any finger event,
++// the remaining tracked fingers are forgotten (the compositor can swallow
++// their up events), so they cannot count towards a later hold.
++//
++// Edge swipe: the trigger that works where the compositor takes three fingers.
++// Two fingers that each land within the rightmost EdgeZoneFraction of the output
++// width, at most EdgePairMs apart, and then both move left by at least
++// EdgeSwipeFraction of the output width within EdgeSwipeWindowMs of the first
++// landing, open the menu on the right side. The attempt is cancelled when
++// either finger lifts, when another finger lands (or the second lands too
++// late), when either finger moves right by more than MoveFraction, or on
++// timeout. Until it opens the touches reach the host; on open the two fingers
++// are swallowed until they lift and activate nothing. The handle tap and the
++// three finger hold open the menu on the left side.
++//
++// After a cancel by movement the gesture cannot re-arm until fewer than three
++// fingers are down again. Fingers that were down when the menu opened, or that
++// landed while it was open, never take part in a later gesture or reach the
++// host: they stay swallowed until they lift.
++
++#include <cstdint>
++#include <vector>
++
++namespace touchmenu {
++
++constexpr uint32_t HoldMs = 800;
++constexpr uint32_t IdleMs = 10000;
++constexpr uint32_t HandleHideMs = 6000;
++constexpr float EdgeZoneFraction = 0.08f;
++constexpr uint32_t EdgePairMs = 300;
++constexpr float EdgeSwipeFraction = 0.10f;
++constexpr uint32_t EdgeSwipeWindowMs = 1200;
++constexpr int HoldFingers = 3;
++constexpr float MoveFraction = 0.03f;
++constexpr float MinItemHeightFraction = 0.12f;
++constexpr float HandleHeightFraction = 0.06f;
++constexpr int HandleMinPixels = 56;
++constexpr int ItemCount = 4;
++
++enum Item {
++    ItemDisconnect = 0,   // End the stream, the host app keeps running
++    ItemQuitSession = 1,  // End the stream and quit the host app
++    ItemToggleStats = 2,
++    ItemCloseMenu = 3,
++};
++
++// Screen side the panel opens on
++enum class Side {
++    Left,
++    Right,
++};
++
++enum class EventType {
++    None,
++    Open,
++    Activate,   // item = any item except ItemCloseMenu, menu is closed
++    Close,      // menu is closed (close item, tap outside, idle timeout)
++};
++
++struct Event {
++    EventType type = EventType::None;
++    int item = -1;
++    Side side = Side::Left; // For Open: the side the panel opens on
++    // True when the touch event that produced this result must not reach the host
++    bool swallow = false;
++};
++
++struct Rect {
++    int x = 0, y = 0, w = 0, h = 0;
++};
++
++// Menu geometry for an output of outputWidth x outputHeight pixels. The surface
++// is anchored at the bottom-left corner of the output: its top-left corner is
++// at (0, outputHeight - surfaceHeight), so surface x equals output x. For the
++// left side the surface is just the panel. For the right side the surface is
++// as wide as the output, transparent except for the panel at its right end.
++// Items are relative to the surface; itemInOutput() gives output pixels.
++struct Layout {
++    bool valid = false;
++    int surfaceWidth = 0, surfaceHeight = 0;
++    int panelX = 0, panelWidth = 0;  // Panel inside the surface, full surface height
++    int originY = 0;                 // Output y of the surface's top edge
++    int border = 1;     // item and frame border thickness
++    int fontPixels = 12;
++    Rect items[ItemCount];
++
++    Rect itemInOutput(int item) const {
++        Rect r = items[item];
++        r.y += originY;
++        return r;
++    }
++};
++
++Layout computeLayout(int outputWidth, int outputHeight, Side side = Side::Left);
++
++// Side of the square corner handle in pixels (0 if the output size is unknown)
++int handleSize(int outputWidth, int outputHeight);
++
++// Handle rectangle in output pixels: bottom-left corner of the output
++Rect handleRect(int outputWidth, int outputHeight);
++const char* itemLabel(int item);
++
++class TouchMenu
++{
++public:
++    // Window drawable size in pixels. Set before feeding events.
++    void setOutputSize(int width, int height);
++
++    // Whether the renderer can draw the full-width surface the right side needs.
++    // When false the edge swipe opens the left panel instead. Default true.
++    void setRightPanelAllowed(bool allowed) { m_RightPanelAllowed = allowed; }
++
++    // Which triggers may open the menu. Gestures are the edge swipe and the
++    // three finger hold. With the handle off it is never shown and a touch on
++    // its corner is a normal touch. Default: both on.
++    void setTriggers(bool gestures, bool handle);
++
++    // Side of the open (or last opened) menu
++    Side side() const { return m_Side; }
++
++    Event fingerDown(int64_t id, float x, float y, uint32_t nowMs);
++    Event fingerMove(int64_t id, float x, float y, uint32_t nowMs);
++    Event fingerUp(int64_t id, float x, float y, uint32_t nowMs);
++
++    // The platform cancelled a contact: like an up that activates nothing.
++    // (SDL2 has no such event; kept for SDL3 style cancels.)
++    Event fingerCancel(int64_t id, uint32_t nowMs);
++
++    // Call periodically while needsTick() is true. May return Open or Close.
++    Event tick(uint32_t nowMs);
++
++    // Forget all fingers and close the menu
++    void reset();
++
++    bool isOpen() const { return m_Open; }
++
++    // True while a hold is being timed, the menu is open or the handle is visible
++    bool needsTick() const { return m_Open || m_Armed || m_RecentActivity || m_EdgeActive; }
++
++    // True while the corner handle should be drawn (never while the menu is open)
++    bool handleVisible() const { return m_HandleEnabled && m_RecentActivity && !m_Open; }
++
++    // Item that the active finger went down on and is still over, or -1
++    int highlightedItem() const;
++
++    // Number of fingers that count towards the gesture (not swallowed)
++    int gestureFingerCount() const;
++
++    // Item under a point in normalized coordinates, or -1 (outside every item)
++    int hitTest(float x, float y) const;
++
++private:
++    struct Finger {
++        int64_t id;
++        float startX, startY;
++        float x, y;
++        bool ignored;
++        bool onHandle;
++    };
++
++    Finger* find(int64_t id);
++    bool moved(const Finger& finger) const;
++    void ignoreAllFingers();
++    void closeMenu();
++    void openMenu(uint32_t nowMs, Side side);
++    bool edgeFinger(int64_t id) const { return m_EdgeActive && (id == m_EdgeA || (m_EdgeHaveB && id == m_EdgeB)); }
++    void cancelEdge() { m_EdgeActive = false; m_EdgeHaveB = false; }
++    bool evaluateEdge(uint32_t nowMs);
++    void noteActivity(uint32_t nowMs);
++    bool inHandle(float x, float y) const;
++
++    int m_OutputWidth = 0, m_OutputHeight = 0;
++    std::vector<Finger> m_Fingers;
++    bool m_Open = false;
++    Side m_Side = Side::Left;
++    bool m_RightPanelAllowed = true;
++    bool m_EdgeActive = false, m_EdgeHaveB = false;
++    int64_t m_EdgeA = 0, m_EdgeB = 0;
++    uint32_t m_EdgeFirstMs = 0;
++    bool m_GesturesEnabled = true, m_HandleEnabled = true;
++    // A finger event arrived less than HandleHideMs ago: the handle shows
++    // (when enabled) and lost contacts are not yet forgotten
++    bool m_RecentActivity = false;
++    uint32_t m_LastActivityMs = 0;
++    bool m_Armed = false;
++    bool m_Cancelled = false;
++    uint32_t m_ArmedAtMs = 0;
++    uint32_t m_LastTouchMs = 0;
++    bool m_HaveActive = false;
++    int64_t m_ActiveId = 0;
++    int m_PressItem = -1;
++    int m_CurrentItem = -1;
++};
++
++}
+diff --git a/app/streaming/video/overlaymanager.cpp b/app/streaming/video/overlaymanager.cpp
+index 984c97b2..7a3fb33d 100644
+--- a/app/streaming/video/overlaymanager.cpp
++++ b/app/streaming/video/overlaymanager.cpp
+@@ -1,5 +1,6 @@
+ #include "overlaymanager.h"
+ #include "path.h"
++#include "streaming/input/touchmenu.h"
+ #include <exception>
+ #include <cmath>
+ #include <cstdio>
+@@ -68,6 +69,87 @@ SDL_Surface* renderStatsText(TTF_Font* font, const char* text, SDL_Color color,
+     return surface;
+ }
+ 
++// Touch menu: one bordered button per item on a semi-opaque dark panel. The surface is
++// exactly the layout size, so every renderer draws it 1:1 at the bottom-left corner.
++SDL_Surface* renderTouchMenu(TTF_Font* font, const touchmenu::Layout& layout, int highlighted)
++{
++    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, layout.surfaceWidth, layout.surfaceHeight,
++                                                   32, SDL_PIXELFORMAT_ARGB8888);
++    if (!surface) return nullptr;
++
++    const auto fill = [&](const SDL_Rect& rect, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
++        SDL_Rect copy = rect;
++        SDL_FillRect(surface, &copy, SDL_MapRGBA(surface->format, r, g, b, a));
++    };
++
++    // Fully transparent (the right panel's surface is output-wide), then the
++    // panel with a light frame
++    const int frame = layout.border;
++    SDL_FillRect(surface, nullptr, 0);
++    fill({layout.panelX, 0, layout.panelWidth, surface->h}, 235, 240, 245, 255);
++    fill({layout.panelX + frame, frame, layout.panelWidth - 2 * frame, surface->h - 2 * frame}, 12, 16, 24, 225);
++
++    for (int i = 0; i < touchmenu::ItemCount; ++i) {
++        const touchmenu::Rect& item = layout.items[i];
++        const bool pressed = i == highlighted;
++        fill({item.x, item.y, item.w, item.h}, 235, 240, 245, 255);
++        if (pressed) {
++            fill({item.x + frame, item.y + frame, item.w - 2 * frame, item.h - 2 * frame}, 30, 120, 220, 255);
++        }
++        else {
++            fill({item.x + frame, item.y + frame, item.w - 2 * frame, item.h - 2 * frame}, 36, 44, 58, 255);
++        }
++
++        if (!font) continue;
++        auto* label = TTF_RenderUTF8_Blended(font, touchmenu::itemLabel(i), {255, 255, 255, 255});
++        if (label) {
++            SDL_Rect at{item.x + (item.w - label->w) / 2, item.y + (item.h - label->h) / 2, label->w, label->h};
++            SDL_BlitSurface(label, nullptr, surface, &at);
++            SDL_FreeSurface(label);
++        }
++    }
++    return surface;
++}
++
++// Touch menu corner handle: a dark square with a three-bar menu glyph at the
++// bottom-left corner of the surface, the optional status text (consumed) to its
++// right, bottom aligned. The handle is exactly side x side pixels at the output's
++// bottom-left corner, which is where the input handler hit-tests it.
++SDL_Surface* composeTouchHandle(SDL_Surface* text, int side)
++{
++    const int gap = std::max(8, side / 4);
++    const int width = side + (text ? gap + text->w : 0);
++    const int height = std::max(side, text ? text->h : 0);
++    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
++    if (!surface) return text;
++    SDL_FillRect(surface, nullptr, 0);
++
++    const auto fill = [&](const SDL_Rect& rect, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
++        SDL_Rect copy = rect;
++        SDL_FillRect(surface, &copy, SDL_MapRGBA(surface->format, r, g, b, a));
++    };
++    const int top = height - side;
++    const int frame = std::max(2, side / 24);
++    fill({0, top, side, side}, 235, 240, 245, 255);
++    fill({frame, top + frame, side - 2 * frame, side - 2 * frame}, 12, 16, 24, 225);
++
++    const int barHeight = std::max(2, side / 10);
++    const int barWidth = side / 2;
++    const int glyphHeight = 3 * barHeight + 2 * barHeight;
++    const int barX = (side - barWidth) / 2;
++    const int barY = top + (side - glyphHeight) / 2;
++    for (int i = 0; i < 3; ++i) {
++        fill({barX, barY + i * 2 * barHeight, barWidth, barHeight}, 255, 255, 255, 255);
++    }
++
++    if (text) {
++        SDL_Rect at{side + gap, height - text->h, text->w, text->h};
++        SDL_BlitSurface(text, nullptr, surface, &at);
++        SDL_FreeSurface(text);
++    }
++    return surface;
++}
++
+ // CPU rasterization runs on the overlay worker. All backends receive the same
+ // composed surface through their current overlay upload path; no GPU API work
+ // or text rendering happens on the frame path.
+@@ -479,9 +561,48 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
+         if (!combined.empty() && !host.empty()) combined += "\n\n";
+         combined += host;
+         auto& overlay = m_Overlays[OverlayStatusUpdate];
+-        if (combined == overlay.text && overlay.enabled == !combined.empty()) return;
++        // The overlay stays visible while the touch menu or the handle is drawn
++        const bool show = !combined.empty() || m_TouchMenuActive || m_TouchHandleVisible;
++        if (combined == overlay.text && overlay.enabled == show) return;
+         SDL_utf8strlcpy(overlay.text, combined.c_str(), sizeof(overlay.text));
+-        overlay.enabled = !combined.empty();
++        overlay.enabled = show;
++        ++overlay.revision;
++        overlay.dirty = true;
++        overlay.queued = std::chrono::steady_clock::now();
++    }
++    m_WorkReady.notify_one();
++}
++
++bool OverlayManager::supportsWideOverlay()
++{
++    std::lock_guard<std::mutex> lock(m_StateLock);
++    return m_WideOverlaySupported;
++}
++
++void OverlayManager::setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible, bool rightSide)
++{
++    {
++        std::lock_guard<std::mutex> lock(m_StateLock);
++        // Same fallback as the input side: no wide surface, no right panel
++        rightSide = rightSide && active && m_WideOverlaySupported;
++        // The handle is never drawn together with the menu
++        handleVisible = handleVisible && !active;
++        if (!active) {
++            highlightedItem = -1;
++            if (!handleVisible) outputWidth = outputHeight = 0;
++        }
++        if (m_TouchMenuActive == active && m_TouchHandleVisible == handleVisible &&
++                m_TouchMenuRight == rightSide &&
++                m_TouchMenuWidth == outputWidth && m_TouchMenuHeight == outputHeight &&
++                m_TouchMenuHighlight == highlightedItem) return;
++        m_TouchMenuActive = active;
++        m_TouchHandleVisible = handleVisible;
++        m_TouchMenuRight = rightSide;
++        m_TouchMenuWidth = outputWidth;
++        m_TouchMenuHeight = outputHeight;
++        m_TouchMenuHighlight = highlightedItem;
++        auto& overlay = m_Overlays[OverlayStatusUpdate];
++        overlay.enabled = active || handleVisible || overlay.text[0] != 0;
+         ++overlay.revision;
+         overlay.dirty = true;
+         overlay.queued = std::chrono::steady_clock::now();
+@@ -598,6 +719,7 @@ void OverlayManager::setOverlayRenderer(IOverlayRenderer* renderer)
+         std::lock_guard<std::mutex> stateLock(m_StateLock);
+         m_Renderer = renderer;
+         m_HaveRenderer = renderer != nullptr;
++        m_WideOverlaySupported = renderer == nullptr || renderer->supportsWideOverlay();
+         for (auto& overlay : m_Overlays) {
+             ++overlay.revision;
+             overlay.dirty = m_HaveRenderer;
+@@ -617,8 +739,9 @@ void OverlayManager::run()
+     for (;;) {
+         OverlayType type;
+         char text[1024];
+-        bool enabled, drawText;
+-        int fontSize, outputWidth, outputHeight;
++        bool enabled, drawText, drawMenu, drawHandle;
++        int fontSize, outputWidth, outputHeight, menuHighlight, handleSide = 0;
++        touchmenu::Layout menuLayout;
+         std::shared_ptr<const TimingGraphSnapshot> graph;
+         uint64_t revision;
+         Clock::time_point queued;
+@@ -639,8 +762,21 @@ void OverlayManager::run()
+             auto& overlay = m_Overlays[type];
+             overlay.dirty = false;
+             enabled = overlay.enabled;
+-            drawText = enabled && overlay.text[0] && (type != OverlayDebug || m_StatsEnabled);
++            drawMenu = enabled && type == OverlayStatusUpdate && m_TouchMenuActive;
++            drawText = !drawMenu && enabled && overlay.text[0] && (type != OverlayDebug || m_StatsEnabled);
+             fontSize = overlay.fontSize;
++            menuHighlight = m_TouchMenuHighlight;
++            if (drawMenu) {
++                menuLayout = touchmenu::computeLayout(m_TouchMenuWidth, m_TouchMenuHeight,
++                                                      m_TouchMenuRight ? touchmenu::Side::Right : touchmenu::Side::Left);
++                if (menuLayout.valid) fontSize = menuLayout.fontPixels;
++                else drawMenu = false; // Output size unknown or too small
++            }
++            drawHandle = enabled && type == OverlayStatusUpdate && !drawMenu && m_TouchHandleVisible && !m_TouchMenuActive;
++            if (drawHandle) {
++                handleSide = touchmenu::handleSize(m_TouchMenuWidth, m_TouchMenuHeight);
++                if (handleSide <= 0) drawHandle = false;
++            }
+             outputWidth = overlay.outputWidth;
+             outputHeight = overlay.outputHeight;
+             revision = overlay.revision;
+@@ -652,7 +788,7 @@ void OverlayManager::run()
+         auto& overlay = m_Overlays[type];
+         SDL_Surface* surface = nullptr;
+         const bool drawGraph = enabled && graph && graph->points.size() >= 2;
+-        if (drawText || drawGraph) {
++        if (drawText || drawGraph || drawMenu || drawHandle) {
+             if ((!overlay.font || rasterFontSizes[type] != fontSize) && !m_FontData.isEmpty()) {
+                 auto resized = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()), 1, fontSize);
+                 if (!resized) continue;
+@@ -661,7 +797,11 @@ void OverlayManager::run()
+                 rasterFontSizes[type] = fontSize;
+             }
+             const double scale = type == OverlayDebug ? fontSize / 20.0 : 1.0;
+-            if (drawText) {
++            if (drawMenu) {
++                surface = renderTouchMenu(overlay.font, menuLayout, menuHighlight);
++                if (!surface) continue; // Keep the last successful overlay on failure.
++            }
++            else if (drawText) {
+                 if (overlay.font) {
+                     surface = type == OverlayDebug ? renderStatsText(overlay.font, text, overlay.color, scale) :
+                         RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
+@@ -670,6 +810,7 @@ void OverlayManager::run()
+                 if (!surface) continue; // Keep the last successful overlay on failure.
+             }
+             if (drawGraph && overlay.font) surface = composeTimingGraph(overlay.font, surface, *graph, scale);
++            if (drawHandle) surface = composeTouchHandle(surface, handleSide);
+         }
+         if (type == OverlayDebug) surface = fitToOutput(surface, outputWidth, outputHeight);
+         const auto rasterized = Clock::now();
+diff --git a/app/streaming/video/overlaymanager.h b/app/streaming/video/overlaymanager.h
+index 97e64031..8e0d3791 100644
+--- a/app/streaming/video/overlaymanager.h
++++ b/app/streaming/video/overlaymanager.h
+@@ -29,6 +29,11 @@ public:
+ 
+     virtual void notifyOverlayUpdated(OverlayType type) = 0;
+ 
++    // Whether the renderer draws an output-wide surface that is mostly fully
++    // transparent correctly (the touch menu's right-hand panel needs one). When it
++    // does not, the menu opens on the left, where the surface is only the panel.
++    virtual bool supportsWideOverlay() const { return true; }
++
+     struct UpdateTiming {
+         OverlayType type;
+         uint64_t revision;
+@@ -71,6 +76,16 @@ public:
+     // For OverlayDebug, controls the stats text independently of the graph.
+     void setOverlayState(OverlayType type, bool enabled);
+     void setStatusMessage(StatusSource source, const std::string& text);
++    // While active, the status overlay shows the touch menu (see touchmenu.h) instead of the
++    // status text, laid out for an output of outputWidth x outputHeight pixels. highlightedItem
++    // is the pressed item or -1. Clearing it brings the status text back. Without the menu,
++    // handleVisible draws the small corner handle in the bottom-left corner, with the status
++    // text (if any) to its right. rightSide puts the menu panel at the right end of an
++    // output-wide surface instead of at the left.
++    void setTouchMenu(bool active, int outputWidth, int outputHeight, int highlightedItem, bool handleVisible, bool rightSide);
++
++    // False when the active renderer cannot draw the wide transparent surface of the right panel
++    bool supportsWideOverlay();
+     SDL_Color getOverlayColor(OverlayType type);
+     int getOverlayFontSize(OverlayType type);
+     void setOutputSize(int width, int height);
+@@ -100,6 +115,9 @@ private:
+     QByteArray m_FontData;
+     std::shared_ptr<const TimingGraphSnapshot> m_TimingGraph;
+     bool m_StatsEnabled = false, m_TimingGraphEnabled = false;
++    bool m_TouchMenuActive = false, m_TouchHandleVisible = false, m_TouchMenuRight = false;
++    bool m_WideOverlaySupported = true;
++    int m_TouchMenuWidth = 0, m_TouchMenuHeight = 0, m_TouchMenuHighlight = -1;
+     std::mutex m_StateLock;
+     std::string m_StatusMessages[static_cast<int>(StatusSource::Count)];
+     std::condition_variable m_WorkReady;
+diff --git a/tests/tests.pro b/tests/tests.pro
+index fbdcc383..a3f2348f 100644
+--- a/tests/tests.pro
++++ b/tests/tests.pro
+@@ -11,6 +11,7 @@ contains(CONFIG, tests) {
+     SUBDIRS += launchWarning
+     SUBDIRS += updates
+     SUBDIRS += posture
++    SUBDIRS += touchmenu
+     SUBDIRS += vrr
+     SUBDIRS += haptics
+     SUBDIRS += steamcontroller
+diff --git a/tests/touchmenu/touchmenu.pro b/tests/touchmenu/touchmenu.pro
+new file mode 100644
+index 00000000..7627b0fc
+--- /dev/null
++++ b/tests/touchmenu/touchmenu.pro
+@@ -0,0 +1,9 @@
++TEMPLATE = app
++TARGET = tst_touchmenu
++QT = core testlib
++CONFIG += console testcase c++17
++CONFIG -= app_bundle
++INCLUDEPATH += $$PWD/../../app
++SOURCES += $$PWD/tst_touchmenu.cpp \
++    $$PWD/../../app/streaming/input/touchmenu.cpp
++HEADERS += $$PWD/../../app/streaming/input/touchmenu.h
+diff --git a/tests/touchmenu/tst_touchmenu.cpp b/tests/touchmenu/tst_touchmenu.cpp
+new file mode 100644
+index 00000000..f8d33813
+--- /dev/null
++++ b/tests/touchmenu/tst_touchmenu.cpp
+@@ -0,0 +1,849 @@
++#include <QtTest>
++
++#include <cmath>
++
++#include "streaming/input/touchmenu.h"
++
++using namespace touchmenu;
++
++namespace {
++
++// Three fingers well away from the menu, spread out
++void threeDown(TouchMenu& m, uint32_t t)
++{
++    QCOMPARE(m.fingerDown(1, 0.50f, 0.20f, t).type, EventType::None);
++    QCOMPARE(m.fingerDown(2, 0.60f, 0.20f, t).type, EventType::None);
++    QCOMPARE(m.fingerDown(3, 0.70f, 0.20f, t).type, EventType::None);
++}
++
++// Opens the menu with three fingers at t = 0 .. 800 and lifts them
++void openMenu(TouchMenu& m, uint32_t& now)
++{
++    threeDown(m, 0);
++    QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++    now = HoldMs;
++    QVERIFY(m.isOpen());
++}
++
++void liftHoldFingers(TouchMenu& m, uint32_t t)
++{
++    QVERIFY(m.fingerUp(1, 0.50f, 0.20f, t).swallow);
++    QVERIFY(m.fingerUp(2, 0.60f, 0.20f, t).swallow);
++    QVERIFY(m.fingerUp(3, 0.70f, 0.20f, t).swallow);
++}
++
++// Center of an item in normalized window coordinates
++void itemCenter(int outW, int outH, int item, float& x, float& y, Side side = Side::Left)
++{
++    Layout l = computeLayout(outW, outH, side);
++    Rect r = l.itemInOutput(item);
++    x = (r.x + r.w / 2.0f) / outW;
++    y = (r.y + r.h / 2.0f) / outH;
++}
++
++// Two fingers land at the right edge (the second 100 ms later) and both move
++// left by 0.12 of the width. Returns the event of the last move.
++Event edgeSwipe(TouchMenu& m, uint32_t t0, uint32_t gapMs = 100, float dx = 0.12f)
++{
++    m.fingerDown(1, 0.97f, 0.50f, t0);
++    m.fingerDown(2, 0.98f, 0.60f, t0 + gapMs);
++    m.fingerMove(1, 0.97f - dx, 0.50f, t0 + gapMs + 100);
++    return m.fingerMove(2, 0.98f - dx, 0.60f, t0 + gapMs + 200);
++}
++
++} // namespace
++
++class TouchMenuTest : public QObject
++{
++    Q_OBJECT
++
++private:
++    TouchMenu m;
++
++private slots:
++    void init()
++    {
++        m = TouchMenu();
++        m.setOutputSize(1280, 720);
++    }
++
++    void threeFingersOpenAfterHold()
++    {
++        threeDown(m, 1000);
++        QVERIFY(m.needsTick());
++        QCOMPARE(m.tick(1000).type, EventType::None);
++        QCOMPARE(m.tick(1000 + HoldMs - 1).type, EventType::None);
++        QVERIFY(!m.isOpen());
++        Event e = m.tick(1000 + HoldMs);
++        QCOMPARE(e.type, EventType::Open);
++        QVERIFY(e.side == Side::Left);
++        QVERIFY(e.swallow);
++        QVERIFY(m.isOpen());
++    }
++
++    void eventsReachHostUntilOpen()
++    {
++        QVERIFY(!m.fingerDown(1, 0.5f, 0.2f, 0).swallow);
++        QVERIFY(!m.fingerDown(2, 0.6f, 0.2f, 0).swallow);
++        QVERIFY(!m.fingerDown(3, 0.7f, 0.2f, 0).swallow);
++        QVERIFY(!m.fingerMove(1, 0.501f, 0.2f, 100).swallow);
++    }
++
++    void twoFingersNeverOpen()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerDown(2, 0.6f, 0.2f, 0);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++        QCOMPARE(m.tick(60000).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void movementBeyondThresholdCancels()
++    {
++        threeDown(m, 0);
++        // 3 % of 720 px = 21.6 px: 40 px is too far
++        m.fingerMove(2, 0.60f, 0.20f + 40.0f / 720.0f, 100);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void smallMovementDoesNotCancel()
++    {
++        threeDown(m, 0);
++        m.fingerMove(2, 0.60f, 0.20f + 10.0f / 720.0f, 100);
++        QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++    }
++
++    void thresholdUsesShorterSide()
++    {
++        threeDown(m, 0);
++        // 25 px sideways: below 3 % of the width (38 px) but above 3 % of the shorter side (21.6 px)
++        m.fingerMove(1, 0.50f + 25.0f / 1280.0f, 0.20f, 100);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++    }
++
++    void cancelledByMovementDoesNotRearmWhileThreeDown()
++    {
++        threeDown(m, 0);
++        m.fingerMove(2, 0.60f, 0.40f, 100);
++        // Finger comes back and holds still: still cancelled
++        m.fingerMove(2, 0.60f, 0.20f, 200);
++        QCOMPARE(m.tick(5000).type, EventType::None);
++        // Fingers lift below three, then a new hold works
++        m.fingerUp(3, 0.70f, 0.20f, 6000);
++        m.fingerDown(3, 0.70f, 0.20f, 6100);
++        QCOMPARE(m.tick(6100 + HoldMs).type, EventType::Open);
++    }
++
++    void fingerLiftedEarlyCancels()
++    {
++        threeDown(m, 0);
++        m.fingerUp(3, 0.70f, 0.20f, 400);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++        // The finger lands again: the hold restarts from that moment
++        m.fingerDown(3, 0.70f, 0.20f, 1000);
++        QCOMPARE(m.tick(1000 + HoldMs - 1).type, EventType::None);
++        QCOMPARE(m.tick(1000 + HoldMs).type, EventType::Open);
++    }
++
++    void fourthFingerDoesNotRestartHold()
++    {
++        threeDown(m, 0);
++        m.fingerDown(4, 0.80f, 0.20f, 500);
++        // Timed from the third finger, not from the fourth
++        QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++    }
++
++    void fourthFingerMovementCancels()
++    {
++        threeDown(m, 0);
++        m.fingerDown(4, 0.80f, 0.20f, 500);
++        m.fingerMove(4, 0.80f, 0.50f, 600);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++    }
++
++    void fourthFingerLeavingKeepsHold()
++    {
++        threeDown(m, 0);
++        m.fingerDown(4, 0.80f, 0.20f, 500);
++        m.fingerUp(4, 0.80f, 0.20f, 600);
++        QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++    }
++
++    void thirdFingerAfterScrollingFingersDoesNotArm()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerDown(2, 0.6f, 0.2f, 0);
++        m.fingerMove(1, 0.5f, 0.5f, 100);
++        m.fingerDown(3, 0.7f, 0.2f, 200);
++        QCOMPARE(m.tick(2000).type, EventType::None);
++    }
++
++    void openedMenuSwallowsEverything()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        // Fingers that were down stay swallowed, also their lift and any move
++        QVERIFY(m.fingerMove(1, 0.51f, 0.2f, now + 10).swallow);
++        liftHoldFingers(m, now + 20);
++        // New touches too
++        QVERIFY(m.fingerDown(5, 0.1f, 0.1f, now + 30).swallow);
++        QVERIFY(m.fingerMove(5, 0.1f, 0.2f, now + 40).swallow);
++    }
++
++    void holdFingersDoNotActivateOnLift()
++    {
++        // Fingers hold right above the "Disconnect" item and lift there
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y);
++        m.fingerDown(1, x, y, 0);
++        m.fingerDown(2, x + 0.02f, y, 0);
++        m.fingerDown(3, x - 0.02f, y, 0);
++        QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++        QCOMPARE(m.fingerUp(1, x, y, 900).type, EventType::None);
++        QCOMPARE(m.fingerUp(2, x + 0.02f, y, 900).type, EventType::None);
++        QCOMPARE(m.fingerUp(3, x - 0.02f, y, 900).type, EventType::None);
++        QVERIFY(m.isOpen());
++    }
++
++    void activationNeedsDownAndUpOnSameItem()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++
++        float dx, dy, sx, sy;
++        itemCenter(1280, 720, ItemDisconnect, dx, dy);
++        itemCenter(1280, 720, ItemToggleStats, sx, sy);
++
++        // Down on one item, up on another: nothing
++        m.fingerDown(7, dx, dy, now + 100);
++        QCOMPARE(m.highlightedItem(), (int)ItemDisconnect);
++        m.fingerMove(7, sx, sy, now + 150);
++        QCOMPARE(m.highlightedItem(), -1);
++        Event e = m.fingerUp(7, sx, sy, now + 200);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(m.isOpen());
++
++        // Down and up on the same item
++        m.fingerDown(8, sx, sy, now + 300);
++        QCOMPARE(m.highlightedItem(), (int)ItemToggleStats);
++        e = m.fingerUp(8, sx, sy, now + 350);
++        QCOMPARE(e.type, EventType::Activate);
++        QCOMPARE(e.item, (int)ItemToggleStats);
++        QVERIFY(e.swallow);
++        QVERIFY(!m.isOpen());
++        QVERIFY(!m.needsTick());
++    }
++
++    void disconnectItemActivates()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y);
++        m.fingerDown(7, x, y, now + 100);
++        Event e = m.fingerUp(7, x, y, now + 150);
++        QCOMPARE(e.type, EventType::Activate);
++        QCOMPARE(e.item, (int)ItemDisconnect);
++    }
++
++    void quitSessionItemActivates()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        float x, y;
++        itemCenter(1280, 720, ItemQuitSession, x, y);
++        m.fingerDown(7, x, y, now + 100);
++        Event e = m.fingerUp(7, x, y, now + 150);
++        QCOMPARE(e.type, EventType::Activate);
++        QCOMPARE(e.item, (int)ItemQuitSession);
++        QVERIFY(!m.isOpen());
++    }
++
++    void closeItemCloses()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        float x, y;
++        itemCenter(1280, 720, ItemCloseMenu, x, y);
++        m.fingerDown(7, x, y, now + 100);
++        QCOMPARE(m.fingerUp(7, x, y, now + 150).type, EventType::Close);
++        QVERIFY(!m.isOpen());
++        // Normal input resumes
++        QVERIFY(!m.fingerDown(9, 0.5f, 0.2f, now + 300).swallow);
++    }
++
++    void tapOutsideCloses()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        m.fingerDown(7, 0.9f, 0.1f, now + 100);
++        Event e = m.fingerUp(7, 0.9f, 0.1f, now + 150);
++        QCOMPARE(e.type, EventType::Close);
++        QVERIFY(e.swallow);
++        QVERIFY(!m.isOpen());
++    }
++
++    void idleTimeoutCloses()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        QCOMPARE(m.tick(now + IdleMs - 1).type, EventType::None);
++        QVERIFY(m.isOpen());
++        QCOMPARE(m.tick(now + IdleMs).type, EventType::Close);
++        QVERIFY(!m.isOpen());
++        QVERIFY(!m.needsTick());
++    }
++
++    void touchRestartsIdleTimeout()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y);
++        // A touch late in the idle period restarts it
++        m.fingerDown(8, x, y, now + 9000);
++        m.fingerMove(8, x, y, now + 9500);
++        m.fingerUp(8, 0.9f, 0.1f, now + 9600); // Down on an item, up outside: no action
++        QVERIFY(m.isOpen());
++        QCOMPARE(m.tick(now + 9600 + IdleMs - 1).type, EventType::None);
++        QCOMPARE(m.tick(now + 9600 + IdleMs).type, EventType::Close);
++    }
++
++    void fingersHeldThroughCloseStaySwallowed()
++    {
++        threeDown(m, 0);
++        QCOMPARE(m.tick(HoldMs).type, EventType::Open);
++        QCOMPARE(m.tick(HoldMs + IdleMs).type, EventType::Close);
++        // The three fingers are still down: they do not reach the host,
++        // and they do not start another hold.
++        QVERIFY(m.fingerMove(1, 0.5f, 0.2f, HoldMs + IdleMs + 10).swallow);
++        QCOMPARE(m.tick(HoldMs + 2 * IdleMs).type, EventType::None);
++        QVERIFY(m.fingerUp(1, 0.5f, 0.2f, HoldMs + 2 * IdleMs).swallow);
++        m.fingerUp(2, 0.6f, 0.2f, HoldMs + 2 * IdleMs);
++        m.fingerUp(3, 0.7f, 0.2f, HoldMs + 2 * IdleMs);
++        QVERIFY(!m.fingerDown(1, 0.5f, 0.2f, HoldMs + 3 * IdleMs).swallow);
++    }
++
++    void gestureWorksAgainAfterClose()
++    {
++        uint32_t now;
++        openMenu(m, now);
++        liftHoldFingers(m, now);
++        m.fingerDown(7, 0.9f, 0.1f, now + 100);
++        QCOMPARE(m.fingerUp(7, 0.9f, 0.1f, now + 150).type, EventType::Close);
++        uint32_t t = now + 1000;
++        threeDown(m, t);
++        QCOMPARE(m.tick(t + HoldMs).type, EventType::Open);
++    }
++
++    void tickWrapAround()
++    {
++        uint32_t t = 0xFFFFFF00u;
++        threeDown(m, t);
++        QCOMPARE(m.tick(t + 100).type, EventType::None);
++        QCOMPARE(m.tick(t + HoldMs).type, EventType::Open); // wraps past 2^32
++    }
++
++    void layoutThreeItems_data()
++    {
++        QTest::addColumn<int>("w");
++        QTest::addColumn<int>("h");
++        QTest::newRow("1920x1280") << 1920 << 1280;
++        QTest::newRow("1280x720") << 1280 << 720;
++        QTest::newRow("720x1280") << 720 << 1280;
++        QTest::newRow("3840x2160") << 3840 << 2160;
++    }
++
++    void layoutThreeItems()
++    {
++        QFETCH(int, w);
++        QFETCH(int, h);
++        Layout l = computeLayout(w, h);
++        QVERIFY(l.valid);
++        QVERIFY(l.surfaceWidth > 0 && l.surfaceWidth <= w);
++        QVERIFY(l.surfaceHeight > 0 && l.surfaceHeight <= h);
++        QVERIFY(l.fontPixels >= 12);
++
++        const int minHeight = (int)std::ceil(h * MinItemHeightFraction);
++        for (int i = 0; i < ItemCount; i++) {
++            const Rect& r = l.items[i];
++            QVERIFY2(r.h >= minHeight, "item shorter than the minimum");
++            QVERIFY(r.x >= 0 && r.y >= 0);
++            QVERIFY(r.x + r.w <= l.surfaceWidth);
++            QVERIFY(r.y + r.h <= l.surfaceHeight);
++            QVERIFY(QString(itemLabel(i)).size() > 0);
++            for (int j = i + 1; j < ItemCount; j++) {
++                const Rect& o = l.items[j];
++                bool apart = r.x + r.w <= o.x || o.x + o.w <= r.x ||
++                             r.y + r.h <= o.y || o.y + o.h <= r.y;
++                QVERIFY2(apart, "items overlap");
++            }
++        }
++        // Stacked top to bottom in menu order
++        QVERIFY(l.items[0].y < l.items[1].y && l.items[1].y < l.items[2].y && l.items[2].y < l.items[3].y);
++    }
++
++    void layoutHitTest()
++    {
++        m.setOutputSize(1920, 1280);
++        for (int i = 0; i < ItemCount; i++) {
++            float x, y;
++            itemCenter(1920, 1280, i, x, y);
++            QCOMPARE(m.hitTest(x, y), i);
++        }
++        // Top of the window is outside the menu
++        QCOMPARE(m.hitTest(0.1f, 0.05f), -1);
++        // Right of the menu
++        QCOMPARE(m.hitTest(0.99f, 0.95f), -1);
++    }
++
++    void activityShowsHandle()
++    {
++        QVERIFY(!m.handleVisible());
++        QVERIFY(!m.needsTick());
++        QVERIFY(!m.fingerDown(1, 0.5f, 0.2f, 0).swallow);
++        QVERIFY(m.handleVisible());
++        QVERIFY(m.needsTick());
++    }
++
++    void handleHidesAfterIdle()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 100);
++        m.fingerUp(1, 0.5f, 0.2f, 200);
++        QCOMPARE(m.tick(200 + HandleHideMs - 1).type, EventType::None);
++        QVERIFY(m.handleVisible());
++        QCOMPARE(m.tick(200 + HandleHideMs).type, EventType::None);
++        QVERIFY(!m.handleVisible());
++        QVERIFY(!m.needsTick());
++    }
++
++    void activityRestartsHandleHide()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 5000);
++        m.tick(5000 + HandleHideMs - 1);
++        QVERIFY(m.handleVisible());
++    }
++
++    void tapOnVisibleHandleOpensMenu()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 100);
++        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
++        QVERIFY(m.fingerDown(9, x, y, 200).swallow);
++        Event e = m.fingerUp(9, x, y, 300);
++        QCOMPARE(e.type, EventType::Open);
++        QVERIFY(e.side == Side::Left);
++        QVERIFY(e.swallow);
++        QVERIFY(m.isOpen());
++        QVERIFY(!m.handleVisible());
++        // The menu works as after the hold: an outside tap closes it
++        m.fingerDown(10, 0.9f, 0.1f, 400);
++        QCOMPARE(m.fingerUp(10, 0.9f, 0.1f, 450).type, EventType::Close);
++    }
++
++    void handleDownInsideLiftOutsideDoesNotOpen()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 100);
++        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
++        QVERIFY(m.fingerDown(9, x, y, 200).swallow);
++        QVERIFY(m.fingerMove(9, 0.5f, 0.5f, 250).swallow);
++        Event e = m.fingerUp(9, 0.5f, 0.5f, 300);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(e.swallow);
++        QVERIFY(!m.isOpen());
++    }
++
++    void handleDragInsideHandleDoesNotOpen()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 100);
++        // 30 px inside the 56 px handle is more than 3 % of 720
++        QVERIFY(m.fingerDown(9, 5.0f / 1280, 715.0f / 720, 200).swallow);
++        Event e = m.fingerUp(9, 35.0f / 1280, 715.0f / 720, 300);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(e.swallow);
++    }
++
++    void cornerTouchWhileHiddenIsForwarded()
++    {
++        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
++        QVERIFY(!m.handleVisible());
++        QVERIFY(!m.fingerDown(1, x, y, 0).swallow);
++        QVERIFY(m.handleVisible());
++        // That tap does not open anything
++        Event e = m.fingerUp(1, x, y, 100);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(!e.swallow);
++        QVERIFY(!m.isOpen());
++    }
++
++    void handleFingerDoesNotCountForHold()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 50);
++        m.fingerDown(9, 28.0f / 1280, 692.0f / 720, 100); // swallowed on the handle
++        m.fingerDown(2, 0.6f, 0.2f, 100);
++        m.fingerDown(3, 0.7f, 0.2f, 100);
++        QCOMPARE(m.gestureFingerCount(), 2);
++        QCOMPARE(m.tick(100 + HoldMs).type, EventType::None);
++    }
++
++    void redownOfTrackedIdReplaces()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerDown(2, 0.6f, 0.2f, 0);
++        // The compositor lost finger 1's up: the same id comes back
++        m.fingerDown(1, 0.4f, 0.4f, 500);
++        QCOMPARE(m.gestureFingerCount(), 2);
++        QCOMPARE(m.tick(500 + HoldMs).type, EventType::None);
++        // A real third finger still arms
++        m.fingerDown(3, 0.7f, 0.2f, 600);
++        QCOMPARE(m.gestureFingerCount(), 3);
++        QCOMPARE(m.tick(600 + HoldMs).type, EventType::Open);
++    }
++
++    void lostFingersAreForgottenWhenIdle()
++    {
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerDown(2, 0.6f, 0.2f, 0);
++        m.tick(HandleHideMs);
++        QCOMPARE(m.gestureFingerCount(), 0);
++        // Two stale records no longer make a phantom third finger
++        m.fingerDown(3, 0.7f, 0.2f, HandleHideMs + 100);
++        QCOMPARE(m.tick(HandleHideMs + 100 + HoldMs).type, EventType::None);
++    }
++
++    void fingerCancelActsLikeUpWithoutActivation()
++    {
++        threeDown(m, 0);
++        m.fingerCancel(3, 100);
++        QCOMPARE(m.gestureFingerCount(), 2);
++        QCOMPARE(m.tick(HoldMs).type, EventType::None);
++
++        // Cancel of the pressed finger in the open menu activates nothing
++        uint32_t t = 1000;
++        m.fingerDown(3, 0.7f, 0.2f, t);
++        QCOMPARE(m.tick(t + HoldMs).type, EventType::Open);
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y);
++        m.fingerDown(7, x, y, t + 900);
++        QCOMPARE(m.fingerCancel(7, t + 950).type, EventType::None);
++        QVERIFY(m.isOpen());
++        QCOMPARE(m.highlightedItem(), -1);
++    }
++
++    void handleRectSizes()
++    {
++        Rect r = handleRect(1920, 1280);
++        QCOMPARE(r.x, 0);
++        QCOMPARE(r.w, 77);
++        QCOMPARE(r.h, 77);
++        QCOMPARE(r.y, 1280 - 77);
++        r = handleRect(1280, 720);
++        QCOMPARE(r.w, 56); // 6 % is 43 px, the minimum wins
++        QCOMPARE(r.h, 56);
++        QCOMPARE(r.y, 720 - 56);
++        QCOMPARE(handleSize(1280, 0), 0);
++    }
++
++    void edgeSwipeOpensRight()
++    {
++        m.fingerDown(1, 0.97f, 0.50f, 1000);
++        QVERIFY(!m.fingerDown(2, 0.98f, 0.60f, 1100).swallow);
++        // Touches reach the host until the menu opens
++        QVERIFY(!m.fingerMove(1, 0.90f, 0.50f, 1200).swallow);
++        Event e = m.fingerMove(1, 0.85f, 0.50f, 1300);
++        QCOMPARE(e.type, EventType::None);
++        e = m.fingerMove(2, 0.86f, 0.60f, 1400);
++        QCOMPARE(e.type, EventType::Open);
++        QVERIFY(e.side == Side::Right);
++        QVERIFY(e.swallow);
++        QVERIFY(m.isOpen());
++        QVERIFY(m.side() == Side::Right);
++    }
++
++    void handleOffNeverShowsAndCornerTouchPasses()
++    {
++        m.setTriggers(true, false);
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        QVERIFY(!m.handleVisible());
++        m.fingerUp(1, 0.5f, 0.2f, 100);
++        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
++        QVERIFY(!m.fingerDown(9, x, y, 200).swallow);
++        Event e = m.fingerUp(9, x, y, 300);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(!e.swallow);
++        QVERIFY(!m.isOpen());
++        // Lost contacts are still forgotten after the idle time
++        m.fingerDown(5, 0.5f, 0.5f, 400);
++        QVERIFY(m.needsTick());
++        m.tick(400 + HandleHideMs);
++        QCOMPARE(m.gestureFingerCount(), 0);
++        QVERIFY(!m.needsTick());
++    }
++
++    void handleOffEdgeSwipeStillOpens()
++    {
++        m.setTriggers(true, false);
++        m.fingerDown(1, 0.97f, 0.50f, 1000);
++        m.fingerDown(2, 0.98f, 0.60f, 1100);
++        m.fingerMove(1, 0.85f, 0.50f, 1300);
++        QCOMPARE(m.fingerMove(2, 0.86f, 0.60f, 1400).type, EventType::Open);
++    }
++
++    void gesturesOffEdgeSwipeAndHoldDoNothing()
++    {
++        m.setTriggers(false, true);
++        m.fingerDown(1, 0.97f, 0.50f, 1000);
++        m.fingerDown(2, 0.98f, 0.60f, 1100);
++        m.fingerMove(1, 0.85f, 0.50f, 1300);
++        Event e = m.fingerMove(2, 0.86f, 0.60f, 1400);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(!e.swallow);
++        m.fingerUp(1, 0.85f, 0.50f, 1500);
++        m.fingerUp(2, 0.86f, 0.60f, 1500);
++        threeDown(m, 2000);
++        QCOMPARE(m.tick(2000 + HoldMs).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void gesturesOffHandleStillOpens()
++    {
++        m.setTriggers(false, true);
++        m.fingerDown(1, 0.5f, 0.2f, 0);
++        m.fingerUp(1, 0.5f, 0.2f, 100);
++        QVERIFY(m.handleVisible());
++        float x = 28.0f / 1280, y = (720 - 28.0f) / 720;
++        m.fingerDown(9, x, y, 200);
++        QCOMPARE(m.fingerUp(9, x, y, 300).type, EventType::Open);
++    }
++
++    void edgeSwipeAtExactTimingLimitsOpens()
++    {
++        // Second finger exactly 300 ms later, completion exactly 1200 ms after the first
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        m.fingerDown(2, 0.98f, 0.6f, EdgePairMs);
++        m.fingerMove(1, 0.80f, 0.5f, 500);
++        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs).type, EventType::Open);
++    }
++
++    void oneFingerFromEdgeDoesNotOpen()
++    {
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        QVERIFY(!m.fingerMove(1, 0.60f, 0.5f, 200).swallow);
++        QCOMPARE(m.fingerMove(1, 0.30f, 0.5f, 400).type, EventType::None);
++        QVERIFY(!m.isOpen());
++        QVERIFY(!m.fingerUp(1, 0.30f, 0.5f, 500).swallow);
++    }
++
++    void edgeSwipeNeedsBothFingersInEdgeZone()
++    {
++        m.fingerDown(1, 0.85f, 0.5f, 0);
++        m.fingerDown(2, 0.86f, 0.6f, 100);
++        m.fingerMove(1, 0.60f, 0.5f, 200);
++        QCOMPARE(m.fingerMove(2, 0.61f, 0.6f, 300).type, EventType::None);
++        QVERIFY(!m.isOpen());
++
++        // Only the second finger outside the zone
++        TouchMenu n;
++        n.setOutputSize(1280, 720);
++        n.fingerDown(1, 0.97f, 0.5f, 0);
++        n.fingerDown(2, 0.85f, 0.6f, 100);
++        n.fingerMove(1, 0.70f, 0.5f, 200);
++        QCOMPARE(n.fingerMove(2, 0.60f, 0.6f, 300).type, EventType::None);
++    }
++
++    void edgeSwipeSecondFingerTooLate()
++    {
++        QCOMPARE(edgeSwipe(m, 0, EdgePairMs + 1).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void edgeSwipeNotFarEnough()
++    {
++        QCOMPARE(edgeSwipe(m, 0, 100, 0.07f).type, EventType::None);
++        QVERIFY(!m.isOpen());
++        // One finger far enough is not enough either
++        TouchMenu n;
++        n.setOutputSize(1280, 720);
++        n.fingerDown(1, 0.97f, 0.5f, 0);
++        n.fingerDown(2, 0.98f, 0.6f, 100);
++        n.fingerMove(1, 0.80f, 0.5f, 200);
++        QCOMPARE(n.fingerMove(2, 0.95f, 0.6f, 300).type, EventType::None);
++    }
++
++    void edgeSwipeCancelledWhenAFingerLiftsEarly()
++    {
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        m.fingerDown(2, 0.98f, 0.6f, 100);
++        m.fingerMove(1, 0.84f, 0.5f, 200);
++        m.fingerUp(1, 0.84f, 0.5f, 250);
++        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 300).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void edgeSwipeTimesOut()
++    {
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        m.fingerDown(2, 0.98f, 0.6f, 100);
++        m.fingerMove(1, 0.80f, 0.5f, 1000);
++        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs + 1).type, EventType::None);
++        QVERIFY(!m.isOpen());
++
++        // Same through the tick, then the fingers keep moving
++        TouchMenu n;
++        n.setOutputSize(1280, 720);
++        n.fingerDown(1, 0.97f, 0.5f, 0);
++        n.fingerDown(2, 0.98f, 0.6f, 100);
++        QCOMPARE(n.tick(EdgeSwipeWindowMs + 1).type, EventType::None);
++        n.fingerMove(1, 0.80f, 0.5f, EdgeSwipeWindowMs + 100);
++        QCOMPARE(n.fingerMove(2, 0.80f, 0.6f, EdgeSwipeWindowMs + 200).type, EventType::None);
++    }
++
++    void edgeSwipeCancelledByRightwardMovement()
++    {
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        m.fingerDown(2, 0.98f, 0.6f, 100);
++        // 3 % of the shorter side (720) is 21.6 px = 0.017 of the width
++        m.fingerMove(1, 0.99f, 0.5f, 200);
++        m.fingerMove(1, 0.80f, 0.5f, 300);
++        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 400).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void edgeSwipeCancelledByThirdFinger()
++    {
++        m.fingerDown(1, 0.97f, 0.5f, 0);
++        m.fingerDown(2, 0.98f, 0.6f, 100);
++        m.fingerDown(3, 0.50f, 0.5f, 150);
++        m.fingerMove(1, 0.80f, 0.5f, 200);
++        QCOMPARE(m.fingerMove(2, 0.80f, 0.6f, 300).type, EventType::None);
++        QVERIFY(!m.isOpen());
++    }
++
++    void edgeSwipeWorksAgainAfterFingersLift()
++    {
++        QCOMPARE(edgeSwipe(m, 0, EdgePairMs + 1).type, EventType::None);
++        m.fingerUp(1, 0.85f, 0.5f, 700);
++        m.fingerUp(2, 0.86f, 0.6f, 700);
++        QCOMPARE(edgeSwipe(m, 2000).type, EventType::Open);
++    }
++
++    void edgeSwipeFallsBackToLeftWithoutWideOverlay()
++    {
++        m.setRightPanelAllowed(false);
++        Event e = edgeSwipe(m, 0);
++        QCOMPARE(e.type, EventType::Open);
++        QVERIFY(e.side == Side::Left);
++        QVERIFY(m.side() == Side::Left);
++    }
++
++    void edgeSwipeFingersDoNotActivateOnLift()
++    {
++        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
++        // Lift both fingers over menu items
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y, Side::Right);
++        QVERIFY(m.fingerMove(1, x, y, 600).swallow);
++        Event e = m.fingerUp(1, x, y, 650);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(e.swallow);
++        itemCenter(1280, 720, ItemToggleStats, x, y, Side::Right);
++        e = m.fingerUp(2, x, y, 650);
++        QCOMPARE(e.type, EventType::None);
++        QVERIFY(e.swallow);
++        QVERIFY(m.isOpen());
++    }
++
++    void rightPanelItemsActivate()
++    {
++        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
++        m.fingerUp(1, 0.85f, 0.5f, 600);
++        m.fingerUp(2, 0.86f, 0.6f, 600);
++        for (int i = 0; i < ItemCount; i++) {
++            float x, y;
++            itemCenter(1280, 720, i, x, y, Side::Right);
++            QCOMPARE(m.hitTest(x, y), i);
++        }
++        float x, y;
++        itemCenter(1280, 720, ItemToggleStats, x, y, Side::Right);
++        m.fingerDown(7, x, y, 700);
++        QCOMPARE(m.highlightedItem(), (int)ItemToggleStats);
++        Event e = m.fingerUp(7, x, y, 750);
++        QCOMPARE(e.type, EventType::Activate);
++        QCOMPARE(e.item, (int)ItemToggleStats);
++        QVERIFY(!m.isOpen());
++    }
++
++    void rightPanelTransparentPartClosesMenu()
++    {
++        QCOMPARE(edgeSwipe(m, 0).type, EventType::Open);
++        m.fingerUp(1, 0.85f, 0.5f, 600);
++        m.fingerUp(2, 0.86f, 0.6f, 600);
++        // Where the left panel would be: transparent surface, outside the panel
++        float x, y;
++        itemCenter(1280, 720, ItemDisconnect, x, y, Side::Left);
++        QCOMPARE(m.hitTest(x, y), -1);
++        m.fingerDown(7, x, y, 700);
++        QCOMPARE(m.fingerUp(7, x, y, 750).type, EventType::Close);
++        QVERIFY(!m.isOpen());
++    }
++
++    void layoutRightPanel_data()
++    {
++        QTest::addColumn<int>("w");
++        QTest::addColumn<int>("h");
++        QTest::newRow("1920x1280") << 1920 << 1280;
++        QTest::newRow("1280x720") << 1280 << 720;
++    }
++
++    void layoutRightPanel()
++    {
++        QFETCH(int, w);
++        QFETCH(int, h);
++        Layout left = computeLayout(w, h, Side::Left);
++        Layout l = computeLayout(w, h, Side::Right);
++        QVERIFY(l.valid);
++        QCOMPARE(l.surfaceWidth, w);
++        QCOMPARE(l.surfaceHeight, left.surfaceHeight);
++        QCOMPARE(l.panelWidth, left.panelWidth);
++        QCOMPARE(l.panelX + l.panelWidth, w);
++        QCOMPARE(l.originY, h - l.surfaceHeight);
++
++        const int minHeight = (int)std::ceil(h * MinItemHeightFraction);
++        for (int i = 0; i < ItemCount; i++) {
++            const Rect& r = l.items[i];
++            QVERIFY(r.h >= minHeight);
++            // Inside the panel
++            QVERIFY(r.x >= l.panelX && r.x + r.w <= l.panelX + l.panelWidth);
++            QVERIFY(r.y >= 0 && r.y + r.h <= l.surfaceHeight);
++            // Inside the output
++            Rect o = l.itemInOutput(i);
++            QVERIFY(o.x >= 0 && o.x + o.w <= w);
++            QVERIFY(o.y >= 0 && o.y + o.h <= h);
++            for (int j = i + 1; j < ItemCount; j++) {
++                const Rect& q = l.items[j];
++                QVERIFY(r.y + r.h <= q.y || q.y + q.h <= r.y);
++            }
++        }
++    }
++
++    void layoutInvalidOutput()
++    {
++        QVERIFY(!computeLayout(0, 720).valid);
++        QVERIFY(!computeLayout(1280, 0).valid);
++    }
++};
++
++QTEST_APPLESS_MAIN(TouchMenuTest)
++#include "tst_touchmenu.moc"
+diff --git a/tests/vrr/overlay.pro b/tests/vrr/overlay.pro
+index e9d13050..e11ffefc 100644
+--- a/tests/vrr/overlay.pro
++++ b/tests/vrr/overlay.pro
+@@ -5,7 +5,7 @@ CONFIG += console c++17
+ CONFIG -= app_bundle
+ DEFINES += SDL_MAIN_HANDLED
+ INCLUDEPATH += $$PWD/../../app $$PWD/../../app/streaming/video
+-SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/path.cpp
++SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/streaming/input/touchmenu.cpp $$PWD/../../app/path.cpp
+ HEADERS += $$PWD/../../app/streaming/video/timinggraph.h
+ win32 {
+     VRR_ARCH = $$QT_ARCH

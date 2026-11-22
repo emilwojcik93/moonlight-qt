@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Wed, 18 Nov 2026 11:08:58 +0100
+Subject: [PATCH 5/7] settings: add touch menu trigger option
+
+settings: add touch menu trigger option
+
+Add StreamingPreferences::TouchMenuTrigger (swipe only [default], swipe and
+handle, handle only, off; persisted as "touchmenutrigger") and the matching
+stream settings combo box. The option decides which gestures open the touch-only
+stream menu added in the following patches. Nothing consumes it until then.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ app/gui/SettingsView.qml              | 24 ++++++++++++++++++++++++
+ app/settings/streamingpreferences.cpp |  7 +++++++
+ app/settings/streamingpreferences.h   | 15 +++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/app/gui/SettingsView.qml b/app/gui/SettingsView.qml
+index 0eff40d7..07226cbe 100644
+--- a/app/gui/SettingsView.qml
++++ b/app/gui/SettingsView.qml
+@@ -2781,6 +2781,30 @@ FocusScope {
+                     ToolTip.text: qsTr("When checked, the touchscreen acts like a trackpad. When unchecked, the touchscreen will directly control the mouse pointer.")
+                 }
+ 
++                ConsoleSettingRow {
++                    width: parent.width
++                    objectName: "touchMenuTriggerRow"
++                    labelItem: ConsoleText { text: qsTr("Touch menu") }
++                    description: qsTr("Opens a menu on touch-only devices to disconnect, quit the session or toggle statistics. Swipe: two fingers from the right edge to the left. Handle: a small button that appears in the bottom-left corner while you touch the stream. Off leaves only the keyboard and gamepad shortcuts.")
++                    editor: AutoResizingComboBox {
++                        id: touchMenuTrigger
++                        textRole: "text"
++                        model: ListModel {
++                            ListElement { text: qsTr("Swipe"); val: StreamingPreferences.TMT_GESTURE }
++                            ListElement { text: qsTr("Handle"); val: StreamingPreferences.TMT_HANDLE }
++                            ListElement { text: qsTr("Swipe and handle"); val: StreamingPreferences.TMT_GESTURE_AND_HANDLE }
++                            ListElement { text: qsTr("Off"); val: StreamingPreferences.TMT_OFF }
++                        }
++                        Component.onCompleted: {
++                            for (var i = 0; i < count; ++i) {
++                                if (model.get(i).val === StreamingPreferences.touchMenuTrigger) { currentIndex = i; break }
++                            }
++                            recalculateWidth()
++                        }
++                        onActivated: StreamingPreferences.touchMenuTrigger = model.get(currentIndex).val
++                    }
++                }
++
+                 ConsoleCheckBox {
+                     id: swapMouseButtonsCheck
+                     hoverEnabled: true
+diff --git a/app/settings/streamingpreferences.cpp b/app/settings/streamingpreferences.cpp
+index a79bbc67..8c1ddd8c 100644
+--- a/app/settings/streamingpreferences.cpp
++++ b/app/settings/streamingpreferences.cpp
+@@ -68,6 +68,7 @@
+ #define SER_MUTEONFOCUSLOSS "muteonfocusloss"
+ #define SER_BACKGROUNDGAMEPAD "backgroundgamepad"
+ #define SER_REVERSESCROLL "reversescroll"
++#define SER_TOUCHMENUTRIGGER "touchmenutrigger"
+ #define SER_SWAPFACEBUTTONS "swapfacebuttons"
+ #define SER_CAPTURESYSKEYS "capturesyskeys"
+ #define SER_CLIENTPOSTURE "clientposture"
+@@ -248,6 +249,11 @@ void StreamingPreferences::reload()
+     muteOnFocusLoss = settings.value(SER_MUTEONFOCUSLOSS, false).toBool();
+     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
+     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
++    touchMenuTrigger = static_cast<TouchMenuTrigger>(settings.value(SER_TOUCHMENUTRIGGER,
++                                                     static_cast<int>(TouchMenuTrigger::TMT_GESTURE)).toInt());
++    if (touchMenuTrigger < TMT_GESTURE || touchMenuTrigger > TMT_OFF) {
++        touchMenuTrigger = TMT_GESTURE;
++    }
+     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
+     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
+     enableHdr = settings.value(SER_HDR, false).toBool();
+@@ -504,6 +510,7 @@ void StreamingPreferences::save()
+     settings.setValue(SER_MUTEONFOCUSLOSS, muteOnFocusLoss);
+     settings.setValue(SER_BACKGROUNDGAMEPAD, backgroundGamepad);
+     settings.setValue(SER_REVERSESCROLL, reverseScrollDirection);
++    settings.setValue(SER_TOUCHMENUTRIGGER, static_cast<int>(touchMenuTrigger));
+     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
+     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
+     settings.setValue(SER_CLIENTPOSTURE, clientPostureMode);
+diff --git a/app/settings/streamingpreferences.h b/app/settings/streamingpreferences.h
+index b4127ae5..bfc01e70 100644
+--- a/app/settings/streamingpreferences.h
++++ b/app/settings/streamingpreferences.h
+@@ -166,6 +166,18 @@ public:
+     };
+     Q_ENUM(PostureMode);
+ 
++    // What opens the touch-only stream menu. The default is the swipe alone:
++    // nothing is drawn over the stream. Off leaves only the keyboard and
++    // gamepad shortcuts.
++    enum TouchMenuTrigger
++    {
++        TMT_GESTURE,
++        TMT_HANDLE,
++        TMT_GESTURE_AND_HANDLE,
++        TMT_OFF,
++    };
++    Q_ENUM(TouchMenuTrigger);
++
+     // What the Steam Controller (2026)'s four grip buttons become on the host
+     enum SteamControllerGrips
+     {
+@@ -232,6 +244,7 @@ public:
+     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
+     Q_PROPERTY(bool backgroundGamepad MEMBER backgroundGamepad NOTIFY backgroundGamepadChanged)
+     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
++    Q_PROPERTY(TouchMenuTrigger touchMenuTrigger MEMBER touchMenuTrigger NOTIFY touchMenuTriggerChanged)
+     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
+     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
+     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
+@@ -296,6 +309,7 @@ public:
+     bool muteOnFocusLoss;
+     bool backgroundGamepad;
+     bool reverseScrollDirection;
++    TouchMenuTrigger touchMenuTrigger = TMT_GESTURE;
+     bool swapFaceButtons;
+     bool keepAwake;
+     int packetSize;
+@@ -379,6 +393,7 @@ signals:
+     void muteOnFocusLossChanged();
+     void backgroundGamepadChanged();
+     void reverseScrollDirectionChanged();
++    void touchMenuTriggerChanged();
+     void swapFaceButtonsChanged();
+     void captureSysKeysModeChanged();
+     void clientPostureModeChanged();

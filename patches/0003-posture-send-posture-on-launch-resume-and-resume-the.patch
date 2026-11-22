@@ -1,0 +1,664 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Tue, 17 Nov 2026 23:52:09 +0100
+Subject: [PATCH 3/7] posture: send posture on launch/resume and resume the
+ stream on change
+
+posture: send posture on launch/resume and resume the stream on change
+
+Wire the posture feature into the stream lifecycle.
+
+NvHTTP::startApp() takes a postureQuery and appends clientPosture and
+clientTouch next to clientVrrRequested on /launch and /resume; stock hosts
+ignore unknown arguments. New NvHTTP::updatePosture() sends GET /posture over
+the paired HTTPS path and returns the host's display_change answer when present.
+tests/power/poweractions.pro now links postureclassifier.cpp because nvhttp.cpp
+parses that reply.
+
+PostureMonitor (posturemonitor.{h,cpp}) runs on a worker thread with its own
+event loop: it samples the local signals once a second (the Qt event loop is not
+pumped during a stream), subscribes to the KWin tabletModeChanged signal,
+debounces for 1 s and reports changes with /posture. It runs in Auto mode only
+and not against GFE.
+
+The host rebuilds its virtual display only on resume, so Session ends the SDL
+loop when the monitor asks for a restart, skips the host app quit and emits
+restartStarting(); Session::createRestartSession() builds the resume session and
+StreamSegue.qml swaps to it, which works for GUI and CLI launches alike. A
+restart only happens when the host says its display must change, at most once per
+60 s, never during the first 5 s, and never when the stream is already ending.
+setQuitHostAppOnExit() is not part of this patch.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ app/app.pro                      |   2 +
+ app/backend/nvhttp.cpp           |  25 ++++++
+ app/backend/nvhttp.h             |  11 +++
+ app/gui/StreamSegue.qml          |  21 +++++
+ app/streaming/posturemonitor.cpp | 141 +++++++++++++++++++++++++++++++
+ app/streaming/posturemonitor.h   |  77 +++++++++++++++++
+ app/streaming/session.cpp        | 100 +++++++++++++++++++++-
+ app/streaming/session.h          |  23 +++++
+ tests/power/poweractions.pro     |   2 +-
+ 9 files changed, 399 insertions(+), 3 deletions(-)
+ create mode 100644 app/streaming/posturemonitor.cpp
+ create mode 100644 app/streaming/posturemonitor.h
+
+diff --git a/app/app.pro b/app/app.pro
+index e9de6626..ea6c3b91 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -182,6 +182,7 @@ SOURCES += \
+     backend/nvhttp.cpp \
+     backend/postureclassifier.cpp \
+     backend/posturedetector.cpp \
++    streaming/posturemonitor.cpp \
+     backend/pyrowaveudpprobe.cpp \
+     backend/nvpairingmanager.cpp \
+     backend/computermanager.cpp \
+@@ -234,6 +235,7 @@ SOURCES += \
+ HEADERS += \
+     backend/postureclassifier.h \
+     backend/posturedetector.h \
++    streaming/posturemonitor.h \
+     streaming/video/videothreadpriority.h \
+     streaming/video/timinggraph.h \
+     streaming/input/dualsensehid.h \
+diff --git a/app/backend/nvhttp.cpp b/app/backend/nvhttp.cpp
+index a4ecccdf..f6fa24fd 100644
+--- a/app/backend/nvhttp.cpp
++++ b/app/backend/nvhttp.cpp
+@@ -1,3 +1,4 @@
++#include "postureclassifier.h"
+ #include "nvcomputer.h"
+ #include "pyrowaveudpprobe.h"
+ #include "poweractions.h"
+@@ -351,6 +352,7 @@ NvHTTP::startApp(QString verb,
+                  int playStationGamepadMask,
+                  bool persistGameControllersOnDisconnect,
+                  bool clientVrrRequested,
++                 const QString& postureQuery,
+                  QString& rtspSessionUrl,
+                  LaunchWarning::Warning& launchWarning)
+ {
+@@ -388,6 +390,11 @@ NvHTTP::startApp(QString verb,
+                                    // (Vibeshine: 1000 Hz virtual display in its Automatic mode).
+                                    // Other hosts ignore unknown launch parameters.
+                                    (clientVrrRequested ? "&clientVrrRequested=1" : "")+
++                                   // Posture hint for hosts that adapt their virtual display to touch
++                                   // clients: clientPosture and clientTouch (never the screen size).
++                                   // Built and validated by posture::buildQuery(); empty means none.
++                                   // Other hosts ignore unknown launch parameters.
++                                   (postureQuery.isEmpty() ? QString() : "&" + postureQuery)+
+                                    LiGetLaunchUrlQueryParameters(),
+                                    LAUNCH_TIMEOUT_MS);
+ 
+@@ -400,6 +407,24 @@ NvHTTP::startApp(QString verb,
+     launchWarning = LaunchWarning::parse(response);
+ }
+ 
++std::optional<bool>
++NvHTTP::updatePosture(const QString& postureQuery)
++{
++    // Fire-and-forget: keep the timeout short and the logging quiet, since a
++    // stock host answers 404 and that is expected.
++    QString response =
++            openConnectionToString(m_BaseUrlHttps,
++                                   "posture",
++                                   postureQuery,
++                                   FAST_FAIL_TIMEOUT_MS,
++                                   NvLogLevel::NVLL_NONE);
++
++    qDebug() << "Posture update response:" << response;
++
++    verifyResponseStatus(response);
++    return posture::parseDisplayChange(response.toStdString());
++}
++
+ void
+ NvHTTP::quitApp()
+ {
+diff --git a/app/backend/nvhttp.h b/app/backend/nvhttp.h
+index ed3bb966..5ab7c170 100644
+--- a/app/backend/nvhttp.h
++++ b/app/backend/nvhttp.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <optional>
+ #include "identitymanager.h"
+ #include "nvapp.h"
+ #include "nvaddress.h"
+@@ -189,9 +190,19 @@ public:
+              int playStationGamepadMask,
+              bool persistGameControllersOnDisconnect,
+              bool clientVrrRequested,
++             const QString& postureQuery,
+              QString& rtspSessionUrl,
+              LaunchWarning::Warning& launchWarning);
+ 
++    // Tells a posture-aware host that the client's posture changed while
++    // streaming (GET /posture over paired HTTPS, same args as launch). Throws
++    // on any failure, including a stock host that has no such endpoint; the
++    // caller is expected to ignore that. Returns the host's display_change
++    // answer when it sent one: true means the stream must be resumed to get a
++    // fitting host display, false means the running display is fine.
++    std::optional<bool>
++    updatePosture(const QString& postureQuery);
++
+     QVector<NvApp>
+     getAppList();
+ 
+diff --git a/app/gui/StreamSegue.qml b/app/gui/StreamSegue.qml
+index 4a3c3daa..607aeac1 100644
+--- a/app/gui/StreamSegue.qml
++++ b/app/gui/StreamSegue.qml
+@@ -62,6 +62,26 @@ Item {
+         window.visible = true
+     }
+ 
++    function restartStarting()
++    {
++        // The client posture changed and the host must rebuild its virtual
++        // display, which it only does on resume. Replace this segue with one
++        // that resumes the same app in a new session. Same shape as
++        // quitStarting(): no sessionFinished() follows, so a CLI launch keeps
++        // running instead of exiting.
++        if (!session) return
++        var next = session.createRestartSession()
++        var component = Qt.createComponent("StreamSegue.qml")
++        var segue = component.createObject(stackView, {
++            "appName": appName, "artwork": artwork, "session": next,
++            "isResume": true, "quitAfter": quitAfter
++        })
++        stackView.replace(stackView.currentItem, segue, StackView.Immediate)
++
++        // The stream window is gone; show the progress while we reconnect
++        window.visible = true
++    }
++
+     function sessionFinished(portTestResult)
+     {
+         if (portTestResult !== 0 && portTestResult !== -1 && streamSegueErrorDialog.text) {
+@@ -121,6 +141,7 @@ Item {
+         session.connectionStarted.connect(connectionStarted)
+         session.displayLaunchError.connect(displayLaunchError)
+         session.quitStarting.connect(quitStarting)
++        session.restartStarting.connect(restartStarting)
+         session.sessionFinished.connect(sessionFinished)
+         session.readyForDeletion.connect(sessionReadyForDeletion)
+ 
+diff --git a/app/streaming/posturemonitor.cpp b/app/streaming/posturemonitor.cpp
+new file mode 100644
+index 00000000..4d5d000a
+--- /dev/null
++++ b/app/streaming/posturemonitor.cpp
+@@ -0,0 +1,141 @@
++#include "posturemonitor.h"
++
++#include "backend/nvhttp.h"
++#include "backend/posturedetector.h"
++
++#include <QDebug>
++#include <QTimer>
++
++PostureMonitor::PostureMonitor(posture::Mode mode,
++                               const posture::Payload& launchPayload,
++                               NvAddress address,
++                               uint16_t httpsPort,
++                               QSslCertificate serverCert,
++                               bool useTrueUid,
++                               bool restartEnabled,
++                               std::optional<std::chrono::steady_clock::time_point> lastRestart)
++    : QThread(nullptr),
++      m_Mode(mode),
++      m_LaunchPayload(launchPayload),
++      m_Address(address),
++      m_HttpsPort(httpsPort),
++      m_ServerCert(serverCert),
++      m_UseTrueUid(useTrueUid),
++      m_RestartEnabled(restartEnabled),
++      m_LastRestart(lastRestart),
++      m_Started(std::chrono::steady_clock::now()),
++      m_NextSample(m_Started + kSampleInterval)
++{
++    setObjectName("Posture Monitor");
++    start();
++}
++
++PostureMonitor::~PostureMonitor()
++{
++    m_Stop = true;
++    quit();
++    wait();
++}
++
++void PostureMonitor::tick()
++{
++    const auto now = std::chrono::steady_clock::now();
++    if (now < m_NextSample) {
++        return;
++    }
++    m_NextSample = now + kSampleInterval;
++
++    // Touch devices: GUI thread, non-blocking
++    const posture::Signals sample = posture::collectLocalSignals();
++    QMutexLocker lock(&m_Mutex);
++    m_Sample = sample;
++    m_HasSample = true;
++}
++
++void PostureMonitor::run()
++{
++    NvHTTP http(m_Address, m_HttpsPort, m_ServerCert, m_UseTrueUid);
++    posture::UpdateGate gate(m_LaunchPayload, kDebounce);
++    posture::RestartGate restart(m_RestartEnabled, m_LaunchPayload, m_Started, m_LastRestart);
++
++    posture::Signals local;
++    bool haveLocal = false;
++    std::optional<bool> osTablet;
++    std::optional<bool> osTabletAvailable;
++    bool busy = false;
++
++    // Pure decision step: no I/O except the /posture call itself. Safe to run
++    // as often as we like; the gates hold the debounce and restart rules.
++    auto evaluate = [&]() {
++        // updatePosture() runs a nested event loop; do not re-enter from it
++        if (busy || !haveLocal) {
++            return;
++        }
++        busy = true;
++
++        posture::Signals sample = local;
++        sample.osTabletMode = osTablet;
++        sample.osTabletModeAvailable = osTabletAvailable;
++        const posture::Payload current = posture::makePayload(sample, m_Mode, true);
++        const auto now = std::chrono::steady_clock::now();
++        if (const auto update = gate.observe(current, now)) {
++            const QString query = QString::fromStdString(posture::buildQuery(*update));
++            qInfo().noquote() << "Client posture changed, notifying host:" << query;
++            try {
++                const std::optional<bool> displayChange = http.updatePosture(query);
++                restart.accepted(*update, displayChange);
++                if (displayChange && !*displayChange) {
++                    qInfo() << "Host switched mode without a new display; no stream restart needed";
++                }
++            } catch (const std::exception& e) {
++                qDebug() << "Posture update ignored:" << e.what();
++            } catch (...) {
++                qDebug() << "Posture update ignored";
++            }
++        }
++
++        if (!m_RestartDue.load() && restart.due(std::chrono::steady_clock::now())) {
++            qInfo() << "Posture change needs a new host display; stream restart requested";
++            m_RestartDue = true;
++        }
++        busy = false;
++    };
++
++    // Event source: KWin tabletModeChanged. Marshalled onto this thread's loop.
++    posture::TabletModeWatcher watcher([&](bool tabletMode) {
++        osTablet = tabletMode;
++        evaluate();
++    });
++    qDebug() << "Posture tablet-mode events:" << (watcher.active() ? "subscribed" : "not available, sampling only");
++
++    // Sampling source and debounce clock
++    QTimer timer;
++    timer.setInterval(250);
++    QObject::connect(&timer, &QTimer::timeout, &timer, [&]() {
++        if (m_Stop) {
++            quit();
++            return;
++        }
++
++        bool fresh = false;
++        {
++            QMutexLocker lock(&m_Mutex);
++            if (m_HasSample) {
++                local = m_Sample;
++                m_HasSample = false;
++                haveLocal = fresh = true;
++            }
++        }
++        if (fresh) {
++            // Blocking D-Bus read (or Win32 metric), at most once a second
++            posture::Signals probe = local;
++            posture::collectOsTabletSignals(probe);
++            osTablet = probe.osTabletMode;
++            osTabletAvailable = probe.osTabletModeAvailable;
++        }
++        evaluate();
++    });
++    timer.start();
++
++    exec();
++}
+diff --git a/app/streaming/posturemonitor.h b/app/streaming/posturemonitor.h
+new file mode 100644
+index 00000000..ab805d1a
+--- /dev/null
++++ b/app/streaming/posturemonitor.h
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include <QMutex>
++#include <QSslCertificate>
++#include <QThread>
++
++#include <atomic>
++#include <chrono>
++#include <optional>
++
++#include "backend/nvaddress.h"
++#include "backend/postureclassifier.h"
++
++// Watches the client posture while a stream runs, tells the host when it
++// changes (2-in-1 flipped to tablet, keyboard detached, ...) and says when the
++// stream should be resumed so the host rebuilds its virtual display.
++//
++// The Qt event loop of the GUI thread is not pumped during a stream and the SDL
++// loop must never block, so the work lives on a worker thread with its own
++// event loop. Two sources feed it:
++//   - tabletModeChanged D-Bus events (Linux/KDE), handled immediately;
++//   - tick(), called from the SDL loop, which takes a cheap non-blocking sample
++//     of the local signals once a second. The worker adds the OS tablet-mode
++//     state (a D-Bus call that can block) on each sample. This is the fallback
++//     and the only source on Windows.
++// Changes are debounced for a short time, sent as /posture (failures are
++// ignored), and an accepted boundary crossing then makes restartDue() true.
++class PostureMonitor : public QThread
++{
++public:
++    static constexpr std::chrono::milliseconds kSampleInterval{1000};
++    static constexpr std::chrono::milliseconds kDebounce{1000};
++
++    // launchPayload is what the launch/resume request carried (possibly
++    // invalid, meaning nothing was sent), the baseline for change detection and
++    // for the restart decision. restartEnabled is the user setting and
++    // lastRestart the time of the previous automatic restart, if any.
++    PostureMonitor(posture::Mode mode,
++                   const posture::Payload& launchPayload,
++                   NvAddress address,
++                   uint16_t httpsPort,
++                   QSslCertificate serverCert,
++                   bool useTrueUid,
++                   bool restartEnabled,
++                   std::optional<std::chrono::steady_clock::time_point> lastRestart);
++    ~PostureMonitor() override;
++
++    // SDL loop thread only. Cheap; never blocks on I/O.
++    void tick();
++
++    // Any thread. True once the host accepted a posture change that needs a
++    // new virtual display and the restart rules (cooldown, ...) allow it.
++    bool restartDue() const { return m_RestartDue.load(); }
++
++protected:
++    void run() override;
++
++private:
++    posture::Mode m_Mode;
++    posture::Payload m_LaunchPayload;
++    NvAddress m_Address;
++    uint16_t m_HttpsPort;
++    QSslCertificate m_ServerCert;
++    bool m_UseTrueUid;
++    bool m_RestartEnabled;
++    std::optional<std::chrono::steady_clock::time_point> m_LastRestart;
++    std::chrono::steady_clock::time_point m_Started;
++
++    std::chrono::steady_clock::time_point m_NextSample;
++
++    std::atomic<bool> m_Stop{false};
++    std::atomic<bool> m_RestartDue{false};
++
++    QMutex m_Mutex;
++    bool m_HasSample = false;
++    posture::Signals m_Sample;
++};
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 88f3e44d..31c3bc72 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -11,6 +11,8 @@
+ #endif
+ #include "streaming/vrrratepolicy.h"
+ #include "backend/richpresencemanager.h"
++#include "backend/posturedetector.h"
++#include "streaming/posturemonitor.h"
+ #include "streaming/gpuperformancehold.h"
+ #include "backend/networkbuffers.h"
+ 
+@@ -1497,13 +1499,24 @@ private:
+ 
+     void run() override
+     {
++        // A posture restart keeps the host app running and resumes it in a new
++        // session. It never applies to a failed or externally stopped session.
++        const bool restarting =
++                m_Session->m_PostureRestartRequested &&
++                !m_Session->m_UnexpectedTermination &&
++                !m_Session->m_ShouldExit;
++
+         // Only quit the running app if our session terminated gracefully
+         bool shouldQuit =
++                !restarting &&
+                 !m_Session->m_UnexpectedTermination &&
+                 m_Session->m_Preferences->quitAppAfter;
+ 
+         // Notify the UI
+-        if (shouldQuit) {
++        if (restarting) {
++            emit m_Session->restartStarting();
++        }
++        else if (shouldQuit) {
+             emit m_Session->quitStarting();
+         }
+         else {
+@@ -1790,6 +1803,26 @@ void Session::notifyMouseEmulationMode(bool enabled)
+     }
+ }
+ 
++// Time of the last automatic posture restart; the cooldown spans sessions.
++static std::optional<std::chrono::steady_clock::time_point> s_LastPostureRestart;
++
++static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
++{
++    switch (mode) {
++    case StreamingPreferences::POSTURE_ALWAYS_TABLET:
++        return posture::Mode::AlwaysTablet;
++    case StreamingPreferences::POSTURE_NEVER:
++        return posture::Mode::Never;
++    case StreamingPreferences::POSTURE_ALWAYS_HANDHELD:
++        return posture::Mode::AlwaysHandheld;
++    case StreamingPreferences::POSTURE_ALWAYS_DESKTOP:
++        return posture::Mode::AlwaysDesktop;
++    case StreamingPreferences::POSTURE_AUTO:
++    default:
++        return posture::Mode::Auto;
++    }
++}
++
+ class AsyncConnectionStartThread : public QThread
+ {
+ public:
+@@ -1843,9 +1876,28 @@ bool Session::startConnectionAsync()
+     QString rtspSessionUrl;
+     LaunchWarning::Warning launchWarning;
+ 
++    // Posture hint. An explicit setting overrides detection, Never sends
++    // nothing, and a desktop without touch sends nothing.
++    const posture::Mode postureMode = toPostureMode(m_Preferences->clientPostureMode);
++    posture::Signals postureSignals = m_PostureLocalSignals;
++    if (postureMode == posture::Mode::Auto) {
++        posture::collectOsTabletSignals(postureSignals);
++    }
++    // A restart after a posture change must be explicit so the host rebuilds the
++    // display for exactly this state, even when it is a plain desktop.
++    m_PostureLaunchPayload = posture::makePayload(postureSignals, postureMode, m_PostureRestartSession);
++    const QString postureQuery = QString::fromStdString(posture::buildQuery(m_PostureLaunchPayload));
++    if (postureMode != posture::Mode::Never) {
++        const posture::Result postureResult = posture::resolve(postureSignals, postureMode);
++        qInfo().noquote() << "Client posture:" << posture::className(postureResult.cls)
++                          << "confidence" << static_cast<int>(postureResult.confidence)
++                          << "touch" << postureResult.touch
++                          << "sending" << (postureQuery.isEmpty() ? QStringLiteral("nothing") : postureQuery);
++    }
++
+     try {
+         NvHTTP http(m_Computer);
+-        http.startApp(m_Computer->currentGameId != 0 ? "resume" : "launch",
++        http.startApp(m_Computer->currentGameId != 0 || m_PostureRestartSession ? "resume" : "launch",
+                       m_Computer->isNvidiaServerSoftware,
+                       m_App.id, &m_StreamConfig,
+                       enableGameOptimizations,
+@@ -1854,6 +1906,7 @@ bool Session::startConnectionAsync()
+                       m_InputHandler->getAttachedPlayStationGamepadMask(),
+                       !m_Preferences->multiController,
+                       m_PresentationSettings.enableVrr,
++                      postureQuery,
+                       rtspSessionUrl,
+                       launchWarning);
+     } catch (const GfeHttpResponseException& e) {
+@@ -2032,6 +2085,13 @@ void Session::setShouldExit(bool quitHostApp)
+     m_ShouldExit = true;
+ }
+ 
++Session* Session::createRestartSession()
++{
++    auto* next = new Session(m_Computer, m_App, m_Preferences);
++    next->m_PostureRestartSession = true;
++    return next;
++}
++
+ void Session::start()
+ {
+     // Wait for any old session to finish cleanup
+@@ -2071,6 +2131,10 @@ void Session::start()
+         }
+     }
+ 
++    // Qt's input device list must be read on the GUI thread, so do it here
++    // rather than in the async connection thread.
++    m_PostureLocalSignals = posture::collectLocalSignals();
++
+     // Initialize the gamepad code with our preferences
+     // NB: m_InputHandler must be initialize before starting the connection.
+     m_InputHandler = new SdlInputHandler(*m_Preferences, m_StreamConfig.width, m_StreamConfig.height);
+@@ -2315,7 +2379,38 @@ void Session::exec()
+         m_HostLaunchWarning.clear();
+     }
+ 
++    // Report posture changes (2-in-1 flipped to tablet, ...) to a posture-aware
++    // host. With an explicit setting nothing can change, and GFE has no endpoint.
++    std::unique_ptr<PostureMonitor> postureMonitor;
++    if (toPostureMode(m_Preferences->clientPostureMode) == posture::Mode::Auto &&
++            !m_Computer->isNvidiaServerSoftware) {
++        postureMonitor = std::make_unique<PostureMonitor>(posture::Mode::Auto,
++                                                          m_PostureLaunchPayload,
++                                                          m_Computer->activeAddress,
++                                                          m_Computer->activeHttpsPort,
++                                                          m_Computer->serverCert,
++                                                          !m_Computer->isNvidiaServerSoftware,
++                                                          m_Preferences->reconnectOnPosture,
++                                                          s_LastPostureRestart);
++    }
++
+     for (;;) {
++        if (postureMonitor) {
++            postureMonitor->tick();
++
++            // The host accepted a posture change that needs a new virtual
++            // display, which it only builds on resume. Tear down and resume.
++            // Skipped when the stream is already ending (user quit, signal,
++            // connection loss): that path must win.
++            if (postureMonitor->restartDue() &&
++                    !m_ShouldExit && !m_UnexpectedTermination && !SDL_HasEvent(SDL_QUIT)) {
++                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                            "Restarting the stream to apply the new client posture");
++                s_LastPostureRestart = std::chrono::steady_clock::now();
++                m_PostureRestartRequested = true;
++                goto DispatchDeferredCleanup;
++            }
++        }
+         if (hostWarningVisible && std::chrono::steady_clock::now() >= hostWarningExpiresAt) {
+             m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
+             hostWarningVisible = false;
+@@ -2724,6 +2819,7 @@ void Session::exec()
+     }
+ 
+ DispatchDeferredCleanup:
++    postureMonitor.reset();
+     m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
+     m_HostLaunchWarning.clear();
+     // Switch back to synchronous logging mode
+diff --git a/app/streaming/session.h b/app/streaming/session.h
+index 0179d663..3354c636 100644
+--- a/app/streaming/session.h
++++ b/app/streaming/session.h
+@@ -12,6 +12,7 @@
+ #include "video/overlaymanager.h"
+ #include "video/clientpacingwarning.h"
+ #include "diagnostics/diagnosticcapture.h"
++#include "backend/postureclassifier.h"
+ #ifdef HAVE_KWIN_SCANOUT_GUARD
+ #include "streaming/kwinscanoutguard.h"
+ #endif
+@@ -113,6 +114,10 @@ public:
+     Q_INVOKABLE bool initialize(QQuickWindow* qtWindow);
+     Q_INVOKABLE void start();
+     Q_INVOKABLE void interrupt();
++
++    // After restartStarting(): a fresh Session for the same app that resumes
++    // it. Must be called on the GUI thread; the caller owns the result.
++    Q_INVOKABLE Session* createRestartSession();
+     Q_PROPERTY(QStringList launchWarnings MEMBER m_LaunchWarnings NOTIFY launchWarningsChanged);
+ 
+     static
+@@ -156,6 +161,11 @@ signals:
+ 
+     void quitStarting();
+ 
++    // The stream was torn down on purpose (client posture changed) and the UI
++    // should start createRestartSession() in its place. sessionFinished() is
++    // not emitted for this session, and the host app is not quit.
++    void restartStarting();
++
+     void sessionFinished(int portTestResult);
+ 
+     // Emitted after sessionFinished() when the session is ready to be destroyed
+@@ -318,6 +328,19 @@ private:
+     bool m_ShouldExit;
+ 
+     bool m_AsyncConnectionSuccess;
++
++    // Client posture hint (see backend/postureclassifier.h). The local signals
++    // are gathered on the GUI thread in start(); the payload is what the
++    // launch/resume request carried, and the baseline for runtime updates.
++    posture::Signals m_PostureLocalSignals;
++    posture::Payload m_PostureLaunchPayload;
++
++    // This session replaces one that was restarted after a posture change: it
++    // always resumes and always sends an explicit posture.
++    bool m_PostureRestartSession = false;
++    // This session ends by an automatic posture restart (set on the SDL thread
++    // before cleanup is dispatched).
++    bool m_PostureRestartRequested = false;
+     int m_PortTestResults;
+ 
+     int m_ActiveVideoFormat;
+diff --git a/tests/power/poweractions.pro b/tests/power/poweractions.pro
+index 3a1d7b53..8c1ce355 100644
+--- a/tests/power/poweractions.pro
++++ b/tests/power/poweractions.pro
+@@ -4,7 +4,7 @@ QT = core gui network testlib
+ CONFIG += console testcase c++17
+ CONFIG -= app_bundle
+ INCLUDEPATH += $$PWD/../../app $$PWD/../../moonlight-common-c/moonlight-common-c/src
+-SOURCES += $$PWD/tst_poweractions.cpp $$PWD/../../app/backend/nvhttp.cpp $$PWD/../../app/backend/nvaddress.cpp $$PWD/../../app/backend/identitymanager.cpp
++SOURCES += $$PWD/tst_poweractions.cpp $$PWD/../../app/backend/nvhttp.cpp $$PWD/../../app/backend/nvaddress.cpp $$PWD/../../app/backend/identitymanager.cpp $$PWD/../../app/backend/postureclassifier.cpp
+ HEADERS += $$PWD/../../app/backend/nvhttp.h $$PWD/../../app/backend/poweractions.h $$PWD/tlsfixture.h
+ win32 {
+     INCLUDEPATH += $$PWD/../../libs/windows/include

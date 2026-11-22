@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+Date: Wed, 18 Nov 2026 11:08:58 +0100
+Subject: [PATCH 7/7] touch-menu: wire touch menu into input handling and
+ session
+
+touch-menu: wire touch menu into input handling and session
+
+Route touch events through the touch menu in SdlInputHandler: while the menu is
+open no touch reaches the host and contacts that were already forwarded are
+released first, lost contacts are forgotten (KDE Plasma on Wayland never delivers
+the finger-up for gestures it grabs), and the menu honours the
+touchmenutrigger setting.
+
+Quit session ends the stream and quits the host app in one step. Disconnect
+leaves the host app running, so a touch-only device had to quit it from the app
+list afterwards. It is done with a per-session flag (Session::setQuitHostAppOnExit)
+instead of changing the "quit app after stream" preference; the client itself
+keeps running. A new SDL_CODE_TOUCH_MENU_TICK event drives the menu's timers
+from the SDL loop.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ app/streaming/input/input.cpp | 180 +++++++++++++++++++++++++++++++++-
+ app/streaming/input/input.h   |  25 +++++
+ app/streaming/session.cpp     |  12 ++-
+ app/streaming/session.h       |   5 +
+ 4 files changed, 220 insertions(+), 2 deletions(-)
+
+diff --git a/app/streaming/input/input.cpp b/app/streaming/input/input.cpp
+index ab4a060e..de168a66 100644
+--- a/app/streaming/input/input.cpp
++++ b/app/streaming/input/input.cpp
+@@ -11,6 +11,9 @@
+ #include <QDir>
+ #include <QGuiApplication>
+ 
++// How often the touch menu timer wakes the main loop while a hold is timed or the menu is open
++#define TOUCH_MENU_TICK_INTERVAL 50
++
+ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight)
+     : m_MultiController(prefs.multiController),
+       m_GamepadMouse(prefs.gamepadMouse),
+@@ -35,8 +38,13 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
+       m_RightButtonReleaseTimer(0),
+       m_DragTimer(0),
+       m_DragButton(0),
+-      m_NumFingersDown(0)
++      m_NumFingersDown(0),
++      m_TouchMenuEnabled(prefs.touchMenuTrigger != StreamingPreferences::TMT_OFF),
++      m_TouchMenuTimer(0)
+ {
++    m_TouchMenu.setTriggers(prefs.touchMenuTrigger != StreamingPreferences::TMT_HANDLE,
++                            prefs.touchMenuTrigger != StreamingPreferences::TMT_GESTURE);
++
+     DualSenseHaptics::resetSpeakerGenerationFloor();
+ 
+     // System keys are always captured when running without a DE
+@@ -299,6 +307,7 @@ SdlInputHandler::~SdlInputHandler()
+     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
+     SDL_RemoveTimer(m_RightButtonReleaseTimer);
+     SDL_RemoveTimer(m_DragTimer);
++    SDL_RemoveTimer(m_TouchMenuTimer);
+ 
+ #if !SDL_VERSION_ATLEAST(2, 0, 9)
+     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+@@ -537,6 +546,12 @@ void SdlInputHandler::handleTouchFingerEvent(SDL_TouchFingerEvent* event)
+     return;
+ #endif
+ 
++    // While the touch menu is open, or for fingers that took part in opening it,
++    // nothing reaches the host.
++    if (m_TouchMenuEnabled && handleTouchMenuFingerEvent(event)) {
++        return;
++    }
++
+     if (m_AbsoluteTouchMode) {
+         handleAbsoluteFingerEvent(event);
+     }
+@@ -544,3 +559,166 @@ void SdlInputHandler::handleTouchFingerEvent(SDL_TouchFingerEvent* event)
+         handleRelativeFingerEvent(event);
+     }
+ }
++
++Uint32 SdlInputHandler::touchMenuTimerCallback(Uint32 interval, void*)
++{
++    // Runs on the SDL timer thread: just wake up the main loop
++    SDL_Event event = {};
++    event.type = SDL_USEREVENT;
++    event.user.code = SDL_CODE_TOUCH_MENU_TICK;
++    SDL_PushEvent(&event);
++
++    return interval;
++}
++
++void SdlInputHandler::getTouchMenuOutputSize(int* width, int* height)
++{
++    // The overlay is drawn 1:1 in output (drawable) pixels, anchored at the
++    // bottom-left corner of the window. Mirrors updateStatsOutputSize() in ffmpeg.cpp.
++    *width = *height = 0;
++    if (m_Window == nullptr) {
++        return;
++    }
++
++#if SDL_VERSION_ATLEAST(2, 26, 0)
++    SDL_GetWindowSizeInPixels(m_Window, width, height);
++#else
++    if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_OPENGL) {
++        SDL_GL_GetDrawableSize(m_Window, width, height);
++    }
++    else {
++        SDL_GetWindowSize(m_Window, width, height);
++    }
++#endif
++}
++
++void SdlInputHandler::updateTouchMenuTimer()
++{
++    if (m_TouchMenu.needsTick()) {
++        if (m_TouchMenuTimer == 0) {
++            m_TouchMenuTimer = SDL_AddTimer(TOUCH_MENU_TICK_INTERVAL,
++                                            touchMenuTimerCallback,
++                                            nullptr);
++        }
++    }
++    else if (m_TouchMenuTimer != 0) {
++        SDL_RemoveTimer(m_TouchMenuTimer);
++        m_TouchMenuTimer = 0;
++    }
++}
++
++void SdlInputHandler::releaseTouchesForTouchMenu()
++{
++    // Release every contact that was already forwarded to the host, the same
++    // way each touch mode ends a touch, so nothing stays stuck there.
++    if (m_AbsoluteTouchMode) {
++        if (LiGetHostFeatureFlags() & LI_FF_PEN_TOUCH_EVENTS) {
++            // Native touch: cancel all active contacts
++            LiSendTouchEvent(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0f, 0.0f, 0.0f,
++                             0.0f, 0.0f, LI_ROT_UNKNOWN);
++        }
++        else {
++            // Touch emulated with the mouse: stop the long press timer and
++            // raise the buttons like emulateAbsoluteFingerEvent() does on finger up.
++            SDL_RemoveTimer(m_LongPressTimer);
++            m_LongPressTimer = 0;
++            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
++            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
++        }
++    }
++    else {
++        // Trackpad mode: cancel any drag and raise the buttons like
++        // handleRelativeFingerEvent() does on finger up.
++        SDL_RemoveTimer(m_DragTimer);
++        m_DragTimer = 0;
++        m_DragButton = 0;
++        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
++        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
++
++        SDL_zero(m_TouchDownEvent);
++        m_NumFingersDown = 0;
++    }
++}
++
++void SdlInputHandler::applyTouchMenuEvent(const touchmenu::Event& event, int outputWidth, int outputHeight)
++{
++    auto& overlays = Session::get()->getOverlayManager();
++
++    if (event.type == touchmenu::EventType::Open) {
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                    "Touch menu opened");
++        releaseTouchesForTouchMenu();
++    }
++    else if (event.type == touchmenu::EventType::Close) {
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                    "Touch menu closed");
++    }
++
++    // Menu (with the pressed item highlight) or corner handle. Nothing is
++    // redrawn when the state did not change.
++    overlays.setTouchMenu(m_TouchMenu.isOpen(), outputWidth, outputHeight,
++                          m_TouchMenu.highlightedItem(), m_TouchMenu.handleVisible(),
++                          m_TouchMenu.side() == touchmenu::Side::Right);
++
++    if (event.type == touchmenu::EventType::Activate) {
++        if (event.item == touchmenu::ItemDisconnect) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Touch menu: disconnect");
++            performSpecialKeyCombo(KeyComboQuit);
++        }
++        else if (event.item == touchmenu::ItemQuitSession) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Touch menu: quit session");
++            // End the stream like Disconnect and quit the host app afterwards
++            Session::get()->setQuitHostAppOnExit();
++            performSpecialKeyCombo(KeyComboQuit);
++        }
++        else if (event.item == touchmenu::ItemToggleStats) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Touch menu: toggle statistics");
++            performSpecialKeyCombo(KeyComboToggleStatsOverlay);
++        }
++    }
++
++    updateTouchMenuTimer();
++}
++
++bool SdlInputHandler::handleTouchMenuFingerEvent(SDL_TouchFingerEvent* event)
++{
++    int outputWidth, outputHeight;
++    getTouchMenuOutputSize(&outputWidth, &outputHeight);
++    m_TouchMenu.setOutputSize(outputWidth, outputHeight);
++    m_TouchMenu.setRightPanelAllowed(Session::get()->getOverlayManager().supportsWideOverlay());
++
++    touchmenu::Event result;
++    switch (event->type) {
++    case SDL_FINGERDOWN:
++        result = m_TouchMenu.fingerDown((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
++        break;
++    case SDL_FINGERMOTION:
++        result = m_TouchMenu.fingerMove((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
++        break;
++    case SDL_FINGERUP:
++        result = m_TouchMenu.fingerUp((int64_t)event->fingerId, event->x, event->y, SDL_GetTicks());
++        break;
++    default:
++        return false;
++    }
++
++    applyTouchMenuEvent(result, outputWidth, outputHeight);
++    return result.swallow;
++}
++
++void SdlInputHandler::handleTouchMenuTick()
++{
++    if (!m_TouchMenuEnabled) {
++        return;
++    }
++
++    int outputWidth, outputHeight;
++    getTouchMenuOutputSize(&outputWidth, &outputHeight);
++    m_TouchMenu.setOutputSize(outputWidth, outputHeight);
++    m_TouchMenu.setRightPanelAllowed(Session::get()->getOverlayManager().supportsWideOverlay());
++
++    applyTouchMenuEvent(m_TouchMenu.tick(SDL_GetTicks()), outputWidth, outputHeight);
++}
+diff --git a/app/streaming/input/input.h b/app/streaming/input/input.h
+index 4b3518bd..87802547 100644
+--- a/app/streaming/input/input.h
++++ b/app/streaming/input/input.h
+@@ -6,6 +6,7 @@
+ #include "SDL_compat.h"
+ #include "dualsensetriggers.h"
+ #include "steamcontroller/steamcontrollersdl.h"
++#include "touchmenu.h"
+ 
+ #include <memory>
+ 
+@@ -57,6 +58,9 @@ struct GamepadState {
+ 
+ #define MAX_FINGERS 2
+ 
++// SDL_USEREVENT code posted by the touch menu timer (the Steam Controller link uses 106)
++#define SDL_CODE_TOUCH_MENU_TICK 107
++
+ #define GAMEPAD_HAPTIC_METHOD_NONE 0
+ #define GAMEPAD_HAPTIC_METHOD_LEFTRIGHT 1
+ #define GAMEPAD_HAPTIC_METHOD_SIMPLERUMBLE 2
+@@ -120,6 +124,9 @@ public:
+ 
+     void handleTouchFingerEvent(SDL_TouchFingerEvent* event);
+ 
++    // SDL_CODE_TOUCH_MENU_TICK: times the three finger hold and the menu idle timeout (main thread)
++    void handleTouchMenuTick();
++
+     int getAttachedGamepadMask();
+ 
+     int getAttachedPlayStationGamepadMask();
+@@ -191,6 +198,17 @@ private:
+ 
+     void handleRelativeFingerEvent(SDL_TouchFingerEvent* event);
+ 
++    // Returns true if the touch menu consumed the event and it must not reach the host
++    bool handleTouchMenuFingerEvent(SDL_TouchFingerEvent* event);
++
++    void applyTouchMenuEvent(const touchmenu::Event& event, int outputWidth, int outputHeight);
++
++    void releaseTouchesForTouchMenu();
++
++    void updateTouchMenuTimer();
++
++    void getTouchMenuOutputSize(int* width, int* height);
++
+     void performSpecialKeyCombo(KeyCombo combo);
+ 
+     static
+@@ -208,6 +226,9 @@ private:
+     static
+     Uint32 dragTimerCallback(Uint32 interval, void* param);
+ 
++    static
++    Uint32 touchMenuTimerCallback(Uint32 interval, void* param);
++
+     SDL_Window* m_Window;
+     bool m_MultiController;
+     bool m_GamepadMouse;
+@@ -263,5 +284,9 @@ private:
+     char m_DragButton;
+     int m_NumFingersDown;
+ 
++    bool m_TouchMenuEnabled;
++    touchmenu::TouchMenu m_TouchMenu;
++    SDL_TimerID m_TouchMenuTimer;
++
+     static const int k_ButtonMap[];
+ };
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 31c3bc72..32a1e062 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -638,6 +638,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
+       m_MouseEmulationRefCount(0),
+       m_FlushingWindowEventsRef(0),
+       m_ShouldExit(false),
++      m_QuitHostAppOnExit(false),
+       m_AsyncConnectionSuccess(false),
+       m_PortTestResults(0),
+       m_OpusDecoder(nullptr),
+@@ -1510,7 +1511,8 @@ private:
+         bool shouldQuit =
+                 !restarting &&
+                 !m_Session->m_UnexpectedTermination &&
+-                m_Session->m_Preferences->quitAppAfter;
++                (m_Session->m_Preferences->quitAppAfter ||
++                 m_Session->m_QuitHostAppOnExit);
+ 
+         // Notify the UI
+         if (restarting) {
+@@ -2085,6 +2087,11 @@ void Session::setShouldExit(bool quitHostApp)
+     m_ShouldExit = true;
+ }
+ 
++void Session::setQuitHostAppOnExit()
++{
++    m_QuitHostAppOnExit = true;
++}
++
+ Session* Session::createRestartSession()
+ {
+     auto* next = new Session(m_Computer, m_App, m_Preferences);
+@@ -2498,6 +2505,9 @@ void Session::exec()
+             case SDL_CODE_STEAM_CONTROLLER_LINK:
+                 m_InputHandler->handleSteamControllerEvent(&event.user);
+                 break;
++            case SDL_CODE_TOUCH_MENU_TICK:
++                m_InputHandler->handleTouchMenuTick();
++                break;
+             default:
+                 SDL_assert(false);
+             }
+diff --git a/app/streaming/session.h b/app/streaming/session.h
+index 3354c636..6d08f2a0 100644
+--- a/app/streaming/session.h
++++ b/app/streaming/session.h
+@@ -150,6 +150,10 @@ public:
+ 
+     void setShouldExit(bool quitHostApp = false);
+ 
++    // Quit the host app when this session ends, whatever the "quit app after
++    // stream" preference says. The client itself keeps running.
++    void setQuitHostAppOnExit();
++
+ signals:
+     void stageStarting(QString stage);
+ 
+@@ -326,6 +330,7 @@ private:
+     QStringList m_LaunchWarnings;
+     QString m_HostLaunchWarning;
+     bool m_ShouldExit;
++    bool m_QuitHostAppOnExit;
+ 
+     bool m_AsyncConnectionSuccess;
+ 
