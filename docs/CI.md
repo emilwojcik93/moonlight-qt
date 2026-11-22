@@ -209,12 +209,49 @@ immutable releases enabled, Issues enabled.
 3. Immutable releases: already enabled; confirm the repository variable `IMMUTABLE_CONFIRMED=true` only if
    `GET /repos/emilwojcik93/moonlight-qt/immutable-releases` is not readable by `GITHUB_TOKEN`.
 4. Optional: environment `release-approval` (required reviewer = Owner) only if `ENFORCE_SENSITIVE_GATE=true`; secret `GCHAT_WEBHOOK_URL`.
-5. Rulesets: `build/**` creation/update restricted to the App; `automation` no force-push/deletion; tags `*-vp.*` no update/delete
+5. Rulesets: `build/**` creation/update restricted to the App; `automation` no force-push/deletion but it MUST still accept pushes of `github-actions[bot]` (upstream-watch commits `upstream-seen.json` with `GITHUB_TOKEN`); tags `*-vp.*` no update/delete
    (do not restrict creation: `GITHUB_TOKEN` creates the tag). Settings > Actions: "Require actions to be pinned to a full-length
    commit SHA" (the self-test and the wrapper are pinned; the upstream reusable workflow is not, so enable it only after checking that
    setting's scope for reusable workflows from the same repository), fork-PR approval for all external contributors, artifact and log
    retention 7 days (upstream's workflow uploads symbols and binaries with the repository default of 90 days).
 
-## 8. Trial results
+## 8. Trial result (secret-free build path, wrapper dry run) - works
 
-See section 9 (filled in from the real runs).
+Branch `ci-trial/v6.2.0-daily.202-n0` = upstream `v6.2.0-daily.202` (9184cacd) + the 7-patch series + wrapper (built locally with the
+same `apply_series.py` / `assemble_build.py` the workflow uses, pushed by hand), run 45059534569 (push trigger, dry run),
+19:13:33Z -> 19:41:39Z (28.1 min), **success**:
+
+| Job | Result | Time |
+|---|---|---|
+| validate | success | 12 s |
+| build -> `build-win-mac.yml` (windows-2025, Qt 6.11.1: compile x64+arm64, all upstream tests incl. the patch's posture/touch-menu test targets, bundle) | success | 27.3 min |
+| package (gate, stage, preview manifest; ubuntu, 7-Zip = preinstalled `/usr/bin/7z`) | success | 28 s |
+| publish / notify | skipped (dry run / trial) | - |
+
+Facts learned: no secret and no input beyond `ci_version`, `source_ref`, `build_macos` is needed (the workflow declares no secrets);
+no standalone MSI and no provenance file are produced; artifacts: `Moonlight-Windows-Release-<ci>` (bundle 52.97 MB + portable zip,
+92 MB), `Moonlight-Windows-x64-<ci>` (39 MB, `Moonlight.exe` at the root), `-arm64-` (34 MB), `zDevDbgSyms-Windows-<ci>` (99 MB),
+`VRR-trace-contracts-*` (0.5 MB). The gate read `6.2.61616.0` from the bundle PE, from the Burn manifest (registration + both MSI
+packages) and from both `Moonlight.exe`; the manifest was generated and verified (`manifest.json` + `SHA256SUMS`). The patched
+series compiled and passed upstream's tests on the current upstream daily (the series had only been apply-tested before).
+Untested until the first real release: the `publish` job (attest, release, verify) and `upstream-watch` itself (it can only run
+from the default branch). The self-test workflow is green on `ubuntu-24.04` (338 tests, actionlint 1.7.12 + shellcheck, zizmor 1.32.0).
+
+## 9. Optimization notes (measured, run 45059534569)
+
+| Step | Time | Note |
+|---|---|---|
+| checkout (recursive submodules, depth 0) | 27 s | fine |
+| setup-deps (prebuilt moonlight-qt-deps v8) | 31 s | fine |
+| Install Qt x64 + arm64 | 102 s + 61 s | `jurplel/install-qt-action` caches are branch-scoped: a fresh `build/*` branch never hits the cache. A warm-up workflow on the default branch would save ~2.5 min per build; not worth a new privileged-adjacent workflow |
+| Build x64 | 421 s | |
+| Build VRR diagnostics / test targets (all of `tests/tests.pro`) | 454 s | includes the posture and touch-menu tests (patch group tests) |
+| Run upstream test steps | ~2-3 min | |
+| Build ARM64 | 358 s | cross build; required because the Burn bundle embeds the arm64 MSI and the gate requires both |
+| bundle (`generate-bundle.bat`) | 12 s | |
+| package (gate) | 28 s | |
+
+Total 28 min versus the PLAN budget of 60 min (R-BLD-5): no further optimization is needed. Skipping arm64 or the tests would need a
+`ci` patch to upstream's workflow (diverging from upstream, Security Gate review) for a 6-8 min gain: not done. Artifact
+retention is the repository default (upstream's workflow sets no retention): set Settings > Actions > retention to 7 days
+(Owner action 5). `fail-fast` is irrelevant (single matrix entry); concurrency is per build branch with `cancel-in-progress: false`.

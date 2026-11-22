@@ -130,14 +130,15 @@ jobs:
         with:
           name: Moonlight-Windows-arm64-${{ needs.validate.outputs.build_version }}
           path: in/arm64
-      - name: Make sure a modern 7-Zip (7zz) is available (reads the Burn manifest inside the bundle)
+      - name: Make sure 7-Zip is available (reads the Burn manifest inside the bundle)
         run: |
           set -euo pipefail
-          if ! command -v 7zz > /dev/null; then
+          # The ubuntu-24.04 image ships /usr/bin/7z (verified in the trial); install only when absent.
+          if ! command -v 7zz > /dev/null && ! command -v 7z > /dev/null && ! command -v 7za > /dev/null; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq --no-install-recommends 7zip
           fi
-          for b in 7zz 7z; do if command -v "$b" > /dev/null; then echo "using $(command -v "$b")"; break; fi; done
+          for b in 7zz 7z 7za; do if command -v "$b" > /dev/null; then echo "using $(command -v "$b")"; break; fi; done
       - name: Mandatory gate - bundle, embedded MSIs and Moonlight.exe must be exactly 6.2.B.0 (above upstream 6.2.U.0)
         env:
           UP_TAG: ${{ needs.validate.outputs.tag }}
