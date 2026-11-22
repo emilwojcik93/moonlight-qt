@@ -104,11 +104,40 @@ function Compare-Presence {
 }
 
 # ---- installer execution ----------------------------------------------------------------------------
+function Test-MsiBusy {
+    <# Windows Installer serialises installs with the Global\_MSIExecute mutex: held => another install/uninstall is running. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+    $m = $null
+    try { $m = [System.Threading.Mutex]::OpenExisting('Global\_MSIExecute') } catch { return $false }
+    try {
+        $got = $false
+        try { $got = $m.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+        if ($got) { try { $m.ReleaseMutex() } catch { Write-Verbose 'msi mutex release failed' }; return $false }
+        return $true
+    } finally { $m.Dispose() }
+}
+
+function Wait-MsiIdle {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([int]$TimeoutSec = 120, [scriptblock]$Probe = { Test-MsiBusy })
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        if (-not (& $Probe)) { return $true }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 function Invoke-MoonlightInstaller {
     <#
       Runs `<installer> /install /quiet /norestart /log <log>` from the SAME verified file:
       holds a FileShare.Read handle (nobody can write/replace/delete it) and re-hashes through that handle
-      immediately before launch. Returns @{Started;HashOk;Rc;TimedOut;RebootPending}.
+      immediately before launch. On timeout the whole process tree is killed (job object + parent walk) and the Windows
+      Installer mutex is awaited before the caller may decide anything (rollback only after the tree is gone).
+      Returns @{Started;HashOk;Rc;TimedOut;RebootPending;TreeGone;MsiIdle}.
     #>
     [CmdletBinding()]
     param(
@@ -116,15 +145,18 @@ function Invoke-MoonlightInstaller {
         [Parameter(Mandatory)][string]$ExpectedSha256,
         [Parameter(Mandatory)][string]$LogPath,
         [ValidateSet('install', 'uninstall')][string]$Verb = 'install',
-        [int]$TimeoutSec = 600
+        [int]$TimeoutSec = 600,
+        [scriptblock]$MsiProbe = { Test-MsiBusy }
     )
     $h = Open-DenyWriteHandle -Path $InstallerPath
     try {
         $actual = Get-UpdSha256FromStream -Stream $h
-        if ($actual -ne $ExpectedSha256) { return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false } }
+        if ($actual -ne $ExpectedSha256) { return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false; TreeGone = $true; MsiIdle = $true } }
         $iargs = @(('/' + $Verb), '/quiet', '/norestart', '/log', $LogPath)
         $r = Invoke-UpdProcess -FilePath $InstallerPath -ArgumentList $iargs -TimeoutSec $TimeoutSec
-        return @{ Started = $true; HashOk = $true; Rc = $r.Rc; TimedOut = $r.TimedOut; RebootPending = ($r.Rc -eq 3010) }
+        $msiIdle = $true
+        if ($r.TimedOut) { $msiIdle = Wait-MsiIdle -TimeoutSec 120 -Probe $MsiProbe }
+        return @{ Started = $true; HashOk = $true; Rc = $r.Rc; TimedOut = $r.TimedOut; RebootPending = ($r.Rc -eq 3010); TreeGone = $r.TreeGone; MsiIdle = $msiIdle }
     } finally { $h.Dispose() }
 }
 
@@ -140,7 +172,7 @@ function Add-VerifiedBundle {
         [Parameter(Mandatory)][int]$BuildNumber,
         [string[]]$AdditionalFullControlSids = @()
     )
-    if (-not (Test-UpdRegex $Name '^(v6\.2\.0-daily\.[0-9]{1,5}-vp\.[0-9]{1,3}|installed-[0-9]{5})$')) { throw 'bundle name invalid' }
+    if (-not (Test-UpdRegex $Name '^(v6\.2\.0-daily\.[1-9][0-9]{0,4}-vp\.[1-9][0-9]{0,2}|installed-[0-9]{5})$')) { throw 'bundle name invalid' }
     $root = Join-Path $DataDir 'bundles'
     Initialize-SecureDirectory -Path $root -AdditionalFullControlSids $AdditionalFullControlSids
     $dir = Join-Path $root $Name
@@ -189,6 +221,8 @@ function Invoke-MoonlightRollback {
     <#
       Re-installs the previous verified bundle. Attempt 1: install over the new version. If the version did not
       change (Burn/MSI blocks downgrades), attempt 2: uninstall the failed bundle first, then install previous.
+      Never uninstalls when the previous bundle is missing/corrupt, when Moonlight started meanwhile (-IdleCheck),
+      or when an installer step timed out and its process tree / Windows Installer is not idle.
       Returns @{Ok;Method}. All executions go through Invoke-MoonlightInstaller (hash re-check, deny-write).
     #>
     [CmdletBinding()]
@@ -197,20 +231,27 @@ function Invoke-MoonlightRollback {
         [Parameter(Mandatory)][string]$FailedBundlePath,
         [Parameter(Mandatory)][string]$FailedSha256,
         [Parameter(Mandatory)][string]$RunDir,
-        [scriptblock]$GetVersion = { Get-InstalledMoonlightVersion }
+        [scriptblock]$GetVersion = { Get-InstalledMoonlightVersion },
+        [scriptblock]$IdleCheck = { $true }        # returns $true when Moonlight is NOT running
     )
+    $run = {
+        param($path, $sha, $log, $verb)
+        return (Invoke-MoonlightInstaller -InstallerPath $path -ExpectedSha256 $sha -LogPath $log -Verb $verb)
+    }
     # never uninstall anything if the previous bundle is not intact: a failed-health install beats no install
     if ((-not (Test-Path -LiteralPath $Previous.Path -PathType Leaf)) -or ((Get-UpdSha256 -Path $Previous.Path) -ne $Previous.Sha256)) {
         return @{ Ok = $false; Method = 'previous-bundle-missing-or-corrupt' }
     }
-    $log1 = Join-Path $RunDir 'rollback-install.log'
-    $r1 = Invoke-MoonlightInstaller -InstallerPath $Previous.Path -ExpectedSha256 $Previous.Sha256 -LogPath $log1
+    if (-not (& $IdleCheck)) { return @{ Ok = $false; Method = 'moonlight-running' } }
+    $r1 = & $run $Previous.Path $Previous.Sha256 (Join-Path $RunDir 'rollback-install.log') 'install'
+    if ($r1.TimedOut -and (-not $r1.TreeGone -or -not $r1.MsiIdle)) { return @{ Ok = $false; Method = 'installer-not-stopped' } }
     $fv = ConvertFrom-FileVersion -Version (& $GetVersion)
     if ($r1.Started -and $null -ne $fv -and $fv.Build -eq $Previous.Build) { return @{ Ok = $true; Method = 'install-over' } }
-    $log2 = Join-Path $RunDir 'rollback-uninstall.log'
-    $null = Invoke-MoonlightInstaller -InstallerPath $FailedBundlePath -ExpectedSha256 $FailedSha256 -LogPath $log2 -Verb uninstall
-    $log3 = Join-Path $RunDir 'rollback-install2.log'
-    $r3 = Invoke-MoonlightInstaller -InstallerPath $Previous.Path -ExpectedSha256 $Previous.Sha256 -LogPath $log3
+    if (-not (& $IdleCheck)) { return @{ Ok = $false; Method = 'moonlight-running' } }
+    $u = & $run $FailedBundlePath $FailedSha256 (Join-Path $RunDir 'rollback-uninstall.log') 'uninstall'
+    if ($u.TimedOut -and (-not $u.TreeGone -or -not $u.MsiIdle)) { return @{ Ok = $false; Method = 'installer-not-stopped' } }
+    $r3 = & $run $Previous.Path $Previous.Sha256 (Join-Path $RunDir 'rollback-install2.log') 'install'
+    if ($r3.TimedOut -and (-not $r3.TreeGone -or -not $r3.MsiIdle)) { return @{ Ok = $false; Method = 'installer-not-stopped' } }
     $fv = ConvertFrom-FileVersion -Version (& $GetVersion)
     if ($r3.Started -and $null -ne $fv -and $fv.Build -eq $Previous.Build) { return @{ Ok = $true; Method = 'uninstall-then-install' } }
     return @{ Ok = $false; Method = 'failed' }

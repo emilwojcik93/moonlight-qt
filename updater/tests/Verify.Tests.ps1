@@ -77,8 +77,9 @@ Describe 'Manifest validation' {
         Write-FixtureFiles $fx $script:dir
         $m = Read-ReleaseManifest -Path (Join-Path $script:dir 'manifest.json') -ExpectedTag $fx.Tag -AllowOwners @('Nonary')
         $m.Installer | Should -Be 'MoonlightSetup.exe'
-        $m.BuildNumber | Should -Be 60202
-        $m.SourceRef | Should -Match '^refs/heads/build/'
+        $m.BuildNumber | Should -Be 61616
+        $m.SourceRef | Should -Be 'refs/heads/build/v6.2.0-daily.202-n1'      # derived from the tag (CONTRACT 3b)
+        $m.AssetSizes['MoonlightSetup.exe'] | Should -Be 4096
         $m.Bundles | Should -Contain 'attestation.sigstore.json'
     }
     It 'rejects: <Name>' -ForEach @(
@@ -97,13 +98,26 @@ Describe 'Manifest validation' {
         @{ Name = 'bad bundle name'; Mutate = { param($m) $m.attestation = @('../x.json') } },
         @{ Name = 'no bundle'; Mutate = { param($m) $m.attestation = @() } },
         @{ Name = 'installer not listed in assets'; Mutate = { param($m) $m.assets = @(@{ name = 'other.exe'; sha256 = ('a' * 64); size = 1 }) } },
-        @{ Name = 'bad asset hash'; Mutate = { param($m) $m.assets[0].sha256 = 'XYZ' } }
+        @{ Name = 'bad asset hash'; Mutate = { param($m) $m.assets[0].sha256 = 'XYZ' } },
+        @{ Name = 'legacy build scheme 60000+U'; Mutate = { param($m) $m.build.version = '6.2.0-daily.60202' } },
+        @{ Name = 'build number of another N'; Mutate = { param($m) $m.build.version = '6.2.0-daily.61617' } },
+        @{ Name = 'source_ref automation instead of the derived build ref'; Mutate = { param($m) $m.build.source_ref = 'refs/heads/automation' } },
+        @{ Name = 'source_ref of another build'; Mutate = { param($m) $m.build.source_ref = 'refs/heads/build/v6.2.0-daily.201-n1' } },
+        @{ Name = 'reserved device name as bundle'; Mutate = { param($m) $m.attestation = @('NUL.jsonl') } },
+        @{ Name = 'negative asset size'; Mutate = { param($m) $m.assets[0].size = -5 } }
     ) {
         $fx = New-FixtureRelease -U 202 -N 1
         $obj = [System.Text.Encoding]::UTF8.GetString($fx.Files['manifest.json']) | ConvertFrom-Json
         & $Mutate $obj
         [IO.File]::WriteAllText((Join-Path $script:dir 'manifest.json'), ($obj | ConvertTo-Json -Depth 8))
         { Read-ReleaseManifest -Path (Join-Path $script:dir 'manifest.json') -ExpectedTag $fx.Tag -AllowOwners @('Nonary') } | Should -Throw
+    }
+    It 'owner must be in the policy list AND in the local owner list' {
+        $fx = New-FixtureRelease -U 202 -N 1
+        Write-FixtureFiles $fx $script:dir
+        { Read-ReleaseManifest -Path (Join-Path $script:dir 'manifest.json') -ExpectedTag $fx.Tag -AllowOwners @('Nonary') -LocalOwners @('Nonary') } | Should -Not -Throw
+        { Read-ReleaseManifest -Path (Join-Path $script:dir 'manifest.json') -ExpectedTag $fx.Tag -AllowOwners @('Nonary', 'Evil') -LocalOwners @('SomeoneElse') } | Should -Throw '*local owner list*'
+        { Read-ReleaseManifest -Path (Join-Path $script:dir 'manifest.json') -ExpectedTag $fx.Tag -AllowOwners @('Evil') -LocalOwners @('Nonary') } | Should -Throw '*policy allow-list*'
     }
     It 'rejects invalid JSON and oversize manifests' {
         $p = Join-Path $script:dir 'manifest.json'
@@ -172,6 +186,8 @@ Describe 'Attestation argument construction' {
             $a | Should -Match '--signer-workflow github.com/emilwojcik93/moonlight-qt/.github/workflows/patched-windows-release.yml'
             $a | Should -Match '--source-ref refs/heads/build/v6.2.0-daily.202-n1'
             $a | Should -Match '--deny-self-hosted-runners'
+            $a | Should -Match '--predicate-type https://slsa.dev/provenance/v1'
+            $a | Should -Match '--cert-oidc-issuer https://token.actions.githubusercontent.com'
             $a | Should -Match ('--source-digest ' + ('b' * 40))
             $a | Should -Match '--bundle "C:\\run dir\\attestation.sigstore.json"'
             $a | Should -Not -Match '--token|GH_TOKEN'

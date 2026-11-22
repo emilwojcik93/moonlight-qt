@@ -4,7 +4,7 @@
 Set-StrictMode -Version Latest
 
 $script:UpdRoot = Split-Path -Parent $PSScriptRoot
-$script:LibFiles = @('Common', 'Version', 'Yaml', 'Config', 'Security', 'GitHub', 'Verify', 'Install', 'Notify', 'Orchestrator', 'Snappy')
+$script:LibFiles = @('Common', 'Version', 'Yaml', 'Config', 'Security', 'GitHub', 'Verify', 'Install', 'Notify', 'Orchestrator', 'Main', 'Snappy')
 
 function New-TestRoot {
     $r = Join-Path ([System.IO.Path]::GetTempPath()) ('mlu-test-' + [guid]::NewGuid().ToString('N'))
@@ -27,7 +27,7 @@ function New-TestConfig {
     $c = @{}
     foreach ($k in $script:UpdConfigDefaults.Keys) { $c[$k] = $script:UpdConfigDefaults[$k] }
     $c['mode'] = 'install'
-    $c['test_mode'] = $false
+    $c['min_cooling_off_hours'] = 0        # the production default floor is 2 h; tests opt in explicitly
     $c['api_base'] = 'https://api.github.com'
     $c['download_base'] = 'https://github.com'
     foreach ($k in $Override.Keys) { $c[$k] = $Override[$k] }
@@ -43,7 +43,7 @@ function New-FixtureRelease {
         [switch]$NotImmutable, [switch]$Prerelease, [byte[]]$InstallerBytes
     )
     $tag = 'v6.2.0-daily.{0}-vp.{1}' -f $U, $N
-    $build = 60000 + $U
+    $build = ConvertTo-BuildNumber -U $U -N $N      # CONTRACT 3b: 60000 + 8*U + (N-1)
     $rng = New-Object System.Random($U * 1000 + $N)
     $inst = New-Object byte[] 4096; $rng.NextBytes($inst)
     if ($InstallerBytes) { $inst = $InstallerBytes }
@@ -94,6 +94,8 @@ function New-FakeCtx {
         VerifyFailFor = @(); InstallMode = 'ok'; PresenceBefore = $null; PresenceAfter = $null; RollbackOk = $true
         PolicyThrows = $null; ReleasesThrows = $null; Calls = (New-Object System.Collections.Generic.List[string]); Notified = (New-Object System.Collections.Generic.List[string])
         PackageCache = $null; PresenceCalls = 0; RunningCalls = 0; TamperInstallerOnDownload = $false; Now = $null
+        RunningSeq = $null; NoBaseline = $false; Sleeps = (New-Object System.Collections.Generic.List[int]); BootTime = (Get-Date).ToUniversalTime().AddDays(-1)
+        DownloadThrows = $null; ServerDate = $null
     }
 }
 
@@ -108,10 +110,10 @@ function New-FakeDeps {
         param($cfg, $dataDir, $state)
         $script:FakeCtx.Calls.Add('GetReleases')
         if ($script:FakeCtx.ReleasesThrows) { throw $script:FakeCtx.ReleasesThrows }
-        return @{ Releases = @($script:FakeCtx.Fixtures | ForEach-Object { $_.Release }); FromCache = $false; Etag = 'x'; RateLimit = $null }
+        return @{ Releases = @($script:FakeCtx.Fixtures | ForEach-Object { $_.Release }); FromCache = $false; Etag = 'x'; RateLimit = $null; ServerDate = $script:FakeCtx.ServerDate }
     }
     $d.GetPolicy = {
-        param($cfg, $state)
+        param($cfg, $state, $dataDir)
         $script:FakeCtx.Calls.Add('GetPolicy')
         if ($script:FakeCtx.PolicyThrows) { throw $script:FakeCtx.PolicyThrows }
         return @{ Policy = $script:FakeCtx.Policy; CommitSha = ('d' * 40) }
@@ -119,6 +121,11 @@ function New-FakeDeps {
     $d.GetInstalledVersion = { $script:FakeCtx.Installed }
     $d.IsMoonlightRunning = {
         $script:FakeCtx.RunningCalls++
+        if ($null -ne $script:FakeCtx.RunningSeq -and @($script:FakeCtx.RunningSeq).Count -gt 0) {
+            $first = @($script:FakeCtx.RunningSeq)[0]
+            $script:FakeCtx.RunningSeq = @(@($script:FakeCtx.RunningSeq) | Select-Object -Skip 1)
+            return [bool]$first
+        }
         if ($script:FakeCtx.RunningCalls -gt 1 -and $null -ne $script:FakeCtx.RunningAfter) { return [bool]$script:FakeCtx.RunningAfter }
         return [bool]$script:FakeCtx.Running
     }
@@ -129,8 +136,9 @@ function New-FakeDeps {
         return $p
     }
     $d.Download = {
-        param($cfg, $tag, $name, $runDir, $maxBytes)
+        param($cfg, $tag, $name, $runDir, $maxBytes, $expectedSize, $timeoutSec)
         $script:FakeCtx.Calls.Add("Download:$name")
+        if ($script:FakeCtx.DownloadThrows) { throw $script:FakeCtx.DownloadThrows }
         $fx = $script:FakeCtx.Fixtures | Where-Object { $_.Tag -ceq $tag } | Select-Object -First 1
         if ($null -eq $fx -or -not $fx.Files.ContainsKey($name)) { throw "HTTP 404 $name" }
         $bytes = [byte[]]$fx.Files[$name]
@@ -152,22 +160,29 @@ function New-FakeDeps {
     $d.RunInstaller = {
         param($path, $sha, $log, $verb)
         $script:FakeCtx.Calls.Add("RunInstaller:$verb")
-        if ((Get-UpdSha256 -Path $path) -ne $sha) { return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false } }
+        $res = { param($rc, $timedOut = $false, $tree = $true, $msi = $true) @{ Started = $true; HashOk = $true; Rc = $rc; TimedOut = $timedOut; RebootPending = ($rc -eq 3010); TreeGone = $tree; MsiIdle = $msi } }
+        if ((Get-UpdSha256 -Path $path) -ne $sha) { return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false; TreeGone = $true; MsiIdle = $true } }
+        $target = ('6.2.{0}.0' -f $script:FakeCtx.TargetBuild)
         switch ($script:FakeCtx.InstallMode) {
-            'ok' { $script:FakeCtx.Installed = ('6.2.{0}.0' -f $script:FakeCtx.TargetBuild); return @{ Started = $true; HashOk = $true; Rc = 0; TimedOut = $false; RebootPending = $false } }
-            'reboot' { $script:FakeCtx.Installed = ('6.2.{0}.0' -f $script:FakeCtx.TargetBuild); return @{ Started = $true; HashOk = $true; Rc = 3010; TimedOut = $false; RebootPending = $true } }
-            'wrongversion' { return @{ Started = $true; HashOk = $true; Rc = 0; TimedOut = $false; RebootPending = $false } }
-            'rc1' { return @{ Started = $true; HashOk = $true; Rc = 1603; TimedOut = $false; RebootPending = $false } }
-            'timeout' { return @{ Started = $true; HashOk = $true; Rc = -1; TimedOut = $true; RebootPending = $false } }
+            'ok' { $script:FakeCtx.Installed = $target; return (& $res 0) }
+            'reboot' { $script:FakeCtx.Installed = $target; return (& $res 3010) }
+            'rc3010same' { return (& $res 3010) }
+            'rc1641' { $script:FakeCtx.Installed = $target; return (& $res 1641) }
+            'rc1641same' { return (& $res 1641) }
+            'rc1618' { return (& $res 1618) }
+            'wrongversion' { return (& $res 0) }
+            'rc1' { return (& $res 1603) }
+            'timeout' { return (& $res -1 $true $true $true) }
+            'stuck' { return (& $res -1 $true $false $true) }
             'loseCert' {
-                $script:FakeCtx.Installed = ('6.2.{0}.0' -f $script:FakeCtx.TargetBuild)
+                $script:FakeCtx.Installed = $target
                 $script:FakeCtx.PresenceAfter = [pscustomobject]@{ HiveAvailable = $true; UniqueId = $true; Hosts = $true; Certificate = $false; Key = $true }
-                return @{ Started = $true; HashOk = $true; Rc = 0; TimedOut = $false; RebootPending = $false }
+                return (& $res 0)
             }
         }
     }
     $d.Rollback = {
-        param($prev, $failedPath, $failedSha, $runDir)
+        param($prev, $failedPath, $failedSha, $runDir, $idle)
         $script:FakeCtx.Calls.Add("Rollback:$($prev.Name)")
         if ($script:FakeCtx.RollbackOk) { $script:FakeCtx.Installed = ('6.2.{0}.0' -f $prev.Build) }
         return @{ Ok = [bool]$script:FakeCtx.RollbackOk; Method = 'fake' }
@@ -175,6 +190,8 @@ function New-FakeDeps {
     $d.Notify = { param($cfg, $dataDir, $result, $tag, $detail) $script:FakeCtx.Notified.Add("$result|$tag") }
     $d.TestPathAcl = { param($p) return @() }
     $d.PackageCacheBundle = { $script:FakeCtx.PackageCache }
+    $d.Sleep = { param($sec) $script:FakeCtx.Sleeps.Add([int]$sec) }
+    $d.GetBootTime = { $script:FakeCtx.BootTime }
     return $d
 }
 
@@ -182,8 +199,13 @@ function Invoke-FakeUpdate {
     param([Parameter(Mandatory)]$Dirs, [Parameter(Mandatory)][hashtable]$Ctx, [hashtable]$ConfigOverride = @{}, [string]$ModeOverride, [switch]$VerifyOnly, [object[]]$Fixtures)
     if ($Fixtures) { $Ctx.Fixtures = $Fixtures }
     if (-not $Ctx.ContainsKey('TargetBuild')) {
-        $newest = $Ctx.Fixtures | Sort-Object -Property U, N -Descending | Select-Object -First 1
+        $newest = $Ctx.Fixtures | Sort-Object -Property Build -Descending | Select-Object -First 1
         if ($newest) { $Ctx.TargetBuild = $newest.Build } else { $Ctx.TargetBuild = 0 }
+    }
+    if (-not $Ctx.NoBaseline -and -not $Ctx.PackageCache) {
+        $pcf = Join-Path $Dirs.Root 'package-cache-bundle.exe'
+        if (-not (Test-Path $pcf)) { [System.IO.File]::WriteAllBytes($pcf, [byte[]](1, 2, 3, 4, 5)) }
+        $Ctx.PackageCache = $pcf
     }
     Initialize-UpdLog -LogDir (Join-Path $Dirs.Data 'logs') -RunId 'test'
     $cfg = New-TestConfig -Override $ConfigOverride
@@ -196,4 +218,12 @@ function Get-AllLogText {
     $t = ''
     foreach ($f in (Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.log' -or $_.Name -like '*.log.1' })) { $t += [System.IO.File]::ReadAllText($f.FullName) + "`n" }
     return $t
+}
+
+function Remove-UpdDenyForTest {
+    <# Test convenience: forget attempts/denies so that a loop can produce many runs for one tag. #>
+    param([string]$DataDir)
+    $st = Read-UpdState -DataDir $DataDir
+    $st.denied = @(); $st.attempts = (New-Object psobject)
+    Save-UpdState -DataDir $DataDir -State $st
 }

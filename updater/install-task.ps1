@@ -69,6 +69,7 @@ if ($GhExeSource) {
 
 $configPath = Join-Path $ProgramDir 'config.json'
 $configExists = Test-Path -LiteralPath $configPath
+if ($SetMode -eq 'install' -and -not $configExists) { throw 'refusing -SetMode install on a fresh machine: install in report-only mode first, rehearse with update.ps1 -VerifyOnly, then run with -SetMode install (gate G4)' }
 $defaultConfig = [ordered]@{
     schema = 1; mode = 'report-only'; channel = 'canary'; cooling_off_hours = 0
     repo = 'emilwojcik93/moonlight-qt'; policy_branch = 'automation'; policy_path = 'policy.yml'
@@ -101,8 +102,10 @@ $plan.Add("8. Register scheduled task $TaskPath$TaskName :")
 $plan.Add("     principal : NT AUTHORITY\SYSTEM, LogonType ServiceAccount, RunLevel Highest")
 $plan.Add("     action    : $PsExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ProgramDir\update.ps1`"")
 $plan.Add("     triggers  : (a) AtLogOn of any user, random delay 3 min; (b) Daily at $RunAt; (c) every 6 hours (repetition PT6H for 3650 days)")
-$plan.Add("     settings  : ExecutionTimeLimit PT30M, MultipleInstances IgnoreNew, StartWhenAvailable, runs on battery, RunOnlyIfNetworkAvailable, Hidden")
-$plan.Add("9. Nothing is installed or downloaded from the Moonlight feed by this script; the task starts in whatever mode config.json says (default report-only).")
+$plan.Add("     settings  : ExecutionTimeLimit PT2H (exceeds the updater's internal worst-case budget, see docs), MultipleInstances IgnoreNew, StartWhenAvailable, runs on battery, RunOnlyIfNetworkAvailable, Hidden")
+$modeText = if ($SetMode) { $SetMode } else { 'whatever config.json says (new installs: report-only)' }
+$plan.Add("9. Nothing is installed or downloaded from the Moonlight feed by this script; the task runs in mode: $modeText.")
+$plan.Add("10. Delete a stale $ProgramDir\test-mode.flag if one exists (the updater has no test mode; the file has no effect).")
 
 Write-Output "install-task plan ($(if ($whatIf) { 'WHATIF: nothing will be changed' } else { 'executing' })):"
 foreach ($l in $plan) { Write-Output $l }
@@ -147,6 +150,9 @@ foreach ($f in (Get-ChildItem -LiteralPath $ProgramDir -File -Recurse)) {
     Set-Acl -LiteralPath $f.FullName -AclObject $a
 }
 Write-Output "installed scripts into $ProgramDir"
+
+$staleFlag = Join-Path $ProgramDir 'test-mode.flag'
+if (Test-Path -LiteralPath $staleFlag) { Remove-Item -LiteralPath $staleFlag -Force; Write-Output 'removed stale test-mode.flag' }
 
 # 4 data dir
 Initialize-AdminDir $DataDir
@@ -217,7 +223,7 @@ $t1 = New-ScheduledTaskTrigger -AtLogOn
 $t1.Delay = 'PT3M'
 $t2 = New-ScheduledTaskTrigger -Daily -At $RunAt
 $t3 = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddHours(0)) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 3650)
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew -StartWhenAvailable `
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew -StartWhenAvailable `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable -Hidden
 $prin = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $task = New-ScheduledTask -Action $action -Trigger @($t1, $t2, $t3) -Settings $settings -Principal $prin -Description 'Moonlight patched-feed updater (verify, then install when idle). Managed by install-task.ps1.'

@@ -18,7 +18,7 @@ Describe 'Happy path' {
         $fx = New-FixtureRelease -U 202 -N 1
         $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
         $r.Result | Should -Be 'updated'; $r.ExitCode | Should -Be 0; $r.Tag | Should -Be $fx.Tag
-        $ctx.Installed | Should -Be '6.2.60202.0'
+        $ctx.Installed | Should -Be '6.2.61616.0'
         $c = Get-Calls $ctx
         $c | Should -Contain 'Download:manifest.json'
         $c | Should -Contain 'Verify:manifest.json'
@@ -109,17 +109,27 @@ Describe 'Idle check' {
 
 Describe 'Version rules' {
     It 'refuses downgrade: installed newer than every release => noop' {
-        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60300.0'
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.62000.0'
         $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 202), (New-FixtureRelease -U 201))
         $r.Result | Should -Be 'noop'
         (@($ctx.Calls) -match '^Download').Count | Should -Be 0
     }
-    It 'same upstream U, higher N: key is newer but MSI build number is not => skipped, not installed' {
-        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60202.0'
-        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 202 -N 2))
+    It 'a rebuild N+1 of the same U has its own build number and installs (CONTRACT 3b)' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.61616.0'         # U202 N1
+        $fx = New-FixtureRelease -U 202 -N 2                               # B 61617
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'updated'
+        $ctx.Installed | Should -Be '6.2.61617.0'
+    }
+    It 'the installed build itself and lower rebuilds are not newer: noop' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.61617.0'
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 202 -N 2), (New-FixtureRelease -U 202 -N 1))
         $r.Result | Should -Be 'noop'
-        (Get-AllLogText $d.Data) | Should -Match 'same or lower MSI build number'
-        Test-NothingInstalled $ctx | Should -BeTrue
+        (Get-AllLogText $d.Data) | Should -Match 'not newer than installed'
+    }
+    It 'legacy installed 6.2.60006 is upgraded by a 3b build without any special case' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 202 -N 1))).Result | Should -Be 'updated'
     }
     It 'no Moonlight installed => noop (first install is manual)' {
         $d = New-Case; $ctx = New-FakeCtx -Installed ''
@@ -311,7 +321,8 @@ Describe 'Verification failures => nothing installed' {
         $deps = New-FakeDeps -Ctx $ctx -Sids @($d.Sid)
         $deps.AssertGh = { param($gh, $p) throw 'gh.exe hash does not match pin' }
         Initialize-UpdLog -LogDir (Join-Path $d.Data 'logs') -RunId 't'
-        $ctx.Fixtures = @((New-FixtureRelease)); $ctx.TargetBuild = 60202
+        $pc = Join-Path $d.Root 'pc.exe'; [IO.File]::WriteAllBytes($pc, [byte[]](1, 2, 3, 4)); $ctx.PackageCache = $pc
+        $ctx.Fixtures = @((New-FixtureRelease)); $ctx.TargetBuild = 61616
         $r = Invoke-MoonlightUpdate -ProgramDir $d.Prog -DataDir $d.Data -Config (New-TestConfig) -Deps $deps
         $r.Result | Should -Be 'verify_failed'
         (@($ctx.Calls) -match '^Verify:').Count | Should -Be 0
@@ -325,50 +336,301 @@ Describe 'Verification failures => nothing installed' {
     }
 }
 
-Describe 'Install failure => deny + rollback' {
-    It '<Mode>: failed health check rolls back to the previous bundle, denies the tag, exit 5' -ForEach @(
+Describe 'Install failure => rollback; deny only after 2 consecutive real failures' {
+    It '<Mode>: first failure rolls back (exit 5) and does NOT deny; the tag is retried after backoff' -ForEach @(
         @{ Mode = 'wrongversion' }, @{ Mode = 'rc1' }, @{ Mode = 'timeout' }, @{ Mode = 'loseCert' }
     ) {
         $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = $Mode
-        $pc = Join-Path $d.Root 'pc.exe'; [IO.File]::WriteAllBytes($pc, [byte[]](1, 2, 3, 4)); $ctx.PackageCache = $pc
         $fx = New-FixtureRelease -U 202
         $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
         $r.Result | Should -Be 'rolled_back'; $r.ExitCode | Should -Be 5
         @($ctx.Calls) | Should -Contain 'Rollback:installed-60006'
         $ctx.Installed | Should -Be '6.2.60006.0'
         $st = Read-UpdState -DataDir $d.Data
-        Test-LocallyDenied -State $st -Tag $fx.Tag | Should -BeTrue
+        Test-LocallyDenied -State $st -Tag $fx.Tag | Should -BeFalse
+        (Get-AttemptRecord -State $st -Tag $fx.Tag).failures | Should -Be 1
         $st.installed | Should -BeNullOrEmpty
         (Get-VerifiedBundles -DataDir $d.Data | ForEach-Object Name) | Should -Not -Contain $fx.Tag      # failed bundle is not kept
         $ctx.Notified | Should -Contain ('rolled_back|' + $fx.Tag)
-        # next run does not retry the denied tag
+        # next run, inside the 1 h backoff: nothing happens
+        $ctx.Calls.Clear()
+        $r2 = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r2.Result | Should -Be 'deferred'; $r2.Detail | Should -Match 'backoff'
+        (@($ctx.Calls) -match '^(Download|RunInstaller)').Count | Should -Be 0
+    }
+    It 'second consecutive failure of the same tag denies it; a third run does nothing' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = 'wrongversion'
+        $fx = New-FixtureRelease -U 202
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+        $ctx.Installed = '6.2.60006.0'; $ctx.Now = (Get-Date).ToUniversalTime().AddHours(3); $ctx.Calls.Clear()
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'rolled_back'
+        Test-LocallyDenied -State (Read-UpdState -DataDir $d.Data) -Tag $fx.Tag | Should -BeTrue
         $ctx.Calls.Clear(); $ctx.InstallMode = 'ok'
         (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)).Result | Should -Be 'noop'
-        Test-NothingInstalled $ctx | Should -BeTrue
+        (@($ctx.Calls) -match '^RunInstaller').Count | Should -Be 0
     }
     It 'rollback failure => exit 6 and a loud notification' {
         $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'wrongversion'; $ctx.RollbackOk = $false
-        $pc = Join-Path $d.Root 'pc.exe'; [IO.File]::WriteAllBytes($pc, [byte[]](1, 2, 3, 4)); $ctx.PackageCache = $pc
         $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))
         $r.ExitCode | Should -Be 6
         ($ctx.Notified -join ',') | Should -Match 'ROLLBACK-FAILED'
     }
-    It 'no previous bundle available => cannot roll back, exit 6, tag denied' {
-        $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'wrongversion'; $ctx.PackageCache = $null
-        $fx = New-FixtureRelease
-        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
-        $r.ExitCode | Should -Be 6
-        Test-LocallyDenied -State (Read-UpdState -DataDir $d.Data) -Tag $fx.Tag | Should -BeTrue
-    }
-    It 'installer hash re-check failure (file swapped after verification) is a failed install, not a success' {
+    It 'installer hash re-check failure (file swapped after verification): nothing ran => verify_failed, no rollback' {
         $d = New-Case; $ctx = New-FakeCtx
         $deps = New-FakeDeps -Ctx $ctx -Sids @($d.Sid)
-        $deps.RunInstaller = { param($p, $s, $l, $v) $ctx.Calls.Add('RunInstaller:install'); return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false } }.GetNewClosure()
+        $deps.RunInstaller = { param($p, $s, $l, $v) $script:FakeCtx.Calls.Add('RunInstaller:install'); return @{ Started = $false; HashOk = $false; Rc = $null; TimedOut = $false; RebootPending = $false; TreeGone = $true; MsiIdle = $true } }
         $pc = Join-Path $d.Root 'pc.exe'; [IO.File]::WriteAllBytes($pc, [byte[]](1, 2, 3, 4)); $ctx.PackageCache = $pc
         Initialize-UpdLog -LogDir (Join-Path $d.Data 'logs') -RunId 't'
-        $ctx.Fixtures = @((New-FixtureRelease)); $ctx.TargetBuild = 60202
+        $ctx.Fixtures = @((New-FixtureRelease)); $ctx.TargetBuild = 61616
         $r = Invoke-MoonlightUpdate -ProgramDir $d.Prog -DataDir $d.Data -Config (New-TestConfig) -Deps $deps
+        $r.Result | Should -Be 'verify_failed'
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+    }
+}
+
+Describe 'Installer exit codes (P2-3)' {
+    It '1618 (another installation running) => deferred, no rollback, no deny, transient backoff' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'rc1618'
+        $fx = New-FixtureRelease
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'deferred'; $r.ExitCode | Should -Be 0
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        $st = Read-UpdState -DataDir $d.Data
+        Test-LocallyDenied -State $st -Tag $fx.Tag | Should -BeFalse
+        (Get-AttemptRecord -State $st -Tag $fx.Tag).transient | Should -Be 1
+        (Get-AttemptRecord -State $st -Tag $fx.Tag).failures | Should -Be 0
+    }
+    It '3010 with the target version present => success' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'reboot'
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))
+        $r.Result | Should -Be 'updated'; $r.Detail | Should -Match 'reboot pending: True'
+    }
+    It '<Mode>: version unchanged => pending_reboot (no rollback, no deny), state recorded' -ForEach @(@{ Mode = 'rc3010same' }, @{ Mode = 'rc1641same' }) {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = $Mode
+        $fx = New-FixtureRelease
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'pending_reboot'; $r.ExitCode | Should -Be 0
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        $st = Read-UpdState -DataDir $d.Data
+        $st.pending_reboot.tag | Should -Be $fx.Tag
+        Test-LocallyDenied -State $st -Tag $fx.Tag | Should -BeFalse
+        (Get-VerifiedBundles -DataDir $d.Data | ForEach-Object Name) | Should -Contain $fx.Tag      # kept for the re-verification
+    }
+    It '1641 with the correct version => success' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'rc1641'
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))).Result | Should -Be 'updated'
+    }
+    It 'pending reboot: next run before a reboot waits; after the reboot with the target version it is resolved' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = 'rc3010same'
+        $fx = New-FixtureRelease
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+        $ctx.Calls.Clear()
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)       # BootTime = yesterday: no reboot yet
+        $r.Result | Should -Be 'deferred'; $r.Detail | Should -Match 'reboot pending'
+        (@($ctx.Calls) -match '^(Download|RunInstaller)').Count | Should -Be 0
+        $ctx.BootTime = (Get-Date).ToUniversalTime().AddMinutes(5); $ctx.Installed = '6.2.61616.0'       # rebooted, upgrade completed
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'noop'
+        $st = Read-UpdState -DataDir $d.Data
+        $st.pending_reboot | Should -BeNullOrEmpty; $st.installed.tag | Should -Be $fx.Tag
+        (Get-AllLogText $d.Data) | Should -Match 'event=pending_reboot_resolved'
+    }
+    It 'pending reboot: after the reboot the target version is still missing => genuine failure, rollback' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = 'rc3010same'
+        $fx = New-FixtureRelease
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+        $ctx.Calls.Clear(); $ctx.BootTime = (Get-Date).ToUniversalTime().AddMinutes(5)
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
         $r.Result | Should -Be 'rolled_back'
+        @($ctx.Calls) | Should -Contain 'Rollback:installed-60006'
+    }
+    It 'installer timeout whose process tree could not be stopped => exit 6, NO rollback, no deny (rollback only after the tree is gone)' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.InstallMode = 'stuck'
+        $fx = New-FixtureRelease
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.ExitCode | Should -Be 6; $r.Detail | Should -Match 'did not stop'
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        Test-LocallyDenied -State (Read-UpdState -DataDir $d.Data) -Tag $fx.Tag | Should -BeFalse
+    }
+}
+
+Describe 'Idle handling (P2-4)' {
+    It 'Moonlight starts right before the launch (3rd idle check) => deferred, installer never launched' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.RunningSeq = @($false, $false, $true)
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))
+        $r.Result | Should -Be 'deferred'
+        (@($ctx.Calls) -match '^RunInstaller').Count | Should -Be 0
+    }
+    It 'rollback needed while Moonlight runs: bounded backoff, then rollback_pending + alert (no uninstall)' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'; $ctx.InstallMode = 'wrongversion'
+        $ctx.RunningSeq = @($false, $false, $false) + (1..10 | ForEach-Object { $true })       # idle for the installs, then Moonlight is started
+        $fx = New-FixtureRelease
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.ExitCode | Should -Be 6; $r.Detail | Should -Match 'rollback postponed'
+        @($ctx.Sleeps) | Should -Be @(30, 60, 120, 240)
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        ($ctx.Notified -join ',') | Should -Match 'ROLLBACK-POSTPONED'
+        $st = Read-UpdState -DataDir $d.Data
+        $st.rollback_pending.tag | Should -Be $fx.Tag
+        (Get-VerifiedBundles -DataDir $d.Data | ForEach-Object Name) | Should -Contain $fx.Tag      # failed bundle kept for the late rollback
+        # later, Moonlight is closed: the late rollback happens at the start of the next run
+        $ctx.RunningSeq = @(); $ctx.Running = $false; $ctx.Calls.Clear()
+        $r2 = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r2.Result | Should -Be 'rolled_back'; $r2.Detail | Should -Match 'late rollback'
+        @($ctx.Calls) | Should -Contain 'Rollback:installed-60006'
+        (Read-UpdState -DataDir $d.Data).rollback_pending | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Rollback baseline (P2-5)' {
+    It 'no baseline => refuse to install before downloading anything (exit 3, log no_rollback_baseline)' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.NoBaseline = $true
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))
+        $r.ExitCode | Should -Be 3; $r.Detail | Should -Match 'refusing to install'
+        (@($ctx.Calls) -match '^(Download|RunInstaller)').Count | Should -Be 0
+        (Get-AllLogText $d.Data) | Should -Match 'no_rollback_baseline'
+    }
+    It 'allow_no_baseline=true installs anyway' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.NoBaseline = $true
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -ConfigOverride @{ allow_no_baseline = $true } -Fixtures @((New-FixtureRelease))).Result | Should -Be 'updated'
+    }
+    It 'a Package Cache bundle that is not admin-only is not used as baseline' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $pc = Join-Path $d.Root 'pc.exe'; [IO.File]::WriteAllBytes($pc, [byte[]](1, 2, 3)); $ctx.PackageCache = $pc
+        $deps = New-FakeDeps -Ctx $ctx -Sids @($d.Sid)
+        $deps.TestPathAcl = { param($p) return @('writable by Users') }
+        Initialize-UpdLog -LogDir (Join-Path $d.Data 'logs') -RunId 't'
+        $ctx.Fixtures = @((New-FixtureRelease)); $ctx.TargetBuild = 61616
+        (Invoke-MoonlightUpdate -ProgramDir $d.Prog -DataDir $d.Data -Config (New-TestConfig) -Deps $deps).ExitCode | Should -Be 3
+    }
+    It 'after a successful update the new bundle is the baseline of the next one' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 202)))
+        $ctx.NoBaseline = $true; $ctx.PackageCache = $null; $ctx.Calls.Clear(); $ctx.TargetBuild = (ConvertTo-BuildNumber -U 203 -N 1)
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease -U 203))
+        $r.Result | Should -Be 'updated'
+    }
+}
+
+Describe 'Order, backoff and pruning (P2-6)' {
+    It 'the manifest and SHA256SUMS attestations are verified BEFORE the installer is downloaded' {
+        $d = New-Case; $ctx = New-FakeCtx
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease)))
+        $c = Get-Calls $ctx
+        $iDl = [array]::IndexOf($c, 'Download:MoonlightSetup.exe')
+        [array]::IndexOf($c, 'Verify:manifest.json') | Should -BeLessThan $iDl
+        [array]::IndexOf($c, 'Verify:SHA256SUMS') | Should -BeLessThan $iDl
+        [array]::IndexOf($c, 'Verify:MoonlightSetup.exe') | Should -BeGreaterThan $iDl
+    }
+    It 'a manifest that fails verification never causes the installer download' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.VerifyFailFor = @('manifest.json')
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease)))
+        (@($ctx.Calls) -match '^Download:MoonlightSetup').Count | Should -Be 0
+    }
+    It 'a permanently bad release is not re-processed on every run (backoff) and is denied after 3 verification failures' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.VerifyOk = $false
+        $fx = New-FixtureRelease
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+        $ctx.Calls.Clear()
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)       # immediately again: inside the backoff
+        $r.Result | Should -Be 'deferred'
+        (@($ctx.Calls) -match '^Download').Count | Should -Be 0
+        $ctx.Now = (Get-Date).ToUniversalTime().AddHours(1)
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))     # 2nd failure
+        $ctx.Now = (Get-Date).ToUniversalTime().AddHours(10)
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))     # 3rd failure => denied
+        Test-LocallyDenied -State (Read-UpdState -DataDir $d.Data) -Tag $fx.Tag | Should -BeTrue
+        $ctx.Calls.Clear(); $ctx.VerifyOk = $true; $ctx.Now = (Get-Date).ToUniversalTime().AddHours(20)
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)).Result | Should -Be 'noop'
+    }
+    It 'download errors are transient: deferred (exit 8), backoff, never denied' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.DownloadThrows = 'HTTP 503'
+        $fx = New-FixtureRelease
+        foreach ($h in 0, 2, 5, 12, 30, 60) {
+            $ctx.Now = (Get-Date).ToUniversalTime().AddHours($h)
+            $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+            @(8, 0) | Should -Contain $r.ExitCode
+        }
+        $st = Read-UpdState -DataDir $d.Data
+        Test-LocallyDenied -State $st -Tag $fx.Tag | Should -BeFalse
+        (Get-AttemptRecord -State $st -Tag $fx.Tag).transient | Should -BeGreaterThan 2
+    }
+    It 'failed runs do not leak: only the newest 3 run dirs survive' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.VerifyOk = $false
+        $fx = New-FixtureRelease
+        foreach ($h in 0, 2, 4, 6, 8) {
+            $ctx.Now = (Get-Date).ToUniversalTime().AddHours($h * 20)
+            [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+            Start-Sleep -Milliseconds 1100       # run dir names carry a one-second timestamp
+            Remove-UpdDenyForTest -DataDir $d.Data
+        }
+        @(Get-ChildItem (Join-Path $d.Data 'updates') -Directory).Count | Should -BeLessOrEqual 3
+    }
+    It 'installer size must equal the manifest / release size (truncation or swap) => verify_failed before any install' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $fx = New-FixtureRelease; ($fx.Release.assets | Where-Object name -eq 'MoonlightSetup.exe').size = 9999      # API disagrees with the manifest (4096)
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)).Result | Should -Be 'verify_failed'
+        (@($ctx.Calls) -match '^(Download:MoonlightSetup|RunInstaller)').Count | Should -Be 0
+    }
+    It 'the manifest owner must be in the LOCAL owner list as well' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -ConfigOverride @{ upstream_owners = @('SomeoneElse') } -Fixtures @((New-FixtureRelease))
+        $r.Result | Should -Be 'verify_failed'
+        (@($ctx.Calls) -match '^RunInstaller').Count | Should -Be 0
+    }
+}
+
+Describe 'Presence when the user hive is unavailable (P2-8)' {
+    It 'no hive before the install => install postponed (never unchecked), exit 0' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $ctx.PresenceBefore = [pscustomobject]@{ HiveAvailable = $false; UniqueId = $false; Hosts = $false; Certificate = $false; Key = $false }
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @((New-FixtureRelease))
+        $r.Result | Should -Be 'deferred'; $r.Detail | Should -Match 'presence check unavailable'
+        (@($ctx.Calls) -match '^RunInstaller').Count | Should -Be 0
+        (Get-AllLogText $d.Data) | Should -Match 'presence_unavailable'
+    }
+    It 'hive gone after the install => verification_pending (no rollback); re-checked at the next run' {
+        $d = New-Case; $ctx = New-FakeCtx -Installed '6.2.60006.0'
+        $ctx.PresenceAfter = [pscustomobject]@{ HiveAvailable = $false; UniqueId = $false; Hosts = $false; Certificate = $false; Key = $false }
+        $fx = New-FixtureRelease
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx)
+        $r.Result | Should -Be 'updated'
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        (Read-UpdState -DataDir $d.Data).verification_pending.tag | Should -Be $fx.Tag
+        # next run: hive available again and the certificate is missing => alert, no rollback, pending cleared
+        $ctx.PresenceCalls = 5; $ctx.PresenceAfter = [pscustomobject]@{ HiveAvailable = $true; UniqueId = $true; Hosts = $true; Certificate = $false; Key = $true }
+        $ctx.Calls.Clear()
+        [void](Invoke-FakeUpdate -Dirs $d -Ctx $ctx -Fixtures @($fx))
+        ($ctx.Notified -join ',') | Should -Match 'PRESENCE-LOST'
+        (@($ctx.Calls) -match '^Rollback').Count | Should -Be 0
+        (Read-UpdState -DataDir $d.Data).verification_pending | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Local cooling-off floor (P2-9) and clock (P3)' {
+    It 'with the production default floor of 2 h a 1 h old release is deferred even though the policy says 0' {
+        $d = New-Case; $ctx = New-FakeCtx; $ctx.Policy = New-DefaultPolicy -Canary 0
+        $fx = New-FixtureRelease -PublishedAt ((Get-Date).ToUniversalTime().AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -ConfigOverride @{ min_cooling_off_hours = 2 } -Fixtures @($fx)
+        $r.Result | Should -Be 'deferred'
+        (@($ctx.Calls) -match '^Download').Count | Should -Be 0
+    }
+    It 'a 3 h old release passes the floor; the Owner can lower the floor locally' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $fx = New-FixtureRelease -PublishedAt ((Get-Date).ToUniversalTime().AddHours(-3).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        (Invoke-FakeUpdate -Dirs $d -Ctx $ctx -ConfigOverride @{ min_cooling_off_hours = 2 } -Fixtures @($fx)).Result | Should -Be 'updated'
+        $d2 = New-Case; $ctx2 = New-FakeCtx
+        $young = New-FixtureRelease -PublishedAt ((Get-Date).ToUniversalTime().AddMinutes(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        (Invoke-FakeUpdate -Dirs $d2 -Ctx $ctx2 -ConfigOverride @{ min_cooling_off_hours = 0 } -Fixtures @($young)).Result | Should -Be 'updated'
+    }
+    It 'a local clock 30 days ahead does not defeat cooling-off: GitHub server time is used when the skew exceeds 5 minutes' {
+        $d = New-Case; $ctx = New-FakeCtx
+        $ctx.Now = (Get-Date).ToUniversalTime().AddDays(30); $ctx.ServerDate = (Get-Date).ToUniversalTime()
+        $fx = New-FixtureRelease -PublishedAt ((Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        $r = Invoke-FakeUpdate -Dirs $d -Ctx $ctx -ConfigOverride @{ cooling_off_hours = 24 } -Fixtures @($fx)
+        $r.Result | Should -Be 'deferred'
+        (Get-AllLogText $d.Data) | Should -Match 'clock_skew'
     }
 }
 

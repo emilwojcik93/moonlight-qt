@@ -2,9 +2,11 @@
 
 Set-StrictMode -Version Latest
 
-# Build scheme "contract-v1": ci_version = 6.2.0-daily.(60000+U) -> FileVersion 6.2.(60000+U).0.
+# Build scheme "contract-v1.1 s3b": ci_version = 6.2.0-daily.B with B = 60000 + 8*U + (N-1), N in 1..8, B <= 65535,
+# FileVersion 6.2.B.0. (U,N) is derived from B: U = (B-60000) div 8, N = ((B-60000) mod 8)+1. Ordering is numeric on B.
+# A legacy installed build such as 6.2.60006 simply compares numerically lower than any new build (no special case).
 # Everything that depends on the scheme lives in this file (single place to change).
-$script:UpdScheme = @{ Offset = 60000; MaxBuild = 65535; Major = 6; Minor = 2 }
+$script:UpdScheme = @{ Offset = 60000; PerU = 8; MaxBuild = 65535; Major = 6; Minor = 2 }
 
 function Test-MoonlightTag {
     [CmdletBinding()]
@@ -13,39 +15,50 @@ function Test-MoonlightTag {
     return (Test-UpdRegex -Value $Tag -Pattern $Pattern)
 }
 
-function ConvertTo-OrderingKey {
-    <# Tag v6.2.0-daily.U-vp.N -> @{U;N;Tag}. Throws on anything that does not match the anchored regex. #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Tag)
-    if (-not (Test-MoonlightTag -Tag $Tag)) { throw "invalid moonlight tag" }
-    $m = [regex]::Match($Tag, '^v6\.2\.0-daily\.([0-9]{1,5})-vp\.([0-9]{1,3})$')
-    return [pscustomobject]@{ U = [int]$m.Groups[1].Value; N = [int]$m.Groups[2].Value; Tag = $Tag }
-}
-
-function Compare-OrderingKey {
-    <# -1, 0, 1 comparing (U,N) numerically. #>
-    [CmdletBinding()]
-    [OutputType([int])]
-    param([Parameter(Mandatory)]$A, [Parameter(Mandatory)]$B)
-    if ($A.U -lt $B.U) { return -1 }
-    if ($A.U -gt $B.U) { return 1 }
-    if ($A.N -lt $B.N) { return -1 }
-    if ($A.N -gt $B.N) { return 1 }
-    return 0
-}
-
 function ConvertTo-BuildNumber {
-    <# Upstream-daily number U -> third FileVersion field (scheme contract-v1). #>
+    <# (U,N) -> third FileVersion field. Throws for N outside 1..8 or B above the MSI limit. #>
     [CmdletBinding()]
     [OutputType([int])]
-    param([Parameter(Mandatory)][int]$U)
-    $b = $script:UpdScheme.Offset + $U
+    param([Parameter(Mandatory)][int]$U, [Parameter(Mandatory)][int]$N)
+    if ($U -lt 1) { throw 'U must be >= 1' }
+    if ($N -lt 1 -or $N -gt $script:UpdScheme.PerU) { throw "N must be 1..$($script:UpdScheme.PerU)" }
+    $b = $script:UpdScheme.Offset + $script:UpdScheme.PerU * $U + ($N - 1)
     if ($b -gt $script:UpdScheme.MaxBuild) { throw "build number $b exceeds MSI limit" }
     return $b
 }
 
+function ConvertFrom-BuildNumber {
+    <# B -> @{U;N}; $null when B is outside 60000..65535. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Build)
+    if ($Build -lt $script:UpdScheme.Offset -or $Build -gt $script:UpdScheme.MaxBuild) { return $null }
+    $d = $Build - $script:UpdScheme.Offset
+    return [pscustomobject]@{ U = [int][math]::Floor($d / $script:UpdScheme.PerU); N = ($d % $script:UpdScheme.PerU) + 1 }
+}
+
+function ConvertTo-OrderingKey {
+    <# Tag v6.2.0-daily.U-vp.N -> @{U;N;Build;Tag}. Throws on non-canonical tags and on N > 8 / B > 65535 (not installable). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Tag)
+    if (-not (Test-MoonlightTag -Tag $Tag)) { throw "invalid moonlight tag" }
+    $m = [regex]::Match($Tag, '^v6\.2\.0-daily\.([1-9][0-9]{0,4})-vp\.([1-9][0-9]{0,2})$')
+    $u = [int]$m.Groups[1].Value; $n = [int]$m.Groups[2].Value
+    $b = ConvertTo-BuildNumber -U $u -N $n
+    return [pscustomobject]@{ U = $u; N = $n; Build = $b; Tag = $Tag }
+}
+
+function Compare-OrderingKey {
+    <# -1, 0, 1 comparing numerically on the build number (equivalent to (U,N) order). #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([Parameter(Mandatory)]$A, [Parameter(Mandatory)]$B)
+    if ($A.Build -lt $B.Build) { return -1 }
+    if ($A.Build -gt $B.Build) { return 1 }
+    return 0
+}
+
 function ConvertFrom-FileVersion {
-    <# "6.2.60006.0" (or ProductVersion style) -> @{Major;Minor;Build;Revision;U}. U = Build-60000 or $null when below offset. #>
+    <# "6.2.61616.0" -> @{Major;Minor;Build;Revision;U;N}. U/N are $null outside the scheme range. #>
     [CmdletBinding()]
     param([AllowNull()][string]$Version)
     if ([string]::IsNullOrEmpty($Version)) { return $null }
@@ -54,20 +67,16 @@ function ConvertFrom-FileVersion {
     $rev = 0
     if ($m.Groups[4].Success) { $rev = [int]$m.Groups[4].Value }
     $build = [int]$m.Groups[3].Value
-    $u = $null
-    if ($build -gt $script:UpdScheme.Offset) { $u = $build - $script:UpdScheme.Offset }
-    return [pscustomobject]@{
-        Major = [int]$m.Groups[1].Value; Minor = [int]$m.Groups[2].Value; Build = $build; Revision = $rev; U = $u
-    }
+    $un = ConvertFrom-BuildNumber -Build $build
+    $u = $null; $n = $null
+    if ($null -ne $un) { $u = $un.U; $n = $un.N }
+    return [pscustomobject]@{ Major = [int]$m.Groups[1].Value; Minor = [int]$m.Groups[2].Value; Build = $build; Revision = $rev; U = $u; N = $n }
 }
 
 function Resolve-InstalledKey {
     <#
-      Installed version -> ordering key.
-      * FileVersion 6.2.<60000+U> gives U; N is unknown for builds not installed by this updater => 0.
-      * If local state.json recorded an install with the same U, its N wins (we know it exactly).
-      Returns $null when nothing usable is installed (caller treats as "not installed": updater does NOT
-      install on a machine without Moonlight; first install is a manual step).
+      Installed version -> ordering key, derived from the FileVersion build field alone (state.json is not trusted for ordering).
+      Returns $null when nothing usable is installed (the updater does not install on a machine without Moonlight).
     #>
     [CmdletBinding()]
     param([AllowNull()][string]$FileVersion, [AllowNull()]$State)
@@ -75,15 +84,7 @@ function Resolve-InstalledKey {
     if ($null -eq $fv) { return $null }
     if ($fv.Major -ne $script:UpdScheme.Major -or $fv.Minor -ne $script:UpdScheme.Minor) { return $null }
     if ($null -eq $fv.U) { return $null }
-    $n = 0
-    if ($null -ne $State) {
-        $si = $null
-        if ($State.PSObject.Properties.Name -contains 'installed') { $si = $State.installed }
-        if ($null -ne $si -and ($si.PSObject.Properties.Name -contains 'u') -and ($si.PSObject.Properties.Name -contains 'n')) {
-            if ([int]$si.u -eq $fv.U) { $n = [int]$si.n }
-        }
-    }
-    return [pscustomobject]@{ U = $fv.U; N = $n; Build = $fv.Build; Tag = ('v6.2.0-daily.{0}-vp.{1}' -f $fv.U, $n) }
+    return [pscustomobject]@{ U = $fv.U; N = $fv.N; Build = $fv.Build; Tag = ('v6.2.0-daily.{0}-vp.{1}' -f $fv.U, $fv.N) }
 }
 
 function Select-NewestEligibleRelease {
@@ -108,7 +109,8 @@ function Select-NewestEligibleRelease {
         $pre = $false
         if ($names -contains 'prerelease') { $pre = ($r.prerelease -eq $true) }
         if ($Channel -eq 'stable' -and $pre) { continue }
-        $key = ConvertTo-OrderingKey -Tag $tag
+        $key = $null
+        try { $key = ConvertTo-OrderingKey -Tag $tag } catch { continue }   # N > 8 or B > 65535: not installable
         $out.Add([pscustomobject]@{ Release = $r; Key = $key })
     }
     $sorted = @($out.ToArray() | Sort-Object -Property @{ Expression = { $_.Key.U }; Descending = $true }, @{ Expression = { $_.Key.N }; Descending = $true })

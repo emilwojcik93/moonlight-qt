@@ -116,13 +116,18 @@ Describe 'Secure directory creation' {
         (Split-Path (Split-Path $a -Parent) -Leaf) | Should -Be 'updates'
         (Get-Acl $a).AreAccessRulesProtected | Should -BeTrue
     }
-    It 'removes old run dirs but keeps the current one' {
-        $a = New-UpdRunDirectory -DataDir $script:d.Data -AdditionalFullControlSids @($script:d.Sid)
-        $b = New-UpdRunDirectory -DataDir $script:d.Data -AdditionalFullControlSids @($script:d.Sid)
-        (Get-Item $a).LastWriteTime = (Get-Date).AddDays(-30)
-        Remove-OldRunDirectories -DataDir $script:d.Data -Except $b
-        Test-Path $a | Should -BeFalse
-        Test-Path $b | Should -BeTrue
+    It 'keeps only the newest 3 run dirs (failed runs are pruned too) plus the current one' {
+        $u = Join-Path $script:d.Data 'updates'; New-Item -ItemType Directory -Path $u | Out-Null
+        foreach ($n in 1..6) { New-Item -ItemType Directory -Path (Join-Path $u ('2026010{0}T000000Z-aaaaaaaa' -f $n)) | Out-Null }
+        Remove-OldRunDirectories -DataDir $script:d.Data -KeepLast 3 -Except (Join-Path $u '20260101T000000Z-aaaaaaaa')
+        $left = @(Get-ChildItem $u -Directory | ForEach-Object Name | Sort-Object)
+        $left | Should -Be @('20260101T000000Z-aaaaaaaa', '20260104T000000Z-aaaaaaaa', '20260105T000000Z-aaaaaaaa', '20260106T000000Z-aaaaaaaa')
+    }
+    It 'Test-UpdAclSafe now finds a junction two levels down (bundles subfolder)' {
+        $bundles = Join-Path $script:d.Data 'bundles'; New-Item -ItemType Directory -Path $bundles | Out-Null
+        $real = Join-Path $script:d.Root 'real'; New-Item -ItemType Directory -Path $real | Out-Null
+        cmd /c mklink /J "`"$(Join-Path $bundles 'evil')`"" "`"$real`"" | Out-Null
+        try { (Test-UpdAclSafe -Path $script:d.Data) -join ' ' | Should -Match 'reparse point' } finally { cmd /c rmdir "`"$(Join-Path $bundles 'evil')`"" | Out-Null }
     }
     It 'refuses to initialise a reparse point' {
         $target = Join-Path $script:d.Root 'real'; New-Item -ItemType Directory $target | Out-Null

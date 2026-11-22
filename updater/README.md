@@ -11,7 +11,7 @@ updater/
   install-task.ps1           elevated installer: files, ACLs, gh.exe, config, task   (-WhatIf prints the exact plan)
   uninstall-task.ps1         removes the task (and optionally files/data)            (-WhatIf supported)
   gh-pin.json                pinned gh.exe (version + SHA256 of zip and exe)
-  lib/*.ps1                  Common, Version, Yaml, Config, Security, GitHub, Verify, Install, Notify, Orchestrator, Snappy
+  lib/*.ps1                  Common, Version, Yaml, Config, Security, GitHub, Verify, Install, Notify, Orchestrator, Main, Snappy
   tests/*.Tests.ps1          Pester v5 suite (sandbox only); tests/U3-SystemProbe.ps1 = research probe, run as SYSTEM
   docs/UPDATER.md            design, security model, config, exit codes, U3 answer, enablement steps
   PSScriptAnalyzerSettings.psd1
@@ -20,8 +20,8 @@ updater/
 * Windows PowerShell 5.1 compatible (also tested on PowerShell 7), strict mode, no `Invoke-Expression`, every value that
   reaches a command line is regex-validated and passed as an argument array (no shell).
 * Program dir `C:\Program Files\MoonlightPatchUpdater\` (admin-only), data dir `C:\ProgramData\MoonlightPatchUpdater\`
-  (SYSTEM + Administrators only, inheritance removed); the script aborts at start when either is writable by anyone else.
-* Task `\MoonlightPatch\Update`: SYSTEM, triggers at logon + daily 04:17 + every 6 h, 30 min time limit, single instance.
+  (SYSTEM + Administrators only, inheritance removed); the script aborts at start when either is writable by anyone else. There is no test mode: config.json cannot override paths, URLs or executables.
+* Task `\MoonlightPatch\Update`: SYSTEM, triggers at logon + daily 04:17 + every 6 h, 2 h time limit (internal budget documented), single instance.
 
 Run the tests (needs Pester 5; `-IncludeNetwork` adds the anonymous GitHub/Sigstore checks):
 

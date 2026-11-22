@@ -7,14 +7,14 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { Write-Verbose 'System.Net.Http preloaded' }
 
 function Test-AllowedDownloadHost {
-    <# Redirect targets for release assets. HTTPS only (test mode may pass -AllowHttp for 127.0.0.1). #>
+    <# Every hop of a request (including redirects): HTTPS only, exact host allow-list (-AllowHttp admits loopback for in-process tests only). #>
     [CmdletBinding()]
     [OutputType([bool])]
     param([Parameter(Mandatory)][uri]$Uri, [switch]$AllowHttp)
     if ($Uri.Scheme -ne 'https' -and -not ($AllowHttp -and $Uri.Scheme -eq 'http')) { return $false }
     $h = $Uri.Host.ToLowerInvariant()
     if ($AllowHttp -and ($h -eq '127.0.0.1' -or $h -eq 'localhost')) { return $true }
-    foreach ($ok in @('github.com', 'api.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'github-releases.githubusercontent.com')) {
+    foreach ($ok in @('github.com', 'api.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')) {
         if ($h -eq $ok) { return $true }
     }
     return $false
@@ -22,9 +22,10 @@ function Test-AllowedDownloadHost {
 
 function Invoke-UpdHttp {
     <#
-      Single HTTP GET. Returns @{Status;Headers(hashtable, lower-case keys);Body|FilePath;Bytes;FinalUri}.
-      -OutFile streams to disk with a hard byte cap. Never throws on HTTP status codes (caller decides);
-      throws on transport errors. Tests mock this function.
+      Single logical HTTP GET with MANUAL redirect handling: every hop (including the first request) must pass
+      Test-AllowedDownloadHost before it is contacted; at most 5 hops. Returns @{Status;Headers(lower-case keys);Body|FilePath;Bytes;FinalUri}.
+      -OutFile streams to disk with a hard byte cap. A body shorter than Content-Length, or different from -ExpectedSize, throws
+      (truncated download). Never throws on HTTP status codes (caller decides); throws on transport errors.
     #>
     [CmdletBinding()]
     param(
@@ -32,43 +33,51 @@ function Invoke-UpdHttp {
         [hashtable]$Headers = @{},
         [string]$OutFile,
         [long]$MaxBytes = 5MB,
+        [long]$ExpectedSize = -1,
         [int]$TimeoutSec = 60,
         [switch]$AllowHttp
     )
-    $u = [uri]$Uri
-    if ($u.Scheme -ne 'https' -and -not ($AllowHttp -and $u.Scheme -eq 'http')) { throw 'refusing non-https uri' }
     $handler = New-Object System.Net.Http.HttpClientHandler
-    $handler.AllowAutoRedirect = $true
-    $handler.MaxAutomaticRedirections = 5
+    $handler.AllowAutoRedirect = $false
     $client = New-Object System.Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
     try {
-        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $u)
-        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'MoonlightPatchUpdater/1')
-        foreach ($k in $Headers.Keys) { [void]$req.Headers.TryAddWithoutValidation([string]$k, [string]$Headers[$k]) }
-        $resp = $client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $u = [uri]$Uri
+        $resp = $null
+        for ($hop = 0; $hop -le 5; $hop++) {
+            if (-not (Test-AllowedDownloadHost -Uri $u -AllowHttp:$AllowHttp)) { throw "request to disallowed host or scheme (hop $hop)" }
+            $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $u)
+            [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'MoonlightPatchUpdater/1')
+            foreach ($k in $Headers.Keys) { [void]$req.Headers.TryAddWithoutValidation([string]$k, [string]$Headers[$k]) }
+            if ($null -ne $resp) { $resp.Dispose() }
+            $resp = $client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $code = [int]$resp.StatusCode
+            if ($code -ge 300 -and $code -lt 400 -and $code -ne 304 -and $null -ne $resp.Headers.Location) {
+                if ($hop -ge 5) { throw 'too many redirects' }
+                $u = New-Object System.Uri($u, $resp.Headers.Location)
+                continue
+            }
+            break
+        }
         try {
-            $final = $resp.RequestMessage.RequestUri
-            if (-not (Test-AllowedDownloadHost -Uri $final -AllowHttp:$AllowHttp)) { throw "redirect to disallowed host" }
             $h = @{}
             foreach ($hh in $resp.Headers) { $h[$hh.Key.ToLowerInvariant()] = ($hh.Value -join ',') }
             foreach ($hh in $resp.Content.Headers) { $h[$hh.Key.ToLowerInvariant()] = ($hh.Value -join ',') }
-            $result = @{ Status = [int]$resp.StatusCode; Headers = $h; FinalUri = $final.AbsoluteUri; Body = $null; FilePath = $null; Bytes = 0 }
+            $result = @{ Status = [int]$resp.StatusCode; Headers = $h; FinalUri = $u.AbsoluteUri; Body = $null; FilePath = $null; Bytes = 0 }
             $len = $resp.Content.Headers.ContentLength
             if ($null -ne $len -and $len -gt $MaxBytes) { throw "response too large ($len > $MaxBytes)" }
             $stream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             try {
+                $total = 0L
                 if ($OutFile) {
                     $fs = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
                     try {
                         $buf = New-Object byte[] 81920
-                        $total = 0L
                         while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
                             $total += $n
                             if ($total -gt $MaxBytes) { throw "download exceeds cap $MaxBytes" }
                             $fs.Write($buf, 0, $n)
                         }
-                        $result.Bytes = $total
                     } finally { $fs.Dispose() }
                     $result.FilePath = $OutFile
                 } else {
@@ -79,9 +88,14 @@ function Invoke-UpdHttp {
                             if ($ms.Length + $n -gt $MaxBytes) { throw "response exceeds cap $MaxBytes" }
                             $ms.Write($buf, 0, $n)
                         }
-                        $result.Bytes = $ms.Length
+                        $total = $ms.Length
                         $result.Body = (New-Object System.Text.UTF8Encoding($false)).GetString($ms.ToArray())
                     } finally { $ms.Dispose() }
+                }
+                $result.Bytes = $total
+                if ($result.Status -eq 200) {
+                    if ($null -ne $len -and $total -ne $len) { throw "truncated download ($total of $len bytes)" }
+                    if ($ExpectedSize -ge 0 -and $total -ne $ExpectedSize) { throw "download size $total differs from expected $ExpectedSize" }
                 }
             } finally { $stream.Dispose() }
             return $result
@@ -118,7 +132,7 @@ function Invoke-UpdApi {
     $allowHttp = ($Config.ContainsKey('allow_http') -and $Config['allow_http'] -eq $true)
     $r = Invoke-UpdHttp -Uri ($Config['api_base'].TrimEnd('/') + $Path) -Headers $h -MaxBytes $MaxBytes -AllowHttp:$allowHttp
     $rl = Get-RateLimitState -Headers $r.Headers
-    if ($r.Status -eq 429 -or ($r.Status -eq 403 -and $null -ne $rl.Remaining -and $rl.Remaining -le 0)) {
+    if ($r.Status -eq 429 -or ($r.Status -eq 403 -and (($null -ne $rl.Remaining -and $rl.Remaining -le 0) -or $null -ne $rl.RetryAfter))) {
         $e = New-Object System.Exception('GitHub API rate limit reached')
         $e.Data['RateLimited'] = $true
         if ($null -ne $rl.ResetUtc) { $e.Data['ResetUtc'] = $rl.ResetUtc.ToString('o') }
@@ -126,10 +140,12 @@ function Invoke-UpdApi {
     }
     $et = $null
     if ($r.Headers.ContainsKey('etag')) { $et = $r.Headers['etag'] }
-    if ($r.Status -eq 304) { return @{ Status = 304; Json = $null; Etag = $Etag; RateLimit = $rl; Raw = $null } }
+    $sd = $null
+    if ($r.Headers.ContainsKey('date')) { $t = [datetime]::MinValue; if ([datetime]::TryParse($r.Headers['date'], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)) { $sd = $t } }
+    if ($r.Status -eq 304) { return @{ Status = 304; Json = $null; Etag = $Etag; RateLimit = $rl; Raw = $null; ServerDate = $sd } }
     if ($r.Status -ne 200) { throw ("GitHub API returned HTTP {0} for {1}" -f $r.Status, $Path) }
     try { $j = $r.Body | ConvertFrom-Json } catch { throw 'GitHub API returned invalid JSON' }
-    return @{ Status = 200; Json = $j; Etag = $et; RateLimit = $rl; Raw = $r.Body }
+    return @{ Status = 200; Json = $j; Etag = $et; RateLimit = $rl; Raw = $r.Body; ServerDate = $sd }
 }
 
 function Get-UpdReleases {
@@ -144,11 +160,11 @@ function Get-UpdReleases {
     $r = Invoke-UpdApi -Config $Config -Path ("/repos/{0}/releases?per_page=30" -f $Config['repo']) -Etag $etag
     if ($r.Status -eq 304) {
         $json = [System.IO.File]::ReadAllText($cacheFile) | ConvertFrom-Json
-        return @{ Releases = @($json); FromCache = $true; Etag = $etag; RateLimit = $r.RateLimit }
+        return @{ Releases = @($json); FromCache = $true; Etag = $etag; RateLimit = $r.RateLimit; ServerDate = $r.ServerDate }
     }
     [System.IO.File]::WriteAllText($cacheFile, $r.Raw, (New-Object System.Text.UTF8Encoding($false)))
     $State.etag_releases = $r.Etag
-    return @{ Releases = @($r.Json); FromCache = $false; Etag = $r.Etag; RateLimit = $r.RateLimit }
+    return @{ Releases = @($r.Json); FromCache = $false; Etag = $r.Etag; RateLimit = $r.RateLimit; ServerDate = $r.ServerDate }
 }
 
 function Get-UpdPolicy {
@@ -216,7 +232,7 @@ function Get-ReleaseAssetMap {
     foreach ($a in @($Release.assets)) {
         if ($null -eq $a) { continue }
         $n = [string]$a.name
-        if (-not (Test-UpdRegex $n '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')) { continue }
+        if (-not (Test-SafeAssetName -Name $n)) { continue }
         $digest = $null
         if ($a.PSObject.Properties.Name -contains 'digest' -and $null -ne $a.digest) { $digest = [string]$a.digest }
         $size = 0L
@@ -229,7 +245,8 @@ function Get-ReleaseAssetMap {
 function Save-ReleaseAsset {
     <#
       Downloads one asset into the per-run dir. The URL is CONSTRUCTED from the validated repo, tag and
-      asset name (never taken from API-provided URLs). Redirect hosts are allow-listed. Hard size cap.
+      asset name (never taken from API-provided URLs). Every redirect hop is checked against the host allow-list.
+      Hard size cap; -ExpectedSize (manifest / API size) and Content-Length are enforced (truncation => throw).
     #>
     [CmdletBinding()]
     param(
@@ -237,16 +254,23 @@ function Save-ReleaseAsset {
         [Parameter(Mandatory)][string]$Tag,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$RunDir,
-        [long]$MaxBytes = 5MB
+        [long]$MaxBytes = 5MB,
+        [long]$ExpectedSize = -1,
+        [int]$TimeoutSec = 120
     )
     if (-not (Test-MoonlightTag -Tag $Tag)) { throw 'download: invalid tag' }
-    if (-not (Test-UpdRegex $Name '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')) { throw 'download: invalid asset name' }
+    if (-not (Test-SafeAssetName -Name $Name)) { throw 'download: invalid asset name' }
     $dest = Join-Path $RunDir $Name
     $fullRun = [System.IO.Path]::GetFullPath($RunDir)
     if (-not ([System.IO.Path]::GetFullPath($dest)).StartsWith($fullRun, [StringComparison]::OrdinalIgnoreCase)) { throw 'download: path escape' }
     $uri = '{0}/{1}/releases/download/{2}/{3}' -f $Config['download_base'].TrimEnd('/'), $Config['repo'], $Tag, $Name
     $allowHttp = ($Config.ContainsKey('allow_http') -and $Config['allow_http'] -eq $true)
-    $r = Invoke-UpdHttp -Uri $uri -OutFile $dest -MaxBytes $MaxBytes -TimeoutSec 600 -AllowHttp:$allowHttp
+    try {
+        $r = Invoke-UpdHttp -Uri $uri -OutFile $dest -MaxBytes $MaxBytes -ExpectedSize $ExpectedSize -TimeoutSec $TimeoutSec -AllowHttp:$allowHttp
+    } catch {
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        throw
+    }
     if ($r.Status -ne 200) {
         Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
         throw ("download of {0} failed with HTTP {1}" -f $Name, $r.Status)

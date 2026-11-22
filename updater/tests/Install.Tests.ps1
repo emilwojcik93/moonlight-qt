@@ -265,3 +265,65 @@ Describe 'Bundle store (keep 2) and rollback' {
         (Get-Content $env:FAKE_STATE -Raw).Trim() | Should -Not -Be '60100'
     }
 }
+
+Describe 'Process tree kill, Windows Installer idle wait, rollback idle checks (P2-1, P2-4)' {
+    BeforeEach { $script:w = New-TestRoot; $env:FAKE_STATE = Join-Path $script:w 'state.txt' }
+    AfterEach {
+        Remove-Item Env:\FAKE_STATE, Env:\FAKE_REFUSE_DOWNGRADE -ErrorAction SilentlyContinue
+        Get-Process -Name 'MlHang' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:w -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Invoke-UpdProcess on timeout kills the whole tree (a Burn-style child and grandchild) and reports TreeGone' {
+        $src = @'
+using System; using System.Diagnostics; using System.Threading;
+class P { static int Main(string[] a) {
+  if (a.Length > 0 && a[0] == "child") { if (a.Length < 2) Process.Start(new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "child grandchild") { UseShellExecute = false, CreateNoWindow = true }); Thread.Sleep(60000); return 0; }
+  Process.Start(new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "child") { UseShellExecute = false, CreateNoWindow = true });
+  Thread.Sleep(60000); return 0; } }
+'@
+        [IO.File]::WriteAllText((Join-Path $script:w 'h.cs'), $src)
+        $exe = Join-Path $script:w 'MlHang.exe'
+        & (Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe') /nologo /target:exe "/out:$exe" (Join-Path $script:w 'h.cs') | Out-Null
+        $r = Invoke-UpdProcess -FilePath $exe -ArgumentList @('/install') -TimeoutSec 3
+        $r.TimedOut | Should -BeTrue
+        $r.TreeGone | Should -BeTrue
+        Start-Sleep -Milliseconds 500
+        @(Get-Process -Name 'MlHang' -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+    It 'Get-ProcessDescendantId finds children and grandchildren' {
+        $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c ping -n 20 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
+        try {
+            Start-Sleep -Milliseconds 800
+            @(Get-ProcessDescendantId -RootPid $p.Id).Count | Should -BeGreaterThan 0
+        } finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Get-Process -Name ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+    }
+    It 'Wait-MsiIdle: becomes idle when the probe frees up, gives up when it never does' {
+        $script:n = 0
+        (Wait-MsiIdle -TimeoutSec 10 -Probe { $script:n++; return ($script:n -lt 2) }) | Should -BeTrue
+        (Wait-MsiIdle -TimeoutSec 1 -Probe { $true }) | Should -BeFalse
+    }
+    It 'Test-MsiBusy is $false when no Windows Installer transaction holds the mutex' {
+        Test-MsiBusy | Should -BeFalse
+    }
+    It 'rollback refuses to touch anything when Moonlight is running (IdleCheck false)' {
+        $prev = New-DummyBundle $script:w 'prev' 60100; $bad = New-DummyBundle $script:w 'bad' 60202
+        Set-Content $env:FAKE_STATE 60202
+        $res = Invoke-MoonlightRollback -Previous ([pscustomobject]@{ Name = 'installed-60100'; Path = $prev.Exe; Sha256 = $prev.Sha; Build = 60100 }) `
+            -FailedBundlePath $bad.Exe -FailedSha256 $bad.Sha -RunDir $script:w -GetVersion { '6.2.60202.0' } -IdleCheck { $false }
+        $res.Ok | Should -BeFalse; $res.Method | Should -Be 'moonlight-running'
+        (Get-Content $env:FAKE_STATE -Raw).Trim() | Should -Be '60202'
+        Test-Path (Join-Path $prev.Dir 'args.txt') | Should -BeFalse
+    }
+    It 'rollback stops before the uninstall step when Moonlight starts between the two attempts' {
+        $env:FAKE_REFUSE_DOWNGRADE = '1'
+        $prev = New-DummyBundle $script:w 'prev' 60100; $bad = New-DummyBundle $script:w 'bad' 60202
+        Set-Content $env:FAKE_STATE 60202
+        $script:idleCalls = 0
+        $res = Invoke-MoonlightRollback -Previous ([pscustomobject]@{ Name = 'installed-60100'; Path = $prev.Exe; Sha256 = $prev.Sha; Build = 60100 }) `
+            -FailedBundlePath $bad.Exe -FailedSha256 $bad.Sha -RunDir $script:w -GetVersion { '6.2.{0}.0' -f (Get-Content $env:FAKE_STATE -Raw).Trim() } -IdleCheck { $script:idleCalls++; return ($script:idleCalls -lt 2) }
+        $res.Ok | Should -BeFalse; $res.Method | Should -Be 'moonlight-running'
+        (Get-Content $env:FAKE_STATE -Raw).Trim() | Should -Be '60202'        # the (failed but working) new version was NOT uninstalled
+        Test-Path (Join-Path $bad.Dir 'args.txt') | Should -BeFalse
+    }
+}

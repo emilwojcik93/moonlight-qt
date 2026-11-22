@@ -53,10 +53,10 @@ function Find-AclViolation {
 }
 
 function Test-UpdAclSafe {
-    <# Checks a file or directory (and for directories its immediate children files) via Get-Acl. #>
+    <# Checks a file or directory via Get-Acl: for directories their files and (to -Depth levels) sub-directories, including reparse points. #>
     [CmdletBinding()]
     [OutputType([string[]])]
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [int]$Depth = 3)
     $all = New-Object System.Collections.Generic.List[string]
     if (-not (Test-Path -LiteralPath $Path)) { $all.Add("$Path does not exist"); return , @($all.ToArray()) }
     $item = Get-Item -LiteralPath $Path -Force
@@ -68,6 +68,11 @@ function Test-UpdAclSafe {
     if ($item.PSIsContainer) {
         foreach ($f in (Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction SilentlyContinue)) {
             foreach ($x in (Find-AclViolation -Security (Get-Acl -LiteralPath $f.FullName) -Label $f.FullName)) { $all.Add($x) }
+        }
+        if ($Depth -gt 0) {
+            foreach ($dch in (Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue)) {
+                foreach ($x in (Test-UpdAclSafe -Path $dch.FullName -Depth ($Depth - 1))) { $all.Add($x) }
+            }
         }
     }
     return , @($all.ToArray())
@@ -142,14 +147,18 @@ function New-UpdRunDirectory {
 }
 
 function Remove-OldRunDirectories {
+    <# Keeps the newest -KeepLast run dirs (names sort by UTC timestamp) plus -Except; everything else is removed. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$DataDir, [int]$KeepDays = 7, [string]$Except = '')
+    param([Parameter(Mandatory)][string]$DataDir, [int]$KeepLast = 3, [string]$Except = '')
     $updates = Join-Path $DataDir 'updates'
     if (-not (Test-Path -LiteralPath $updates)) { return }
-    $cut = (Get-Date).AddDays(-$KeepDays)
-    foreach ($d in (Get-ChildItem -LiteralPath $updates -Directory -ErrorAction SilentlyContinue)) {
-        if ($d.FullName -eq $Except) { continue }
-        if ($d.LastWriteTime -lt $cut) { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    $dirs = @(Get-ChildItem -LiteralPath $updates -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    $i = 0
+    foreach ($d in $dirs) {
+        if ($d.FullName -eq $Except) { $i++; continue }
+        $i++
+        if ($i -le $KeepLast) { continue }
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

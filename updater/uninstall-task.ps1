@@ -18,7 +18,7 @@ $TaskPath = '\MoonlightPatch\'
 $TaskName = 'Update'
 
 $plan = New-Object System.Collections.Generic.List[string]
-$plan.Add("1. Unregister scheduled task $TaskPath$TaskName (if present).")
+$plan.Add("1. Unregister scheduled task $TaskPath$TaskName (if present) and delete the then-empty task folder $TaskPath.")
 if ($RemoveFiles) { $plan.Add("2. Delete directory $ProgramDir recursively.") } else { $plan.Add("2. Keep $ProgramDir.") }
 if ($RemoveData) { $plan.Add("3. Delete directory $DataDir recursively (logs, state.json, stored bundles, DPAPI secrets).") } else { $plan.Add("3. Keep $DataDir.") }
 $plan.Add('4. Moonlight, its settings and its registry key are not touched.')
@@ -34,5 +34,10 @@ if (-not $PSCmdlet.ShouldProcess("$TaskPath$TaskName", 'unregister')) { return }
 
 $t = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
 if ($t) { Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false; Write-Output 'task unregistered' } else { Write-Output 'task not present' }
+try {
+    $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect()
+    $folder = $svc.GetFolder('\MoonlightPatch')
+    if ($folder.GetTasks(1).Count -eq 0) { $svc.GetFolder('').DeleteFolder('MoonlightPatch', 0); Write-Output 'removed empty task folder' }
+} catch { Write-Verbose 'task folder not present or not empty' }
 if ($RemoveFiles -and (Test-Path -LiteralPath $ProgramDir)) { Remove-Item -LiteralPath $ProgramDir -Recurse -Force; Write-Output "removed $ProgramDir" }
 if ($RemoveData -and (Test-Path -LiteralPath $DataDir)) { Remove-Item -LiteralPath $DataDir -Recurse -Force; Write-Output "removed $DataDir" }

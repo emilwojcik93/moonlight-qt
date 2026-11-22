@@ -80,6 +80,12 @@ Describe 'YAML subset + policy' {
         Get-EffectiveCoolingOffHours -LocalHours 0 -Policy $pol -Channel canary | Should -Be 6
         Get-EffectiveCoolingOffHours -LocalHours 12 -Policy $pol -Channel canary | Should -Be 12
     }
+    It 'min_cooling_off_hours clamps a policy value of 0 (canary) up to the floor' {
+        $pol = New-DefaultPolicy -Canary 0
+        Get-EffectiveCoolingOffHours -LocalHours 0 -Policy $pol -Channel canary -MinHours 2 | Should -Be 2
+        Get-EffectiveCoolingOffHours -LocalHours 0 -Policy $pol -Channel canary -MinHours 0 | Should -Be 0
+        Get-EffectiveCoolingOffHours -LocalHours 5 -Policy $pol -Channel canary -MinHours 2 | Should -Be 5
+    }
 }
 
 Describe 'Config' {
@@ -105,25 +111,31 @@ Describe 'Config' {
         $Json | Set-Content -LiteralPath (Join-Path $script:d.Prog 'config.json')
         { Read-UpdConfig -ProgramDir $script:d.Prog } | Should -Throw
     }
-    It 'test-only key <Key> is refused without the flag file (env vars never enable it)' -ForEach @(
+    It 'unknown / override key <Key> is refused: config.json cannot inject paths, URLs or executables' -ForEach @(
         @{ Key = 'api_base'; Val = '"http://127.0.0.1:1"' }, @{ Key = 'download_base'; Val = '"http://127.0.0.1:1"' },
-        @{ Key = 'gh_path'; Val = '"C:\\x\\gh.exe"' }, @{ Key = 'allow_http'; Val = 'true' }, @{ Key = 'skip_acl_check'; Val = 'true' }, @{ Key = 'data_dir'; Val = '"C:\\x"' }
+        @{ Key = 'gh_path'; Val = '"C:\\x\\gh.exe"' }, @{ Key = 'allow_http'; Val = 'true' }, @{ Key = 'skip_acl_check'; Val = 'true' },
+        @{ Key = 'data_dir'; Val = '"C:\\x"' }, @{ Key = 'test_mode'; Val = 'true' }
     ) {
-        $env:MLU_TEST_MODE = '1'; $env:TEST_MODE = '1'
+        '' | Set-Content -LiteralPath (Join-Path $script:d.Prog 'test-mode.flag')       # a stale flag file has no effect either
+        $env:MLU_TEST_MODE = '1'
         try {
             ('{"' + $Key + '":' + $Val + '}') | Set-Content -LiteralPath (Join-Path $script:d.Prog 'config.json')
-            { Read-UpdConfig -ProgramDir $script:d.Prog } | Should -Throw '*test-mode*'
-        } finally { Remove-Item Env:\MLU_TEST_MODE, Env:\TEST_MODE -ErrorAction SilentlyContinue }
+            { Read-UpdConfig -ProgramDir $script:d.Prog } | Should -Throw '*unknown config key*'
+        } finally { Remove-Item Env:\MLU_TEST_MODE -ErrorAction SilentlyContinue }
     }
-    It 'test-only keys are honoured when the flag file exists' {
-        '' | Set-Content -LiteralPath (Join-Path $script:d.Prog 'test-mode.flag')
-        '{"api_base":"http://127.0.0.1:8123","download_base":"http://127.0.0.1:8123","allow_http":true}' | Set-Content -LiteralPath (Join-Path $script:d.Prog 'config.json')
+    It 'the returned config always carries the hard-coded endpoints' {
         $c = Read-UpdConfig -ProgramDir $script:d.Prog
-        $c['api_base'] | Should -Be 'http://127.0.0.1:8123'; $c['test_mode'] | Should -BeTrue
+        $c['api_base'] | Should -Be 'https://api.github.com'; $c['download_base'] | Should -Be 'https://github.com'
+        $c.ContainsKey('test_mode') | Should -BeFalse
     }
-    It 'http api_base needs allow_http even in test mode' {
-        '' | Set-Content -LiteralPath (Join-Path $script:d.Prog 'test-mode.flag')
-        '{"api_base":"http://127.0.0.1:8123"}' | Set-Content -LiteralPath (Join-Path $script:d.Prog 'config.json')
+    It 'new keys: local cooling-off floor 2 h, allow_no_baseline false, owner floor' {
+        $c = Read-UpdConfig -ProgramDir $script:d.Prog
+        $c['min_cooling_off_hours'] | Should -Be 2; $c['allow_no_baseline'] | Should -BeFalse; $c['upstream_owners'] | Should -Contain 'Nonary'
+    }
+    It 'rejects bad values for the new keys' -ForEach @(
+        @{ Json = '{"min_cooling_off_hours":-1}' }, @{ Json = '{"allow_no_baseline":"yes"}' }, @{ Json = '{"upstream_owners":[]}' }, @{ Json = '{"upstream_owners":["a b"]}' }
+    ) {
+        $Json | Set-Content -LiteralPath (Join-Path $script:d.Prog 'config.json')
         { Read-UpdConfig -ProgramDir $script:d.Prog } | Should -Throw
     }
     It 'command-line mode override can only narrow' {
@@ -146,6 +158,32 @@ Describe 'State' {
         $s2 = Read-UpdState -DataDir $script:d.Data
         Test-LocallyDenied -State $s2 -Tag 'v6.2.0-daily.202-vp.1' | Should -BeTrue
         Test-LocallyDenied -State $s2 -Tag 'v6.2.0-daily.203-vp.1' | Should -BeFalse
+    }
+    It 'attempt records: exponential backoff, counters, clear' {
+        $s = New-UpdState
+        $t0 = [datetime]::Parse('2026-11-22T10:00:00Z').ToUniversalTime()
+        $r = Set-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1' -Kind transient -NowUtc $t0
+        $r.transient | Should -Be 1
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.202-vp.1' -NowUtc $t0.AddMinutes(10) | Should -BeTrue
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.202-vp.1' -NowUtc $t0.AddMinutes(16) | Should -BeFalse
+        $r = Set-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1' -Kind transient -NowUtc $t0
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.202-vp.1' -NowUtc $t0.AddMinutes(29) | Should -BeTrue     # 30 min for the 2nd
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.202-vp.1' -NowUtc $t0.AddMinutes(31) | Should -BeFalse
+        $null = Set-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1' -Kind install -NowUtc $t0
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.202-vp.1' -NowUtc $t0.AddMinutes(59) | Should -BeTrue     # install failures wait 1 h
+        (Get-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1').failures | Should -Be 1
+        Test-AttemptBackoff -State $s -Tag 'v6.2.0-daily.203-vp.1' -NowUtc $t0 | Should -BeFalse
+        Clear-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1'
+        (Get-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1').transient | Should -Be 0
+    }
+    It 'attempt records survive the JSON round trip' {
+        $d = New-TestDirs
+        try {
+            $s = Read-UpdState -DataDir $d.Data
+            $null = Set-AttemptRecord -State $s -Tag 'v6.2.0-daily.202-vp.1' -Kind verify -NowUtc ([datetime]::UtcNow)
+            Save-UpdState -DataDir $d.Data -State $s
+            (Get-AttemptRecord -State (Read-UpdState -DataDir $d.Data) -Tag 'v6.2.0-daily.202-vp.1').verify_failures | Should -Be 1
+        } finally { Remove-Item -LiteralPath $d.Root -Recurse -Force -ErrorAction SilentlyContinue }
     }
     It 'survives a corrupt state file' {
         'garbage{' | Set-Content -LiteralPath (Join-Path $script:d.Data 'state.json')

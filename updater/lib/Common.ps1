@@ -14,7 +14,7 @@ $script:UpdConst = @{
     MoonlightExe     = 'C:\Program Files\Moonlight Game Streaming\Moonlight.exe'
     MoonlightProcess = 'Moonlight'
     HkcuSubPath      = 'Software\Moonlight Game Streaming Project\Moonlight'
-    TagRegex         = '^v6\.2\.0-daily\.[0-9]{1,5}-vp\.[0-9]{1,3}$'
+    TagRegex         = '^v6\.2\.0-daily\.[1-9][0-9]{0,4}-vp\.[1-9][0-9]{0,2}$'
     DefaultRepo      = 'emilwojcik93/moonlight-qt'
     DefaultApiBase   = 'https://api.github.com'
     DefaultDlBase    = 'https://github.com'
@@ -42,6 +42,18 @@ function Test-UpdRegex {
     # -cmatch: case sensitive; anchors in the patterns are the validation. Use [regex]::IsMatch so that
     # a trailing newline cannot sneak past '$' (RegexOptions.None, '$' matches before a final \n!).
     return [regex]::IsMatch($Value, $Pattern) -and ($Value -notmatch "[\r\n]")
+}
+
+function Test-SafeAssetName {
+    <# File name from an untrusted source: anchored regex, no Windows reserved device names (CON, NUL, COM1, ...), no trailing dot. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][string]$Name, [string]$Pattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+    if (-not (Test-UpdRegex -Value $Name -Pattern $Pattern)) { return $false }
+    $stem = $Name.Split('.')[0]
+    if ($stem -match '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$') { return $false }
+    if ($Name.EndsWith('.')) { return $false }
+    return $true
 }
 
 function ConvertTo-SafeLogValue {

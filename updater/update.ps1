@@ -49,70 +49,23 @@ $libDir = Join-Path $ProgramDir 'lib'
 foreach ($p in @($ProgramDir, $libDir, $PSCommandPath) + @(Get-ChildItem -LiteralPath $libDir -File -Force | ForEach-Object { $_.FullName })) {
     $bootstrapBad += Test-UpdBootstrapAcl -Path $p
 }
-$testSkip = $false
 if ($bootstrapBad.Count -gt 0) {
-    # the only bypass: test-mode flag + config skip_acl_check, evaluated below AFTER libs load is NOT allowed,
-    # so the bypass is decided here from the flag file and config.json text only.
-    $flag = Join-Path $ProgramDir 'test-mode.flag'
-    if ((Test-Path -LiteralPath $flag) -and (Test-Path -LiteralPath (Join-Path $ProgramDir 'config.json'))) {
-        try { $tj = [System.IO.File]::ReadAllText((Join-Path $ProgramDir 'config.json')) | ConvertFrom-Json; if ($tj.PSObject.Properties.Name -contains 'skip_acl_check' -and $tj.skip_acl_check -eq $true) { $testSkip = $true } } catch { $testSkip = $false }
-    }
-    if (-not $testSkip) {
-        Write-Output ('MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=ACL self-check failed: ' + (($bootstrapBad | Select-Object -First 3) -join ' | '))
-        exit 2
-    }
+    Write-Output ('MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=ACL self-check failed: ' + (($bootstrapBad | Select-Object -First 3) -join ' | '))
+    exit 2
 }
 
 # ---- load libraries (order matters) --------------------------------------------------------------------
-foreach ($f in 'Common', 'Version', 'Yaml', 'Config', 'Security', 'GitHub', 'Verify', 'Install', 'Notify', 'Orchestrator', 'Snappy') {
+foreach ($f in 'Common', 'Version', 'Yaml', 'Config', 'Security', 'GitHub', 'Verify', 'Install', 'Notify', 'Orchestrator', 'Main', 'Snappy') {
     . (Join-Path $libDir ($f + '.ps1'))
 }
 
 $exitCode = $script:UpdExit.InternalError
-$mutex = $null
 try {
-    $cfg = $null
-    try { $cfg = Read-UpdConfig -ProgramDir $ProgramDir } catch {
-        Write-Output ('MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=config invalid: ' + (ConvertTo-SafeLogValue $_.Exception.Message 200))
-        exit $script:UpdExit.ConfigInvalid
-    }
-    $dataDir = $script:UpdConst.DataDir
-    if ($cfg.ContainsKey('data_dir')) { $dataDir = [string]$cfg['data_dir'] }
-    if (-not (Test-Path -LiteralPath $dataDir -PathType Container)) {
-        Write-Output 'MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=data dir missing (run install-task.ps1)'
-        exit $script:UpdExit.ConfigInvalid
-    }
-    Initialize-UpdLog -LogDir (Join-Path $dataDir 'logs') -Echo:$Echo
-
-    if (-not $testSkip -and -not ($cfg.ContainsKey('skip_acl_check') -and $cfg['skip_acl_check'] -eq $true)) {
-        try { Assert-UpdSelfAcl -ProgramDir $ProgramDir -DataDir $dataDir } catch {
-            Write-UpdLog -Level ERROR -Event 'acl_violation' -Data @{ message = $_.Exception.Message }
-            Write-Output ('MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=' + (ConvertTo-SafeLogValue $_.Exception.Message 300))
-            exit $script:UpdExit.AclViolation
-        }
-    } else {
-        Write-UpdLog -Level WARN -Event 'acl_check_skipped' -Data @{ reason = 'test-mode skip_acl_check' }
-    }
-
-    $mutex = Enter-UpdMutex
-    if ($null -eq $mutex) {
-        Write-UpdLog -Event 'already_running' -Data @{}
-        Write-Output 'MLUPD_RESULT=deferred MLUPD_TAG= MLUPD_DETAIL=another instance is running'
-        exit $script:UpdExit.AlreadyRunning
-    }
-
-    $deps = New-UpdDeps -Config $cfg -ProgramDir $ProgramDir
-    if ($cfg['test_mode'] -eq $true) {
-        # test mode only (flag file in the admin-only program dir): a non-admin sandbox user must keep access to the dirs it creates
-        $deps.AdditionalFullControlSids = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
-    }
-    $r = Invoke-MoonlightUpdate -ProgramDir $ProgramDir -DataDir $dataDir -Config $cfg -Deps $deps -ModeOverride $Mode -VerifyOnly:$VerifyOnly
-    Write-Output ('MLUPD_RESULT={0} MLUPD_TAG={1} MLUPD_DETAIL={2}' -f $r.Result, $r.Tag, (ConvertTo-SafeLogValue $r.Detail 200))
+    $r = Invoke-UpdaterMain -ProgramDir $ProgramDir -Mode $Mode -VerifyOnly:$VerifyOnly -Echo:$Echo
+    Write-Output $r.Line
     $exitCode = $r.ExitCode
 } catch {
     Write-Output ('MLUPD_RESULT=failed MLUPD_TAG= MLUPD_DETAIL=' + (ConvertTo-SafeLogValue $_.Exception.Message 200))
     $exitCode = $script:UpdExit.InternalError
-} finally {
-    if ($null -ne $mutex) { Exit-UpdMutex -Mutex $mutex }
 }
 exit $exitCode

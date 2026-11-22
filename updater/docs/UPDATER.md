@@ -1,28 +1,40 @@
 # Moonlight patch updater: design, operation, enablement
 
 Scope: Windows Client Engineer deliverable (PLAN tasks T-4.3 .. T-4.5) for the patched Moonlight feed. Binding inputs:
-CONTRACT.md (release feed v1), research/02 (client), research/04 (security). Gate G4 = you switch the task to install mode.
+CONTRACT.md (release feed v1 + v1.1 section 3b), research/02 (client), research/04 (security). Gate G4 = you switch the task to install mode.
 
 ## 1. What it does
 
 ```
 trigger (logon | daily 04:17 | every 6 h)  ->  SYSTEM  ->  powershell.exe update.ps1
   bootstrap ACL check of update.ps1 + lib\ (inline, before any lib code runs)          exit 2 on violation
-  config.json (validated, whitelist)  ->  data-dir self ACL check  ->  named mutex      exit 3 / 2 / 7
-  mode: hold -> stop.  install & Moonlight.exe running -> deferred (exit 0)
-  installed version: FileVersion 6.2.<60000+U> of Moonlight.exe  ->  key (U, N=0 | N from state.json)
+  config.json (strict whitelist, unknown key = invalid) -> data-dir ACL check -> named mutex      exit 3 / 2 / 7
+  mode: hold -> stop.   leftovers: reboot pending / presence check owed / rollback postponed
+  installed version: FileVersion 6.2.B of Moonlight.exe  ->  B = 60000 + 8*U + (N-1)  ->  (U,N)
+  idle check 1 (install mode): Moonlight.exe running -> deferred (exit 0)
   policy.yml from branch `automation`: branches API -> commit sha -> contents API ?ref=<sha>    fail closed (exit 3)
-  releases API (anonymous, ETag, rate-limit aware) -> tag regex -> newest-first candidates
-  per candidate: not denied (policy + local) -> key > installed -> MSI build number > installed -> age >= cooling-off
+  releases API (anonymous, ETag, rate-limit aware; GitHub server time guards the clock) -> canonical tag regex -> newest first
+  per candidate: not denied (policy + local) -> B > installed B -> age >= max(floor 2 h, local, policy) -> not in backoff
   report-only -> log "would install <tag>" and stop (no download)
-  release must be immutable (API flag) -> download manifest.json + SHA256SUMS + bundles + installer into a per-run dir
-  manifest schema/regex validation -> offline attestation verify of manifest, SHA256SUMS, installer (pinned flags)
-  SHA256: computed == SHA256SUMS == manifest == API digest      (-VerifyOnly stops here)
-  idle check again -> keep verified bundles -> install from the SAME file (deny-write handle + re-hash) -> health check
-  health ok -> state.json + prune bundles (keep 2) | health failed -> deny tag locally, rollback, notify
+  release must be immutable (API flag); ROLLBACK BASELINE must exist (else refuse, exit 3)
+  download manifest.json + SHA256SUMS + bundle(s) -> manifest checks -> attest manifest + SHA256SUMS (offline)
+  ONLY THEN download the installer (size == manifest == API) -> attest installer -> SHA256 == SUMS == manifest == API digest   (-VerifyOnly stops here)
+  idle check 2 -> presence before (needs the user hive, else postpone) -> keep verified bundle -> idle check 3 immediately before launch
+  install from the SAME file (deny-write handle + re-hash) -> classify exit code -> health check
+  ok -> state.json + prune bundles (keep 2) | genuinely failed -> wait (bounded) for Moonlight to close -> rollback -> count failure (deny after 2)
+  finally: prune run dirs (keep newest 3)
 ```
 
-Result line (stdout + log): `MLUPD_RESULT=<updated|noop|deferred|held|report-only|verified|verify_failed|rolled_back|failed> MLUPD_TAG=<tag> MLUPD_DETAIL=<text>`.
+Result line (stdout + log): `MLUPD_RESULT=<updated|noop|deferred|held|report-only|verified|verify_failed|pending_reboot|rolled_back|failed> MLUPD_TAG=<tag> MLUPD_DETAIL=<text>`.
+
+### Version scheme (CONTRACT v1.1 section 3b, exactly)
+`B = 60000 + 8*U + (N-1)`, N in 1..8, B <= 65535 (U <= 691). Tag `v6.2.0-daily.U-vp.N` (canonical: no leading zeros, N >= 1), manifest `build.version = 6.2.0-daily.B`, FileVersion `6.2.B.0`.
+Installed (U,N) = `((B-60000) div 8, ((B-60000) mod 8)+1)`, derived from the FileVersion alone; ordering is numeric on B. A legacy installed `6.2.60006` is not special-cased: it is numerically lower than every new build.
+Tags with N > 8 or B > 65535 are never candidates. `build.source_ref` must equal `refs/heads/build/v6.2.0-daily.<U>-n<N>` (derived from the tag, not trusted from the manifest).
+
+### Internal time budget (all below the task limit `ExecutionTimeLimit` = PT2H)
+API calls 3 x 60 s | small assets 3 x 120 s | installer download 600 s | `gh attestation verify` 3 x 180 s | installer run 600 s, then process-tree kill (<= 30 s) and Windows Installer idle wait (<= 120 s) |
+rollback up to 3 installer runs x (600 + 150) s | wait for Moonlight to close before a rollback: backoff 30 + 60 + 120 + 240 s. An install is only started when <= 75 min of the run have elapsed.
 
 ## 2. Files and permissions
 
@@ -30,7 +42,7 @@ Result line (stdout + log): `MLUPD_RESULT=<updated|noop|deferred|held|report-onl
 |---|---|---|
 | `C:\Program Files\MoonlightPatchUpdater\` | `update.ps1`, `lib\*.ps1`, `gh-pin.json`, `config.json`, `bin\gh.exe` | protected; owner Administrators; SYSTEM + Administrators full; nobody else |
 | `C:\ProgramData\MoonlightPatchUpdater\` | `logs\`, `updates\<run>\`, `bundles\`, `cache\`, `secrets\`, `gh-config\`, `state.json` | same |
-| scheduled task `\MoonlightPatch\Update` | SYSTEM, highest, triggers logon+3 min / daily / PT6H, `ExecutionTimeLimit` PT30M, IgnoreNew | |
+| scheduled task `\MoonlightPatch\Update` | SYSTEM, highest, triggers logon+3 min / daily / PT6H, `ExecutionTimeLimit` PT2H, IgnoreNew | |
 
 Self ACL check (R-CLW-1, AC-CLW-1): any Allow ACE with a write-type right (WriteData, AppendData, Delete, ChangePermissions,
 TakeOwnership, ...) for a principal other than SYSTEM / Administrators / TrustedInstaller / CREATOR OWNER, a non-admin owner, or a
@@ -43,16 +55,18 @@ reparse point, on the program dir, `lib\`, `bin\`, every file in them, the data 
 |---|---|---|
 | `mode` | `report-only` | `install` \| `report-only` \| `hold`. Command line `-Mode` can only narrow (install > report-only > hold) |
 | `channel` | `canary` | `canary` accepts pre-releases (the feed is all pre-release); `stable` ignores them |
-| `cooling_off_hours` | `0` | local floor; the policy value for the channel can raise it, never lower it |
+| `cooling_off_hours` | `0` | local value; effective cooling-off = max(`min_cooling_off_hours`, this, policy value of the channel) |
+| `min_cooling_off_hours` | `2` | local FLOOR: a policy value (canary `0`) is clamped up to it. The Owner lowers it locally by editing this file (admin-only), e.g. `0` for an immediate canary |
 | `repo` | `emilwojcik93/moonlight-qt` | feed |
 | `policy_branch` / `policy_path` | `automation` / `policy.yml` | policy source |
 | `signer_workflow` | `github.com/emilwojcik93/moonlight-qt/.github/workflows/patched-windows-release.yml` | pinned `--signer-workflow`; must live in `repo`. **Confirm against the real publish workflow name.** |
 | `verify_mode` | `offline` | `online` additionally runs `gh release verify` / `verify-asset` and needs a stored token (see 6) |
 | `notify_enabled` | `false` | Google Chat webhook (DPAPI blob must exist) |
 | `max_installer_mb` | `200` | download cap |
+| `allow_no_baseline` | `false` | install even when no rollback baseline (previous verified bundle or Package Cache bundle) exists. Not recommended |
+| `upstream_owners` | `["Nonary"]` | local owner floor: `manifest.upstream.owner` must be in this list AND in the policy list |
 
-Test-only keys (`api_base`, `download_base`, `allow_http`, `gh_path`, `data_dir`, `skip_acl_check`) are rejected unless the file
-`test-mode.flag` exists in the (admin-only) program dir. Environment variables never enable them. The flag file must not exist in production.
+**There is no test mode.** Any key outside this table (`api_base`, `gh_path`, `skip_acl_check`, `data_dir`, ...) makes `config.json` invalid (exit 3); a stale `test-mode.flag` has no effect (`install-task.ps1` deletes it). Paths, endpoints and executables are constants of the code; the test harness substitutes them in memory (config hashtable, dependency table, `Invoke-UpdaterMain` parameters), and none of that code path is reachable from `update.ps1` or a file on disk.
 
 Switches of `update.ps1`: `-Mode report-only|hold` (narrowing), `-VerifyOnly` (download and fully verify, install nothing, even when mode is install or report-only), `-Echo` (log lines on the console).
 
@@ -70,27 +84,40 @@ reads exactly that commit (cached per sha, so steady state costs only conditiona
 
 | CONTRACT step | implementation |
 |---|---|
-| 1 tag regex, key > installed, deny-list | `^v6\.2\.0-daily\.[0-9]{1,5}-vp\.[0-9]{1,3}$` anchored (newline-safe), key (U,N) numeric; policy `deny:` + local `state.json` deny; **plus** MSI build number must exceed installed (see 8.2) |
-| 2 age | `now - published_at >= max(local, policy[channel])`; an older release that is old enough is chosen when the newest is too young |
+| 1 tag regex, key > installed, deny-list | `^v6\.2\.0-daily\.[1-9][0-9]{0,4}-vp\.[1-9][0-9]{0,2}$` anchored (newline-safe, canonical: no aliases such as `0202`), build number B numeric > installed B; policy `deny:` (entries must be canonical tags) + local `state.json` deny |
+| 2 age | `now - published_at >= max(min_cooling_off_hours, cooling_off_hours, policy[channel])`; `now` is replaced by the GitHub `Date` header when the local clock differs by more than 5 min; an older release that is old enough is chosen when the newest is too young |
 | 3 `gh release verify[-asset]` | **cannot run unauthenticated (U3)**. Offline substitute: API `immutable == true` required; optional `verify_mode=online` with a stored token runs the real commands |
-| 4 download to admin-only per-run dir | URLs are constructed from validated repo/tag/name, HTTPS, redirect hosts allow-listed, byte caps, per-run dir with its own protected ACL |
-| 5 `gh attestation verify` | offline `--bundle` from the release asset named in the manifest: `--repo --signer-workflow --source-ref --deny-self-hosted-runners --format json`, plus `--source-digest <manifest.build.source_sha>` for SHA256SUMS and the installer. Manifest verified first so its `source_ref`/`source_sha` are authenticated. Allowed refs: `refs/heads/automation` or `refs/heads/build/<name>` |
+| 4 download to admin-only per-run dir | URLs are constructed from validated repo/tag/name (reserved device names rejected), HTTPS only, redirects followed manually and EVERY hop checked against `github.com`, `api.github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, byte caps, truncation detected (Content-Length and manifest/API size), per-run dir with its own protected ACL. Order: manifest, SHA256SUMS, bundle first; the installer only after the manifest and SUMS attestations passed |
+| 5 `gh attestation verify` | offline `--bundle` from the release asset named in the manifest: `--repo --signer-workflow --source-ref --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 --cert-oidc-issuer https://token.actions.githubusercontent.com --format json`, plus `--source-digest <manifest.build.source_sha>` for SHA256SUMS and the installer. The source ref is derived from the tag (`refs/heads/build/v6.2.0-daily.<U>-n<N>`); the manifest is verified first so `source_sha` is authenticated |
 | 6 SHA256 vs SHA256SUMS vs manifest | computed from the deny-write handle == SUMS == manifest == release API `digest` |
 | 7 install from the same verified file, health check, rollback | see below |
 
 Install (R-CLW-3): a `FileShare.Read` handle is held from before the attestation check until the run ends (nobody can write, delete or rename the file);
-the hash is recomputed through that handle immediately before launch; `MoonlightSetup.exe /install /quiet /norestart /log <run>\install.log`, 10 min timeout (process killed).
-Exit 0 and 3010 are success. Health: FileVersion build == `manifest.build.version` build; presence-only booleans (before vs after) of `uniqueid`, `hosts` subkey, `certificate`/`key` value names in the console user's hive.
+the hash is recomputed through that handle immediately before launch; `MoonlightSetup.exe /install /quiet /norestart /log <run>\install.log`, 600 s timeout.
+Moonlight.exe must be closed at three points: at the start of the run, after the downloads/presence check, and immediately before the launch (any hit => deferred, nothing started).
+The installer runs inside a job object: on timeout the WHOLE tree (Burn engine, msiexec children; job members plus a `Win32_Process` parent walk) is killed, the Windows Installer mutex (`Global\_MSIExecute`) is awaited,
+and only after the tree is gone is any decision taken. If the tree or the Windows Installer cannot be stopped: exit 6, NO rollback, no deny, notification (needs a human).
+
+Exit-code handling (P2-3): `0` success | `1618` (another install running) => deferred, no rollback, no deny, transient backoff | `3010` / `1641` with the target version present => success |
+`3010` / `1641` with the version unchanged => `pending_reboot` (state `pending_reboot`, no rollback, no deny, new bundle kept); the next runs wait until the machine has rebooted, then either resolve it (target version present => installed recorded) or treat it as a genuine failure |
+anything else, a wrong FileVersion after exit 0, or lost registry items => genuine failure: rollback, failure counter, **deny only after 2 consecutive real failures of the same tag** (1 h, then 2 h, ... backoff between attempts).
+Health: FileVersion build == `manifest.build.version` build; presence-only booleans (before vs after) of `uniqueid`, `hosts` subkey, `certificate`/`key` value names in the console user's hive.
+
+Backoff / counters (P2-6): per tag, `state.json` `attempts`: transient failures (network, download errors, gh timeouts, 1618) never deny, backoff 15 min x 2^(n-1) up to 6 h; verification failures (hash, attestation, manifest) back off the same way and deny after 3;
+install failures back off 1 h x 2^(n-1) and deny after 2. A completely verified release resets the transient/verify counters. Failed or aborted runs leave at most the newest 3 run directories.
 
 Presence-only registry check (R-CLW-4, T-4.4): SYSTEM has its own HKCU, so the console user is resolved (`Win32_ComputerSystem.UserName`, fallback owner of `explorer.exe`)
 and `HKU\<sid>\Software\Moonlight Game Streaming Project\Moonlight` is opened read-only with `GetValueNames()` / `GetSubKeyNames()` only. The code contains no `GetValue`,
 no `reg.exe`, no export; the Pester suite audits the AST for this and greps every log for `BEGIN PRIVATE KEY` / `BEGIN CERTIFICATE` (log values are also scrubbed:
-PEM markers, DER blobs, tokens, webhook URLs, control characters). If the user's hive is not loaded the check is `unknown` and not used for a decision.
+PEM markers, DER blobs, tokens, webhook URLs, control characters). **User hive not loaded (nobody logged on):** before the install the run is postponed (`deferred`, log `presence_unavailable`; the AtLogOn trigger retries) so an install never goes unchecked;
+if the hive disappears after the install, `verification_pending` is recorded (no rollback) and the check is repeated at the next run/logon; a late loss raises a `PRESENCE-LOST` notification.
 
-Rollback (R-CLW-5): the verified bundle of the version being replaced is kept (`bundles\<tag>` or `bundles\installed-<build>` copied from
-`C:\ProgramData\Package Cache\{7CA3BD1C-5B34-4D14-91A0-4277DD5E2063}\MoonlightSetup.exe` after an ACL check); at most 2 are kept. On failed health: the tag is added to the local deny list,
-the previous bundle is re-hashed (aborts if changed), installed over the failed version; if the version did not change (Burn/MSI blocks downgrades) the failed bundle is uninstalled first,
-then the previous one installed. Exit 5 (rolled back) or 6 (rollback failed: needs a human). Optional Google Chat notification (disabled by default).
+Rollback (R-CLW-5, P2-5): **a rollback baseline is mandatory.** Baseline = the verified bundle of the build installed now (`bundles\<tag>` / `bundles\installed-<build>`), or the existing Burn bundle
+`C:\ProgramData\Package Cache\{7CA3BD1C-5B34-4D14-91A0-4277DD5E2063}\MoonlightSetup.exe` copied into the data dir after an admin-only ACL check; it is re-hashed before anything is installed.
+No baseline => the update is refused before any download (exit 3, log `no_rollback_baseline`) unless `allow_no_baseline` is true. At most 2 bundles are kept.
+Rollback itself: Moonlight must be closed (bounded wait 30/60/120/240 s, then `rollback_pending` + alert `ROLLBACK-POSTPONED`, retried at the start of the next run); the previous bundle is re-hashed (abort if changed),
+installed over the failed version; if the version did not change (Burn/MSI blocks downgrades) the idle check is repeated, the failed bundle is uninstalled, then the previous one installed. Every installer step has its own tree-kill/idle guard.
+Exit 5 (rolled back) or 6 (rollback failed / postponed: needs a human). Optional Google Chat notification (disabled by default).
 
 ## 6. U3: unauthenticated `gh attestation verify` as SYSTEM (answered empirically)
 
@@ -121,29 +148,35 @@ exe sha256 `77437def...bcd69`, same bytes as the cli/cli release zip `8813a72c..
 a valid Authenticode signature by `GitHub, Inc.` (the machine exe is signed; checked). At every run `update.ps1` re-hashes `bin\gh.exe` against the pin before using it. Child environment: `GH_*`/`GITHUB_*` removed, `GH_CONFIG_DIR=<data>\gh-config`,
 no prompts. Bumping gh = new `gh-pin.json` via a reviewed commit and a re-run of `install-task.ps1`.
 
-## 8. Findings that need a decision from the Orchestrator (CONTRACT feasibility)
+## 8. CONTRACT findings (status)
 
-1. **CONTRACT 4.3 as written is infeasible for a token-less consumer** (section 6). Proposal: amend 4.3 to "release is immutable (API flag) AND, where a token is available, `gh release verify[-asset]`"; step 5 stays mandatory and offline.
-2. **Rebuilds of the same upstream daily cannot be installed.** `ci_version = 6.2.0-daily.(60000+U)` gives FileVersion `6.2.<60000+U>` for every `-vp.N` of the same U; MSI major upgrade ignores a same-version package. The updater therefore skips a candidate whose MSI build
-   number is not greater than the installed one (logged `same or lower MSI build number`) instead of reporting a fake success. Proposal for CI: encode N in the third field, e.g. `60000 + 8*U + (N-1)` (N <= 8; U up to ~694) or a monotonic counter as research/02 recommended; the updater reads the expected build only from the attested `manifest.build.version`
-   (one function, `ConvertTo-BuildNumber` in `lib/Version.ps1`, to change when the scheme changes).
-3. The `policy.yml` on branch `automation` today has no `schema`, `deny` or `allow_upstream_owners` (CONTRACT 5); the updater accepts the `upstream.owner_allowlist` shape and warns on the missing `deny:` key. Proposal: add `deny: []` (and `schema: 1`) so a deny entry can actually be written.
-4. The publish workflow file name (`signer_workflow`) and the manifest fields used here (`product`, `tag`, `upstream.owner`, `build.version|source_ref|source_sha`, `installer`, `assets[]`, `attestation[]`) must match what the CI engineer ships; subjects of the attestation must include the installer, `SHA256SUMS` and `manifest.json`.
+1. **CONTRACT 4.3 infeasible token-less**: resolved by CONTRACT v1.1 section 3b (offline mode = immutable flag + offline bundle; online mode with token). Implemented as `verify_mode`.
+2. **Rebuilds of the same upstream daily**: resolved by v1.1 3b (`B = 60000 + 8*U + (N-1)`), adopted exactly (section 1). N > 8 or B > 65535 is not installable and is dropped from the candidates.
+3. `policy.yml` on `automation`: the legacy `upstream.owner_allowlist` shape is still tolerated, an empty owner list is refused, a missing `deny:` key is a warning.
+4. Manifest fields consumed: `schema, product=moonlight, tag, upstream.owner, build.version|source_ref|source_sha, installer, assets[].name|sha256|size, attestation[]`; the bundle files must be release assets; attestation subjects must include the installer, `SHA256SUMS` and `manifest.json`; the signer workflow is `.github/workflows/patched-windows-release.yml`.
 5. Anonymous policy read uses two API calls (branch sha, then contents pinned to that sha) instead of "one authenticated call"; equivalent pinning, documented deviation.
+
+### Security Gate review (commit 25d05388): what was done
+All P1/P2 items were fixed (P1 scheme; P2-1 tree kill; P2-2 task limit PT2H + documented budget; P2-3 exit-code classes; P2-4 idle re-checks; P2-5 mandatory baseline; P2-6 order/backoff/pruning; P2-7 no test hooks; P2-8 hive; P2-9 2 h floor).
+P3 fixed: canonical tags (aliases rejected, also in deny lists), manual redirects with per-hop allow-list, truncation checks (Content-Length + expected size), GitHub server time vs local clock, directory recursion in the ACL check (junctions two levels down),
+secondary rate limits (Retry-After) defer, reserved device names rejected, explicit `--predicate-type` / `--cert-oidc-issuer`, source ref derived from the tag, local owner floor, `-SetMode install` refused on a fresh machine,
+the empty task folder is removed by `uninstall-task.ps1`, `-WhatIf` wording follows `-SetMode`. **Skipped** (residual): bounded reading of gh stdout/stderr and a wider env scrub for gh (P3-8), key-body scrubbing without PEM/`MII` prefix (P3-12; nothing logs registry data),
+a dead-man alert for the Ally (needs the webhook), making the ACL self-check preventive rather than detective (protection rests on the install-time DACL and the inline bootstrap check), Deny-ACE evaluation.
+The reviewer's negative tests are in `tests/QA.Negative.Tests.ps1` (attributed; formerly `Defect`-tagged tests now pass).
 
 ## 9. Exit codes
 
-0 ok (updated, noop, deferred, held, report-only, verified) | 1 internal error | 2 ACL violation | 3 config/policy invalid or unavailable (fail closed) | 4 verification failed (nothing installed) |
-5 install failed, rolled back | 6 install failed and rollback failed / impossible | 7 another instance running | 8 rate limit or network deferral. `MLUPD_RESULT` carries the symbolic result.
+0 ok (updated, noop, deferred, held, report-only, verified, pending_reboot) | 1 internal error | 2 ACL violation | 3 config/policy invalid or unavailable (fail closed) | 4 verification failed (nothing installed) |
+5 install failed, rolled back | 6 install failed and rollback failed / impossible / postponed, or installer could not be stopped | 7 another instance running | 8 rate limit or network deferral. `MLUPD_RESULT` carries the symbolic result.
 
 ## 10. Logs and state
 
-`C:\ProgramData\MoonlightPatchUpdater\logs\update-YYYY-MM-DD.log`: one line per event, `<utc> LEVEL run=<id> event=<name> key="value" ...`; files roll at 2 MB (`.1`) and are deleted after 30 days; per-run dirs older than 7 days are removed.
-`state.json`: installed `{tag,u,n,build,sha256}`, local deny list, ETags, last check / last success. `cache\`: release list, branch, policy per sha.
+`C:\ProgramData\MoonlightPatchUpdater\logs\update-YYYY-MM-DD.log`: one line per event, `<utc> LEVEL run=<id> event=<name> key="value" ...`; files roll at 2 MB (`.1`) and are deleted after 30 days; only the newest 3 per-run dirs are kept.
+`state.json`: installed `{tag,u,n,build,sha256}`, local deny list, per-tag `attempts`, `pending_reboot`, `verification_pending`, `rollback_pending`, ETags, last check / last success. `cache\`: release list, branch, policy per sha.
 
 ## 11. Enabling it (gate G4): exact steps
 
-Prerequisites (other roles): the feed has at least one immutable release with `manifest.json`, `SHA256SUMS`, `attestation.sigstore.json`; `signer_workflow` below equals the real publish workflow path; ideally `deny: []` exists in `policy.yml`.
+Prerequisites (other roles): CI publishes with the CONTRACT 3b build numbers; the feed has at least one immutable release with `manifest.json`, `SHA256SUMS`, `attestation.sigstore.json`; `signer_workflow` below equals the real publish workflow path; ideally `deny: []` exists in `policy.yml`.
 
 All commands from a normal PowerShell; elevation through gsudo (never `Start-Process -Verb RunAs`).
 
@@ -155,11 +188,13 @@ powershell -NoProfile -File .\install-task.ps1 -WhatIf
 gsudo powershell -NoProfile -ExecutionPolicy Bypass -File .\install-task.ps1
 # 3. if the CI publish workflow has another file name, edit signer_workflow
 gsudo notepad "C:\Program Files\MoonlightPatchUpdater\config.json"
-# 4. rehearsal as SYSTEM with Moonlight closed or open: selection only
+# 4. rehearsal as SYSTEM with Moonlight closed or open: selection only (needs a build number scheme 3b release newer than the installed 6.2.60006)
 gsudo -s powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\MoonlightPatchUpdater\update.ps1" -Echo
 #    expect MLUPD_RESULT=report-only (or noop). Then full download + verification, still no install:
 gsudo -s powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\MoonlightPatchUpdater\update.ps1" -Echo -VerifyOnly
 #    expect MLUPD_RESULT=verified; read C:\ProgramData\MoonlightPatchUpdater\logs\update-<date>.log (events attestation_ok, hash_ok)
+#    The rollback baseline is the existing Burn bundle in C:\ProgramData\Package Cache\{7CA3BD1C-...}; without it the install is refused (check: Test-Path that file, ACL admin-only write).
+#    Before enabling, consider the floor: min_cooling_off_hours defaults to 2 (a new release waits 2 h even if the policy says 0); lower it in config.json only deliberately.
 # 5. G4: switch to install
 gsudo powershell -NoProfile -ExecutionPolicy Bypass -File .\install-task.ps1 -SetMode install      # idempotent re-run, only mode changes
 # 6. first real install with Moonlight closed, watched:
@@ -169,12 +204,13 @@ gsudo -s powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Fil
 ```
 
 Optional: `-SetWebhook` (Google Chat alerts) and `-SetGhToken` (verify_mode=online) are prompts of `install-task.ps1`. Back out: `gsudo powershell -File .\uninstall-task.ps1 -RemoveFiles` (task and program dir; `-RemoveData` also removes logs/state/bundles). Hold at any time: set `"mode": "hold"` or `hold: true` in `policy.yml`.
-Not yet proven on a real feed: the Burn rollback path (uninstall + install previous) and SYSTEM-session execution of `MoonlightSetup.exe`; rehearse with T-4.6 on the first real update.
+Still to rehearse on the real feed (T-4.6): one watched install and one FORCED rollback (the Burn rollback path (uninstall + install previous), HKCU presence intact afterwards) and SYSTEM-session execution of `MoonlightSetup.exe`.
 
 ## 12. Tests
 
-`tests/*.Tests.ps1` (Pester 5): version/tag rules incl. malicious names, YAML/policy/config, ACL checks (synthetic and on the real file system, junctions), mutex, deny-write handle, command-line quoting and env scrubbing, snappy decoder,
-manifest/SHA256SUMS validation, presence-only registry check (throw-away `HKCU:\Software\MlUpdaterPesterTest` key), installer runner with a compiled stand-in exe (hash re-check, timeout, locked file), bundle store, rollback (both methods),
-the whole orchestrator with fake dependencies (every negative case: tampered byte, hash mismatch, attestation failure, downgrade, too young, deny-listed, Moonlight running, ACL violation, policy unavailable, rate limit, rollback), an end-to-end run
-against a loopback HTTP fixture (anonymous requests, policy pinned to the commit sha, ETag, real download and process runners, stand-in `gh` recording its flags, stand-in installer), `update.ps1` as a process, `-WhatIf` of the install/uninstall scripts,
-and network-tagged checks against a real attested artifact. The suite never registers the task, installs or uninstalls Moonlight, or reads the real Moonlight registry key.
+`tests/*.Tests.ps1` (Pester 5, 379 tests, Windows PowerShell 5.1): version/tag rules incl. malicious names, aliases and the 3b scheme, YAML/policy/config (no override keys), ACL checks (synthetic and on the real file system, junctions at any depth), mutex, deny-write handle,
+command-line quoting and env scrubbing, process-tree kill, snappy decoder, manifest/SHA256SUMS validation, presence-only registry check (throw-away `HKCU:\Software\MlUpdaterPesterTest` key), installer runner with a compiled stand-in exe (hash re-check, timeout, locked file),
+bundle store, rollback (both methods, idle guards), the whole orchestrator with fake dependencies (every negative case plus exit-code classes, pending reboot, postponed rollback, baseline, backoff/deny counters, hive unavailable, cooling-off floor, clock skew),
+an end-to-end run against a loopback HTTP fixture (anonymous requests, policy pinned to the commit sha, ETag, real download and process runners, stand-in `gh` recording its flags, stand-in installer, real rollback), `update.ps1` as a process (ACL exit 2; stale flag/env vars have no effect),
+`Invoke-UpdaterMain` in-process, `-WhatIf` of the install/uninstall scripts, the reviewer's negative suite, and network-tagged checks against a real attested artifact.
+The suite never registers the task, installs or uninstalls Moonlight, or reads the real Moonlight registry key.

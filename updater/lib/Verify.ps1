@@ -23,11 +23,73 @@ function ConvertTo-WinArg {
     return $sb.ToString()
 }
 
+if (-not ('MlUpdater.JobObject' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace MlUpdater {
+    public sealed class JobObject : IDisposable {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        IntPtr handle;
+        public JobObject() { handle = CreateJobObject(IntPtr.Zero, null); }
+        public bool Valid { get { return handle != IntPtr.Zero; } }
+        public bool Assign(IntPtr processHandle) { return handle != IntPtr.Zero && AssignProcessToJobObject(handle, processHandle); }
+        public bool Terminate() { return handle != IntPtr.Zero && TerminateJobObject(handle, 1); }
+        public void Dispose() { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
+    }
+}
+'@
+}
+
+function Get-ProcessDescendantId {
+    <# Parent walk over Win32_Process (snapshot). Returns the PIDs of all descendants of -RootPid. #>
+    [CmdletBinding()]
+    [OutputType([int[]])]
+    param([Parameter(Mandatory)][int]$RootPid)
+    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, ParentProcessId)
+    $found = New-Object System.Collections.Generic.List[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootPid)
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        foreach ($p in $all) {
+            if ($p.ParentProcessId -eq $cur -and $p.ProcessId -ne $cur -and -not $found.Contains([int]$p.ProcessId)) {
+                $found.Add([int]$p.ProcessId); $queue.Enqueue([int]$p.ProcessId)
+            }
+        }
+    }
+    return , @($found.ToArray())
+}
+
+function Stop-ProcessTree {
+    <# Kills the root, everything in its job object and every descendant found by a parent walk; returns $true when all are gone. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Root, $Job, [int]$WaitSec = 30)
+    $ids = New-Object System.Collections.Generic.List[int]
+    $ids.Add($Root.Id)
+    foreach ($d in (Get-ProcessDescendantId -RootPid $Root.Id)) { $ids.Add($d) }
+    if ($null -ne $Job) { [void]$Job.Terminate() }
+    foreach ($id in $ids) { try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch { Write-Verbose 'stop-process failed' } }
+    $deadline = (Get-Date).AddSeconds($WaitSec)
+    do {
+        $alive = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($alive.Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 function Invoke-UpdProcess {
     <#
       Runs an executable with an argument ARRAY (UseShellExecute=false, no cmd.exe, no string concatenation of
-      user data), captures stdout/stderr, enforces a timeout. -EnvRemovePrefix drops matching variables from the
-      child environment; -EnvSet adds/overrides. Returns @{Rc;Out;Err;TimedOut}.
+      user data), captures stdout/stderr, enforces a timeout. The process is placed in a job object; on timeout the WHOLE
+      TREE (job members + descendants found by a parent walk) is killed and the call only returns once the tree is gone
+      (TreeGone) or the wait expired. -EnvRemovePrefix drops matching variables from the child environment; -EnvSet adds/overrides.
+      Returns @{Rc;Out;Err;TimedOut;TreeGone}.
     #>
     [CmdletBinding()]
     param(
@@ -54,22 +116,26 @@ function Invoke-UpdProcess {
     foreach ($k in $EnvSet.Keys) { $psi.EnvironmentVariables[[string]$k] = [string]$EnvSet[$k] }
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
-    [void]$p.Start()
-    $so = $p.StandardOutput.ReadToEndAsync()
-    $se = $p.StandardError.ReadToEndAsync()
-    $timedOut = $false
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        $timedOut = $true
-        try { $p.Kill() } catch { Write-Verbose 'kill failed' }
-        [void]$p.WaitForExit(5000)
-    }
-    $rc = if ($timedOut) { -1 } else { $p.ExitCode }
-    $out = ''; $err = ''
-    # bounded waits: a grandchild that inherited the pipes must not hang the updater
-    if ($so.Wait(5000)) { $out = $so.Result }
-    if ($se.Wait(5000)) { $err = $se.Result }
-    $p.Dispose()
-    return @{ Rc = $rc; Out = $out; Err = $err; TimedOut = $timedOut }
+    $job = New-Object MlUpdater.JobObject
+    try {
+        [void]$p.Start()
+        if ($job.Valid) { [void]$job.Assign($p.Handle) }
+        $so = $p.StandardOutput.ReadToEndAsync()
+        $se = $p.StandardError.ReadToEndAsync()
+        $timedOut = $false
+        $treeGone = $true
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            $timedOut = $true
+            $treeGone = Stop-ProcessTree -Root $p -Job $job
+            [void]$p.WaitForExit(5000)
+        }
+        $rc = if ($timedOut) { -1 } else { $p.ExitCode }
+        $out = ''; $err = ''
+        # bounded waits: a grandchild that inherited the pipes must not hang the updater
+        if ($so.Wait(5000)) { $out = $so.Result }
+        if ($se.Wait(5000)) { $err = $se.Result }
+        return @{ Rc = $rc; Out = $out; Err = $err; TimedOut = $timedOut; TreeGone = $treeGone }
+    } finally { $job.Dispose(); $p.Dispose() }
 }
 
 # ---- gh.exe provisioning checks ------------------------------------------------------------------
@@ -156,7 +222,8 @@ function Test-ArtifactAttestation {
     )
     if (-not (Test-UpdRegex $SourceRef '^refs/heads/(automation|build/[A-Za-z0-9._-]{1,80})$')) { throw 'source ref not allowed' }
     $a = @('attestation', 'verify', $FilePath, '--repo', $Repo, '--bundle', $BundlePath,
-        '--signer-workflow', $SignerWorkflow, '--source-ref', $SourceRef, '--deny-self-hosted-runners', '--format', 'json')
+        '--signer-workflow', $SignerWorkflow, '--source-ref', $SourceRef, '--deny-self-hosted-runners',
+        '--predicate-type', 'https://slsa.dev/provenance/v1', '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com', '--format', 'json')
     if ($SourceDigest) {
         if (-not (Test-UpdRegex $SourceDigest '^[0-9a-f]{40}$')) { throw 'source digest invalid' }
         $a += @('--source-digest', $SourceDigest)
@@ -168,7 +235,7 @@ function Test-ArtifactAttestation {
 function Read-ReleaseManifest {
     <# Parses and validates manifest.json (schema 1). Every string used later is regex-validated here. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedTag, [string[]]$AllowOwners = @())
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedTag, [string[]]$AllowOwners = @(), [string[]]$LocalOwners = @())
     $fi = Get-Item -LiteralPath $Path
     if ($fi.Length -gt 256KB) { throw 'manifest too large' }
     try { $m = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json } catch { throw 'manifest is not valid JSON' }
@@ -179,35 +246,41 @@ function Read-ReleaseManifest {
     if ($m.schema -ne 1) { throw 'manifest schema unsupported' }
     if ([string]$m.product -cne 'moonlight') { throw 'manifest product is not moonlight' }
     if ([string]$m.tag -cne $ExpectedTag) { throw 'manifest tag does not match release tag' }
-    if (-not (Test-UpdRegex ([string]$m.installer) '^MoonlightSetup[A-Za-z0-9._-]{0,40}\.exe$')) { throw 'manifest installer name invalid' }
+    if (-not (Test-SafeAssetName -Name ([string]$m.installer) -Pattern '^MoonlightSetup[A-Za-z0-9._-]{0,40}\.exe$')) { throw 'manifest installer name invalid' }
     $b = $m.build
     if (-not (Test-UpdRegex ([string]$b.version) '^6\.2\.0-daily\.[0-9]{5}$')) { throw 'manifest build.version invalid' }
     if (-not (Test-UpdRegex ([string]$b.source_sha) '^[0-9a-f]{40}$')) { throw 'manifest build.source_sha invalid' }
-    if (-not (Test-UpdRegex ([string]$b.source_ref) '^refs/heads/(automation|build/[A-Za-z0-9._-]{1,80})$')) { throw 'manifest build.source_ref invalid' }
-    if ($AllowOwners.Count -gt 0) {
-        if (-not (Test-UpdRegex ([string]$m.upstream.owner) '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$')) { throw 'manifest upstream.owner invalid' }
-        if ($AllowOwners -cnotcontains [string]$m.upstream.owner) { throw 'manifest upstream owner not in policy allow-list' }
-    }
+    # CONTRACT 3b: the attestation source ref is derived from the tag, not trusted from the manifest
+    $key = ConvertTo-OrderingKey -Tag $ExpectedTag
+    $expectedRef = 'refs/heads/build/v6.2.0-daily.{0}-n{1}' -f $key.U, $key.N
+    if ([string]$b.source_ref -cne $expectedRef) { throw 'manifest build.source_ref does not match the tag (expected refs/heads/build/<upstreamtag>-n<N>)' }
+    if (-not (Test-UpdRegex ([string]$m.upstream.owner) '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$')) { throw 'manifest upstream.owner invalid' }
+    if ($AllowOwners.Count -gt 0 -and $AllowOwners -cnotcontains [string]$m.upstream.owner) { throw 'manifest upstream owner not in policy allow-list' }
+    if ($LocalOwners.Count -gt 0 -and $LocalOwners -cnotcontains [string]$m.upstream.owner) { throw 'manifest upstream owner not in the local owner list' }
     $bundles = @()
     foreach ($x in @($m.attestation)) {
-        if (-not (Test-UpdRegex ([string]$x) '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.(sigstore\.json|jsonl)$')) { throw 'manifest attestation name invalid' }
+        if (-not (Test-SafeAssetName -Name ([string]$x) -Pattern '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.(sigstore\.json|jsonl)$')) { throw 'manifest attestation name invalid' }
         $bundles += [string]$x
     }
     if ($bundles.Count -lt 1) { throw 'manifest lists no attestation bundle' }
     $assets = @{}
+    $sizes = @{}
     foreach ($a in @($m.assets)) {
-        if (-not (Test-UpdRegex ([string]$a.name) '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')) { throw 'manifest asset name invalid' }
+        if (-not (Test-SafeAssetName -Name ([string]$a.name))) { throw 'manifest asset name invalid' }
         if (-not (Test-UpdRegex ([string]$a.sha256) '^[0-9a-f]{64}$')) { throw 'manifest asset sha256 invalid' }
         $assets[[string]$a.name] = [string]$a.sha256
+        if ($a.PSObject.Properties.Name -contains 'size') {
+            if (($a.size -isnot [int] -and $a.size -isnot [long]) -or $a.size -lt 0) { throw 'manifest asset size invalid' }
+            $sizes[[string]$a.name] = [long]$a.size
+        }
     }
     if (-not $assets.ContainsKey([string]$m.installer)) { throw 'manifest does not list the installer asset' }
-    # build number sanity vs tag (scheme contract-v1)
-    $key = ConvertTo-OrderingKey -Tag $ExpectedTag
+    # build number must equal 60000 + 8*U + (N-1) for the tag (CONTRACT 3b)
     $bn = [int](([string]$b.version).Split('.')[-1])
-    if ($bn -ne (ConvertTo-BuildNumber -U $key.U)) { throw 'manifest build.version does not match tag per version scheme' }
+    if ($bn -ne $key.Build) { throw 'manifest build.version does not match tag per version scheme' }
     return [pscustomobject]@{
         Tag = [string]$m.tag; Installer = [string]$m.installer; Bundles = $bundles; Assets = $assets
-        BuildNumber = $bn; BuildVersion = [string]$b.version; SourceSha = [string]$b.source_sha; SourceRef = [string]$b.source_ref
+        AssetSizes = $sizes; BuildNumber = $bn; BuildVersion = [string]$b.version; SourceSha = [string]$b.source_sha; SourceRef = [string]$b.source_ref
         UpstreamOwner = [string]$m.upstream.owner; Key = $key
     }
 }
