@@ -66,7 +66,7 @@ cd ../rot-fix
 git format-patch --no-signature --zero-commit -o ../ml-automation/patches <upstream-tag>..HEAD
 cd ../ml-automation
 git diff --stat patches/          # only the patches you fixed should change
-tools/series-sha256.sh            # new patch_series_sha256 -> upstream.lock
+tools/series-sha.sh            # new patch_series_sha256 -> upstream.lock
 tools/rot-matrix.sh 5 --floor v6.2.0-daily.201
 ```
 

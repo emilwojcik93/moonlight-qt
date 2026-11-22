@@ -11,13 +11,15 @@
 #   --remote <name>      upstream remote (default: $UPSTREAM_REMOTE or "upstream")
 #   --tag-glob <glob>    tag pattern (default: 'v6.2.0-daily.*')
 #   --master <ref>       master ref (default: <remote>/master)
-#   --floor <tag>        oldest tag the series is expected to apply to; failures on older
-#                        tags are shown as "FAIL*" and do not affect the exit code
+#   --floor <tag>        oldest tag the series is expected to apply to. A failure on an older
+#                        tag is printed as BELOW_FLOOR and is informational only. A failure on
+#                        the floor tag, any newer tag, the newest tag or master fails the run.
 #   --fetch              git fetch <remote> master + tags first (network)
 #   --out <file>         also write the table as markdown to <file>
 #   -h, --help
 #
-# Exit code: 0 if every target applies the full series, 1 if any target fails.
+# Exit code: 0 if every target at or above the floor (incl. newest tag and master)
+# applies the full series; 1 otherwise; 3 usage/environment error.
 # Run from inside the fork clone (needs the upstream remote's tags locally).
 set -uo pipefail
 
@@ -76,7 +78,7 @@ below_floor() {
 
 rows=""
 fails=0
-printf '%-22s %-9s %-6s %-12s %s\n' target commit full posture-only detail
+printf '%-22s %-9s %-12s %-12s %s\n' target commit full posture-only detail
 for ref in $tags "$master"; do
   sha=$(git rev-parse --short=9 "$ref^{commit}")
   label=$ref; [ "$ref" = "$master" ] && label="$master"
@@ -84,7 +86,7 @@ for ref in $tags "$master"; do
   run_one "$ref" --skip-group touch-menu; core=$status; cdetail=$detail
   if [ "$full" != PASS ]; then
     if below_floor "$ref"; then
-      full="FAIL*"; [ "$core" = FAIL ] && core="FAIL*"
+      full=BELOW_FLOOR; [ "$core" = FAIL ] && core=BELOW_FLOOR
     else
       fails=$((fails+1))
     fi
@@ -92,7 +94,7 @@ for ref in $tags "$master"; do
   d=""
   [ -n "$fdetail" ] && d="full: $fdetail"
   [ -n "$cdetail" ] && d="$d${d:+; }core: $cdetail"
-  printf '%-22s %-9s %-6s %-12s %s\n' "$label" "$sha" "$full" "$core" "$d"
+  printf '%-22s %-9s %-12s %-12s %s\n' "$label" "$sha" "$full" "$core" "$d"
   rows="$rows| \`$label\` | \`$sha\` | $full | $core | ${d:-}|
 "
 done

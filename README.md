@@ -12,7 +12,8 @@ upstream.lock          upstream tag/commit the series was last verified against
 policy.yml             allowlist, cooling-off, hold switch, version scheme
 tools/apply-series.sh  git am --3way into a temp worktree, optional tree verify
 tools/rot-matrix.sh    dry run against the last N upstream daily tags + master
-tools/series-sha256.sh hash of the series (patch_series_sha256)
+tools/tests/           regression tests (tools/tests/test-tools.sh)
+tools/series-sha.sh hash of the series (patch_series_sha256)
 docs/                  rot matrix results, how to resolve rot
 ```
 
@@ -77,3 +78,21 @@ POSIX bash; works in git-bash and on ubuntu runners (needs git with
 * Rot: see `docs/RESOLVING-ROT.md`; current matrix:
   `docs/ROT-MATRIX-2026-11-22.md`.
 * `.gitattributes` keeps `*.patch` byte-exact (no CRLF conversion on Windows).
+
+## Series identity and tool behaviour
+
+* `patch_series_sha256` (`tools/series-sha.sh`, same algorithm as the Vibepollo
+  repo): sha256 over the bytes of `patches/series` with LF line endings,
+  followed by the bytes of each patch listed in it (non-blank, non-`#` lines),
+  in series order, unconverted. Group markers and comments are therefore part
+  of the identity.
+* Every patch is authored `emilwojcik93 <adminit@adar.pl>`.
+* `apply-series.sh` uses `git am --3way --keep-cr`; `--keep-branch` creates the
+  branch only after a successful apply and, with `--verify`, a matching tree.
+  `--prefix-check` applies cumulatively, prints `prefix k/N OK|FAILS` and (with
+  `--keep-branch NAME`) creates `NAME-p01..` so CI can build each prefix.
+* `rot-matrix.sh --floor TAG`: targets older than the floor print
+  `BELOW_FLOOR` (informational); any failure at or above the floor, including
+  the newest tag and master, exits non-zero.
+* `.gitattributes`: `* text=auto eol=lf`, patches and series `-text`.
+* Tests: `tools/tests/test-tools.sh`.

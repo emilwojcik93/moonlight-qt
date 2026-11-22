@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Emil=20W=C3=B3jcik?= <emil.wojcik@adar.pl>
+From: emilwojcik93 <adminit@adar.pl>
 Date: Wed, 18 Nov 2026 11:08:58 +0100
 Subject: [PATCH 6/7] touch-menu: add touch menu model, overlay rendering and
  tests

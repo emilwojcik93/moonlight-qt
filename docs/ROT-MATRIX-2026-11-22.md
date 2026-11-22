@@ -7,7 +7,7 @@ plus `upstream/master` (Nonary/moonlight-qt). Produced by:
 tools/rot-matrix.sh 5 --floor v6.2.0-daily.201 --out docs/rot.md
 ```
 
-Series: 7 patches, `patch_series_sha256 = 54ede0d51667dd61fd7224ca9656a6e865ef879be02c94e2c677c6bbd0776d39`.
+Series: 7 patches, `patch_series_sha256 = 838eb05f3f5c4b531f5401e2110fac313b7731457e4202a2555086cc3bfe76cd`.
 Method: `git am --3way` into a temporary worktree per target; nothing is built
 (apply-only check, see "What this does not prove"). "posture-only" is the series
 with `--skip-group touch-menu`.
@@ -16,12 +16,12 @@ with `--skip-group touch-menu`.
 |---|---|---|---|---|
 | `v6.2.0-daily.202` | `9184cacd8` | PASS | PASS | |
 | `v6.2.0-daily.201` | `bbe6d2d36` | PASS | PASS | |
-| `v6.2.0-daily.200` | `f586143cf` | FAIL* | FAIL* | 0002 conflicts in `app/gui/SettingsView.qml` |
-| `v6.2.0-daily.199` | `19758e5e6` | FAIL* | FAIL* | 0002 conflicts in `app/gui/SettingsView.qml` |
-| `v6.2.0-daily.198` | `d54e6c04b` | FAIL* | FAIL* | 0002 conflicts in `app/gui/SettingsView.qml` |
+| `v6.2.0-daily.200` | `f586143cf` | BELOW_FLOOR | BELOW_FLOOR | 0002 conflicts in `app/gui/SettingsView.qml` |
+| `v6.2.0-daily.199` | `19758e5e6` | BELOW_FLOOR | BELOW_FLOOR | 0002 conflicts in `app/gui/SettingsView.qml` |
+| `v6.2.0-daily.198` | `d54e6c04b` | BELOW_FLOOR | BELOW_FLOOR | 0002 conflicts in `app/gui/SettingsView.qml` |
 | `upstream/master` | `9184cacd8` | PASS | PASS | same commit as daily.202 |
 
-`FAIL*` = below the supported floor (`supported_floor_tag: v6.2.0-daily.201` in
+`BELOW_FLOOR` = below the supported floor (`supported_floor_tag: v6.2.0-daily.201` in
 `policy.yml`), not counted as rot.
 
 ## Reading the result
