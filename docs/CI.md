@@ -56,6 +56,7 @@ a re-run keeps the run id; then `stuck` + alert).
 | `.github/workflows/ci-selftest.yml` | pytest + actionlint + zizmor on every change to `ci/` and `.github/` |
 | `.github/dependabot.yml` | weekly updates of SHA-pinned actions |
 | `upstream-seen.json` | first-seen commit per upstream tag + recorded builds (pre-seeded with daily.201 and daily.202) |
+| `ci/prepare_build_branch.py`, `tools/prepare-build-branch.sh` | break-glass local `prepare` (section 4) |
 | `ci/*.py` | helpers (all stdlib, python3 >= 3.8), copied to `.vp-ci/` in build branches |
 | `ci/tests/` | pytest suite (malicious tag fixtures in `ci/tests/fixtures/releases.json`, synthetic PE files for the gate) |
 | `ci/rot-known-fail.txt` | upstream tags the series is known not to apply to (explicit, empty today) |
@@ -132,6 +133,17 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
   repository with `contents:write` + `workflows:write`, only in the `prepare` job (executes no upstream code), environment
   `build-push` (deployment branches: `automation` only). Missing credentials fail the job explicitly; there is deliberately no
   fallback token.
+* Push credential, App token OR deploy key: the `prepare` job needs ONE credential able to create branches that contain workflow
+  files: the GitHub App (`PUSH_APP_ID` + `PUSH_APP_PRIVATE_KEY`) or a write deploy key of this repository (secret `PUSH_DEPLOY_KEY`;
+  written with mode 600 to `$RUNNER_TEMP`, `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`, `known_hosts` built from `gh api meta`
+  over TLS, removed in an always step). Both live in environment `build-push`; the App wins when both exist; neither = explicit
+  failure, never `GITHUB_TOKEN`.
+* Break-glass / first-release path: `tools/prepare-build-branch.sh [--dry-run] [--tag v6.2.0-daily.U] [--remote origin]` (python
+  `ci/prepare_build_branch.py`) runs the same code as `prepare` on the operator machine from a clean `automation` checkout and pushes
+  the lock commit to `automation` and then `build/<tag>-nN` with the operator's own ssh credentials (exactly two `git push` calls, no
+  `--force`; everything else reads public GitHub data anonymously). `--dry-run` prints branch, tip and tree and changes nothing. The
+  shell wrapper picks the first interpreter that really runs (`python3`, `python`, `py -3`). On Windows use
+  `GIT_SSH_COMMAND=C:/Windows/System32/OpenSSH/ssh.exe`.
 * Moved upstream tag vs `upstream-seen.json` or the `upstream.lock` pin = HALT (job fails, issue + chat alert, nothing built).
 * State ordering: `upstream-seen.json` is committed and pushed to `automation` BEFORE the build branch is pushed; a recorded
   build whose branch push failed is `stuck` (alert), a published release without a state entry is also `stuck`.

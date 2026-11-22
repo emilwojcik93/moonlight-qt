@@ -207,19 +207,26 @@ jobs:
           REF: ${{ github.ref }}
         run: |
           [ "$REF" = "refs/heads/automation" ] || { echo "::error::must run on refs/heads/automation"; exit 1; }
-      - name: Require GitHub App credentials (there is deliberately no fallback token)
+      - name: Select the push credential (GitHub App OR deploy key; there is deliberately no fallback token)
+        id: cred
         if: env.DRY_RUN != 'true'
         env:
           APP_ID: ${{ vars.PUSH_APP_ID }}
-          KEY_PRESENT: ${{ secrets.PUSH_APP_PRIVATE_KEY != '' }}
+          APP_KEY_PRESENT: ${{ secrets.PUSH_APP_PRIVATE_KEY != '' }}
+          DEPLOY_KEY_PRESENT: ${{ secrets.PUSH_DEPLOY_KEY != '' }}
         run: |
-          if [ -z "$APP_ID" ] || [ "$KEY_PRESENT" != "true" ]; then
-            echo "::error::PUSH_APP_ID (variable) and PUSH_APP_PRIVATE_KEY (secret) are not configured. Create the GitHub App described in docs/CI.md and add both to the 'build-push' environment. Refusing to fall back to GITHUB_TOKEN or any broader credential."
+          set -euo pipefail
+          mode=none
+          if [ -n "$APP_ID" ] && [ "$APP_KEY_PRESENT" = "true" ]; then mode=app
+          elif [ "$DEPLOY_KEY_PRESENT" = "true" ]; then mode=deploy; fi
+          if [ "$mode" = "none" ]; then
+            echo "::error::No push credential configured. Add EITHER PUSH_APP_ID (variable) + PUSH_APP_PRIVATE_KEY (secret) OR PUSH_DEPLOY_KEY (SSH private key secret of a write deploy key) to the 'build-push' environment (see docs/CI.md). Refusing to fall back to GITHUB_TOKEN or any broader credential."
             exit 1
           fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
       - name: Mint a short-lived App installation token (contents + workflows on this repo only)
         id: app
-        if: env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && steps.cred.outputs.mode == 'app'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.PUSH_APP_ID }}
@@ -340,7 +347,7 @@ jobs:
           echo "::error::could not push upstream-seen.json (is the automation ruleset blocking github-actions?)"
           exit 1
       - name: Push the build branch (App token; triggers patched-windows-release.yml)
-        if: env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && steps.cred.outputs.mode == 'app'
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
           TIP: ${{ steps.assemble.outputs.tip }}
@@ -351,8 +358,30 @@ jobs:
           auth="$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)"
           echo "::add-mask::$auth"
           # No --force: an existing branch means a collision and must fail loudly.
-          git -C src -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
-            push "https://github.com/${REPO}.git" "${TIP}:refs/heads/build/${TAG}-n${N}"
+          git -C src -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" push "https://github.com/${REPO}.git" "${TIP}:refs/heads/build/${TAG}-n${N}"
+      - name: Push the build branch (deploy key over ssh; triggers patched-windows-release.yml)
+        if: env.DRY_RUN != 'true' && steps.cred.outputs.mode == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_KEY: ${{ secrets.PUSH_DEPLOY_KEY }}
+          TIP: ${{ steps.assemble.outputs.tip }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 auto/ci/validate_tag.py repo-slug "$REPO"
+          umask 077
+          key="${RUNNER_TEMP}/push_deploy_key"
+          known="${RUNNER_TEMP}/push_known_hosts"
+          printf '%s\n' "$DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          # Host keys come from the GitHub API over TLS (not trust-on-first-use).
+          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' > "$known"
+          [ -s "$known" ] || { echo "::error::could not obtain GitHub SSH host keys"; exit 1; }
+          export GIT_SSH_COMMAND="ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${known} -o BatchMode=yes"
+          git -C src push "git@github.com:${REPO}.git" "${TIP}:refs/heads/build/${TAG}-n${N}"
+      - name: Remove the deploy key material
+        if: always() && steps.cred.outputs.mode == 'deploy'
+        run: rm -f "${RUNNER_TEMP}/push_deploy_key" "${RUNNER_TEMP}/push_known_hosts"
 
   rerun:
     name: Re-run failed build
