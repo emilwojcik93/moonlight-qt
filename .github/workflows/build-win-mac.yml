@@ -18,23 +18,6 @@ on:
         required: false
         type: boolean
         default: true
-  workflow_dispatch:
-    inputs:
-      ci_version:
-        description: Version string used for the release artifacts
-        required: true
-        type: string
-      source_ref:
-        description: Immutable source commit (daily lane); empty preserves normal checkout
-        required: false
-        type: string
-        default: ""
-      build_macos:
-        description: Include the macOS build
-        required: false
-        type: boolean
-        default: true
-
 jobs:
   build:
     env:

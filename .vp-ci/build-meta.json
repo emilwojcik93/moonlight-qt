@@ -1,0 +1,41 @@
+{
+  "build": {
+    "branch": "build/v6.2.0-daily.202-n1",
+    "build_number": 61616,
+    "file_version": "6.2.61616.0",
+    "n": 1,
+    "release_tag": "v6.2.0-daily.202-vp.1",
+    "trial": false,
+    "version": "6.2.0-daily.61616"
+  },
+  "gate": "auto",
+  "patch_commits": 7,
+  "patches": {
+    "count": 7,
+    "groups": [
+      "posture-core",
+      "touch-menu"
+    ],
+    "series_sha256": "838eb05f3f5c4b531f5401e2110fac313b7731457e4202a2555086cc3bfe76cd"
+  },
+  "schema": 1,
+  "sensitive": {
+    "count": 3,
+    "enforced": false,
+    "paths": [
+      ".github/workflows/build-appimage.yml",
+      "app/app.pro",
+      "app/streaming/session.cpp"
+    ],
+    "since": "v6.2.0-daily.201"
+  },
+  "sensitive_count": 3,
+  "upstream": {
+    "commit": "9184cacd8d426316bdecc47634f0dbf4e6e34654",
+    "owner": "Nonary",
+    "published_at": "2026-11-22T07:17:53Z",
+    "release_id": 454272425,
+    "repo": "moonlight-qt",
+    "tag": "v6.2.0-daily.202"
+  }
+}
