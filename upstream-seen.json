@@ -8,7 +8,14 @@
       "release_id": 451147237
     },
     "v6.2.0-daily.202": {
-      "builds": [],
+      "builds": [
+        {
+          "branch": "build/v6.2.0-daily.202-n1",
+          "n": 1,
+          "series_sha256": "838eb05f3f5c4b531f5401e2110fac313b7731457e4202a2555086cc3bfe76cd",
+          "source_sha": "4ded6ac3b40ae5507545204f5abcb99a0c0720f2"
+        }
+      ],
       "commit": "9184cacd8d426316bdecc47634f0dbf4e6e34654",
       "first_seen": "2026-11-22T20:00:00Z",
       "published_at": "2026-11-22T07:17:53Z",
