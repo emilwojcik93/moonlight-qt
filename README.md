@@ -9,7 +9,7 @@ posture and touch-menu feature as an ordered patch series on top of
 patches/series         ordered list; "# group: NAME" markers
 patches/0001..0007     git format-patch files (author, subject, rationale)
 upstream.lock          upstream tag/commit the series was last verified against
-policy.yml             allowlist, cooling-off, hold switch, version scheme
+policy.yml             CONTRACT section 5 policy: owners, cooling-off, hold, deny
 tools/apply-series.sh  git am --3way into a temp worktree, optional tree verify
 tools/rot-matrix.sh    dry run against the last N upstream daily tags + master
 tools/tests/           regression tests (tools/tests/test-tools.sh)
@@ -73,8 +73,13 @@ POSIX bash; works in git-bash and on ubuntu runners (needs git with
 ## Rules
 
 * Patches never touch submodule gitlinks, `.github/` or version files.
-* Version scheme: `ci_version = 6.2.0-daily.(60000+U)`, U = upstream daily
-  number (see `policy.yml`).
+* Build number rule (CONTRACT v1.1): `ci_version = 6.2.0-daily.(60000+8*U+(N-1))`,
+  U = upstream daily number, N = rebuild counter 1..8 (the build fails if N > 8);
+  monotonic in (U,N), valid for U <= 691. Tag stays `v6.2.0-daily.U-vp.N`.
+  Installers read the expected build from the attested `manifest.build.version`.
+* `policy.yml` follows CONTRACT section 5 exactly (schema 1, `allow_upstream_owners`,
+  `cooling_off_hours`, `hold`, `deny`, `keep_releases`); the only extension is
+  `x-supported_floor_tag`.
 * Rot: see `docs/RESOLVING-ROT.md`; current matrix:
   `docs/ROT-MATRIX-2026-11-22.md`.
 * `.gitattributes` keeps `*.patch` byte-exact (no CRLF conversion on Windows).

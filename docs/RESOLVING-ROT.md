@@ -14,8 +14,8 @@ tools/apply-series.sh <upstream-tag-or-master> --report /tmp/rot-report.md
 The output names the failing patch (`FAIL [group] <file>`), the conflicting
 files and, in the report, the conflict hunks. Note the group: if only
 `touch-menu` fails, you can ship posture-core immediately with
-`--skip-group touch-menu` (remove the group from `groups_enabled` in
-`policy.yml`) and fix the touch menu later. Never publish a series that applies
+`--skip-group touch-menu` (the pipeline passes it; ship posture-core now) and
+fix the touch menu later. Never publish a series that applies
 only partly by accident.
 
 ## 2. Resolve in a scratch worktree

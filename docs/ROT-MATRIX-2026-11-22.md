@@ -21,7 +21,7 @@ with `--skip-group touch-menu`.
 | `v6.2.0-daily.198` | `d54e6c04b` | BELOW_FLOOR | BELOW_FLOOR | 0002 conflicts in `app/gui/SettingsView.qml` |
 | `upstream/master` | `9184cacd8` | PASS | PASS | same commit as daily.202 |
 
-`BELOW_FLOOR` = below the supported floor (`supported_floor_tag: v6.2.0-daily.201` in
+`BELOW_FLOOR` = below the supported floor (`x-supported_floor_tag: v6.2.0-daily.201` in
 `policy.yml`), not counted as rot.
 
 ## Reading the result
