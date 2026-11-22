@@ -1,0 +1,7 @@
+{
+  "version": "2.105.0",
+  "zip_name": "gh_2.105.0_windows_amd64.zip",
+  "zip_sha256": "8813a72c899900afaa10e3fec8fbc64b908c89dbfe837e95ed2fa500fc140627",
+  "gh_exe_sha256": "77437defc10c5cf35ca0d25d626d58a5210de8ad10bf270c02df4630754bcd69",
+  "source": "https://github.com/cli/cli/releases/tag/v2.105.0 (immutable release, attested; hashes taken from the release checksums file and a local verified extraction)"
+}
