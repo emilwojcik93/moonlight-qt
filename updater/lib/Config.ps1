@@ -143,7 +143,7 @@ function New-UpdState {
     return [pscustomobject]@{
         schema = 1; installed = $null; denied = @(); attempts = (New-Object psobject); last_check_utc = $null
         last_success_utc = $null; etag_releases = $null; etag_branch = $null; policy_sha = $null
-        pending_reboot = $null; verification_pending = $null; rollback_pending = $null
+        pending_reboot = $null; verification_pending = $null; rollback_pending = $null; baseline_pins = (New-Object psobject)
     }
 }
 
@@ -165,6 +165,7 @@ function Read-UpdState {
     }
     if ($null -eq $st.denied) { $st.denied = @() }
     if ($null -eq $st.attempts) { $st.attempts = (New-Object psobject) }
+    if ($null -eq $st.baseline_pins) { $st.baseline_pins = (New-Object psobject) }
     return $st
 }
 

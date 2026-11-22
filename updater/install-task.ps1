@@ -68,7 +68,9 @@ if ($GhExeSource) {
 }
 
 $configPath = Join-Path $ProgramDir 'config.json'
-$configExists = Test-Path -LiteralPath $configPath
+# an unelevated -WhatIf cannot read inside the admin-only program dir: access denied means it exists
+$configExists = $true
+try { $configExists = [bool](Test-Path -LiteralPath $configPath -ErrorAction Stop) } catch [System.UnauthorizedAccessException] { $configExists = $true }
 if ($SetMode -eq 'install' -and -not $configExists) { throw 'refusing -SetMode install on a fresh machine: install in report-only mode first, rehearse with update.ps1 -VerifyOnly, then run with -SetMode install (gate G4)' }
 $defaultConfig = [ordered]@{
     schema = 1; mode = 'report-only'; channel = 'canary'; cooling_off_hours = 0

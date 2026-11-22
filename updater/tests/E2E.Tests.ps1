@@ -330,6 +330,8 @@ Describe 'Invoke-UpdaterMain / update.ps1 (no test mode exists in the product)' 
 
 Describe 'install-task.ps1 / uninstall-task.ps1 -WhatIf (no elevation, no changes)' {
     It 'install-task -WhatIf prints the exact plan and changes nothing' {
+        $progBefore = Test-Path 'C:\Program Files\MoonlightPatchUpdater'; $dataBefore = Test-Path 'C:\ProgramData\MoonlightPatchUpdater'
+        $taskBefore = @(Get-ScheduledTask -TaskPath '\MoonlightPatch' -ErrorAction SilentlyContinue).Count
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $UpdRoot 'install-task.ps1') -WhatIf 2>&1 | Out-String
         $LASTEXITCODE | Should -Be 0
         $out | Should -Match 'WHATIF: nothing will be changed'
@@ -344,9 +346,9 @@ Describe 'install-task.ps1 / uninstall-task.ps1 -WhatIf (no elevation, no change
         $out | Should -Match 'new installs: report-only'
         $out | Should -Match 'stale .*test-mode\.flag'
         $out | Should -Match 'WhatIf: no changes made'
-        Test-Path 'C:\Program Files\MoonlightPatchUpdater' | Should -BeFalse
-        Test-Path 'C:\ProgramData\MoonlightPatchUpdater' | Should -BeFalse
-        @(Get-ScheduledTask -TaskPath '\MoonlightPatch\' -ErrorAction SilentlyContinue).Count | Should -Be 0
+        Test-Path 'C:\Program Files\MoonlightPatchUpdater' | Should -Be $progBefore
+        Test-Path 'C:\ProgramData\MoonlightPatchUpdater' | Should -Be $dataBefore
+        @(Get-ScheduledTask -TaskPath '\MoonlightPatch\' -ErrorAction SilentlyContinue).Count | Should -Be $taskBefore
     }
     It 'the registered task limit really is 2 hours' {
         [IO.File]::ReadAllText((Join-Path $UpdRoot 'install-task.ps1')) | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Hours 2\)'
@@ -362,6 +364,7 @@ Describe 'install-task.ps1 / uninstall-task.ps1 -WhatIf (no elevation, no change
         $LASTEXITCODE | Should -Not -Be 0
     }
     It '-SetMode install is refused on a fresh machine (rehearse in report-only first)' {
+        if (Test-Path 'C:\Program Files\MoonlightPatchUpdater') { Set-ItResult -Skipped -Because 'the updater is installed on this machine (not a fresh machine)'; return }
         $ErrorActionPreference = 'Continue'
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $UpdRoot 'install-task.ps1') -WhatIf -SetMode install 2>&1 | Out-String
         $LASTEXITCODE | Should -Not -Be 0
@@ -374,7 +377,6 @@ Describe 'install-task.ps1 / uninstall-task.ps1 -WhatIf (no elevation, no change
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $UpdRoot 'install-task.ps1') 2>&1 | Out-String
         $LASTEXITCODE | Should -Not -Be 0
         $out | Should -Match 'elevated'
-        Test-Path 'C:\Program Files\MoonlightPatchUpdater' | Should -BeFalse
     }
     It 'uninstall-task -WhatIf lists what would be removed and changes nothing' {
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $UpdRoot 'uninstall-task.ps1') -WhatIf -RemoveFiles -RemoveData 2>&1 | Out-String

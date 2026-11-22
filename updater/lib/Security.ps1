@@ -49,7 +49,7 @@ function Find-AclViolation {
             $v.Add(("{0}: {1} ({2}) has write-type rights {3}" -f $Label, $name, $sid, $ace.FileSystemRights))
         }
     }
-    return , @($v.ToArray())
+    return $v.ToArray()
 }
 
 function Test-UpdAclSafe {
@@ -58,11 +58,11 @@ function Test-UpdAclSafe {
     [OutputType([string[]])]
     param([Parameter(Mandatory)][string]$Path, [int]$Depth = 3)
     $all = New-Object System.Collections.Generic.List[string]
-    if (-not (Test-Path -LiteralPath $Path)) { $all.Add("$Path does not exist"); return , @($all.ToArray()) }
+    if (-not (Test-Path -LiteralPath $Path)) { $all.Add("$Path does not exist"); return $all.ToArray() }
     $item = Get-Item -LiteralPath $Path -Force
     if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         $all.Add("$Path is a reparse point (junction/symlink)")
-        return , @($all.ToArray())
+        return $all.ToArray()
     }
     foreach ($x in (Find-AclViolation -Security (Get-Acl -LiteralPath $Path) -Label $Path)) { $all.Add($x) }
     if ($item.PSIsContainer) {
@@ -75,7 +75,36 @@ function Test-UpdAclSafe {
             }
         }
     }
-    return , @($all.ToArray())
+    return $all.ToArray()
+}
+
+function Test-ReadOnlyArtifactAcl {
+    <#
+      Requirement for a READ-ONLY artifact owned by the system (the Burn Package Cache bundle used as rollback baseline):
+      the file and every ancestor directory up to and including -StopAt must (a) be owned by SYSTEM / Administrators /
+      TrustedInstaller, (b) grant no write/append/delete/attribute-write/delete-children/change-permissions/take-ownership
+      (so no Modify/FullControl) to any principal other than SYSTEM / Administrators / TrustedInstaller, and (c) not be a
+      reparse point. Read/execute/synchronize for Users, Everyone, Authenticated Users is fine. (Stricter admin-only checks
+      stay in force for the program dir, data dir and gh.exe: Test-UpdAclSafe.) Returns violation strings, empty when fine.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$StopAt)
+    $v = New-Object System.Collections.Generic.List[string]
+    $stop = [System.IO.Path]::GetFullPath($StopAt).TrimEnd('\')
+    $cur = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (-not $cur.StartsWith($stop + '\', [StringComparison]::OrdinalIgnoreCase)) { $v.Add("$Path is not below $StopAt"); return $v.ToArray() }
+    while ($true) {
+        if (-not (Test-Path -LiteralPath $cur)) { $v.Add("$cur does not exist"); break }
+        $item = Get-Item -LiteralPath $cur -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $v.Add("$cur is a reparse point (junction/symlink)"); break }
+        foreach ($x in (Find-AclViolation -Security (Get-Acl -LiteralPath $cur) -Label $cur)) { $v.Add($x) }
+        if ($cur.Equals($stop, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path -Parent $cur
+        if ([string]::IsNullOrEmpty($parent) -or $parent.Length -ge $cur.Length) { break }
+        $cur = $parent
+    }
+    return $v.ToArray()
 }
 
 function Assert-UpdSelfAcl {

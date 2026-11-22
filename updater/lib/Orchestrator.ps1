@@ -40,7 +40,7 @@ function New-UpdDeps {
     $d.Now = { Get-UpdNowUtc }
     $d.Sleep = { param($sec) Start-Sleep -Seconds $sec }
     $d.GetBootTime = { (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime() }
-    $d.TestPathAcl = { param($p) Test-UpdAclSafe -Path $p }
+    $d.TestPathAcl = { param($p) Test-ReadOnlyArtifactAcl -Path $p -StopAt 'C:\ProgramData\Package Cache' }
     $d.PackageCacheBundle = { Join-Path (Join-Path 'C:\ProgramData\Package Cache' $script:UpdConst.BundleGuid) 'MoonlightSetup.exe' }
     $d.AdditionalFullControlSids = @()
     return $d
@@ -103,24 +103,32 @@ function Resolve-BaselineBundle {
     <#
       Rollback baseline (P2-5): the verified bundle of the build that is installed now, or the existing Burn Package Cache
       bundle copied into the data dir (after an admin-only ACL check). The baseline is re-hashed here, before anything is installed.
-      Returns the bundle object or $null.
+      Trust on first use: the SHA256 of a Package Cache baseline is pinned in state.json when first accepted; a different hash
+      for the same build later is refused. Returns @{Bundle; Refused; Reason}.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Deps, [Parameter(Mandatory)][string]$DataDir, [Parameter(Mandatory)]$State, [Parameter(Mandatory)]$Installed)
     $prev = Get-PreviousBundle -DataDir $DataDir -State $State -Installed $Installed
-    if ($null -ne $prev -and (Test-Path -LiteralPath $prev.Path -PathType Leaf) -and ((Get-UpdSha256 -Path $prev.Path) -eq $prev.Sha256)) { return $prev }
+    if ($null -ne $prev -and (Test-Path -LiteralPath $prev.Path -PathType Leaf) -and ((Get-UpdSha256 -Path $prev.Path) -eq $prev.Sha256)) { return @{ Bundle = $prev; Refused = $false; Reason = $null } }
     $pc = & $Deps.PackageCacheBundle
     if ($pc -and (Test-Path -LiteralPath $pc -PathType Leaf)) {
         $viol = @(& $Deps.TestPathAcl $pc)
         if ($viol.Count -eq 0) {
             $psha = Get-UpdSha256 -Path $pc
-            [void](Add-VerifiedBundle -DataDir $DataDir -Name ('installed-{0}' -f $Installed.Build) -SourcePath $pc -Sha256 $psha -BuildNumber $Installed.Build -AdditionalFullControlSids $Deps.AdditionalFullControlSids)
-            Write-UpdLog -Event 'baseline_bundle_saved' -Data @{ build = $Installed.Build }
-            return (Get-PreviousBundle -DataDir $DataDir -State $State -Installed $Installed)
+            $pinName = 'installed-{0}' -f $Installed.Build
+            $pin = $State.baseline_pins.PSObject.Properties[$pinName]
+            if ($null -ne $pin -and [string]$pin.Value -ne $psha) {
+                Write-UpdLog -Level ERROR -Event 'baseline_changed' -Data @{ build = $Installed.Build; pinned = $pin.Value; now = $psha }
+                return @{ Bundle = $null; Refused = $true; Reason = 'the Package Cache baseline changed since it was first accepted (same build, different SHA256)' }
+            }
+            [void](Add-VerifiedBundle -DataDir $DataDir -Name $pinName -SourcePath $pc -Sha256 $psha -BuildNumber $Installed.Build -AdditionalFullControlSids $Deps.AdditionalFullControlSids)
+            if ($null -eq $pin) { $State.baseline_pins | Add-Member -NotePropertyName $pinName -NotePropertyValue $psha }
+            Write-UpdLog -Event 'baseline_bundle_saved' -Data @{ build = $Installed.Build; sha256 = $psha; pinned_first_use = ($null -eq $pin) }
+            return @{ Bundle = (Get-PreviousBundle -DataDir $DataDir -State $State -Installed $Installed); Refused = $false; Reason = $null }
         }
-        Write-UpdLog -Level WARN -Event 'baseline_bundle_skipped' -Data @{ reason = 'package cache ACL not admin-only' }
+        Write-UpdLog -Level WARN -Event 'baseline_bundle_skipped' -Data @{ reason = 'package cache file or an ancestor is writable by non-admins, not owned by the system, or a reparse point'; detail = ($viol -join ' | ') }
     }
-    return $null
+    return @{ Bundle = $null; Refused = $false; Reason = $null }
 }
 
 function Wait-MoonlightClosed {
@@ -370,7 +378,9 @@ function Invoke-MoonlightUpdateCore {
     # --- rollback baseline BEFORE any big download (P2-5) ---
     $prevBundle = $null
     if (-not $VerifyOnly) {
-        $prevBundle = Resolve-BaselineBundle -Deps $Deps -DataDir $DataDir -State $State -Installed $installed
+        $bl = Resolve-BaselineBundle -Deps $Deps -DataDir $DataDir -State $State -Installed $installed
+        if ($bl.Refused) { return (New-UpdResult -Result 'failed' -Tag $tag -Detail ('refusing to install: ' + $bl.Reason) -ExitCode $script:UpdExit.ConfigInvalid) }
+        $prevBundle = $bl.Bundle
         if ($null -eq $prevBundle) {
             Write-UpdLog -Level ERROR -Event 'no_rollback_baseline' -Data @{ tag = $tag; allow_no_baseline = $Config['allow_no_baseline'] }
             if ($Config['allow_no_baseline'] -ne $true) {
