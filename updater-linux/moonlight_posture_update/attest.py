@@ -16,8 +16,8 @@ import stat
 import subprocess
 from typing import Dict, List, Optional
 
-from . import versioning
-from .errors import NetworkDeferral, VerifyError
+from . import fsio, versioning
+from .errors import ConfigError, NetworkDeferral, VerifyError
 
 GH_CANDIDATES = ("/usr/bin/gh", "/usr/local/bin/gh")
 PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
@@ -27,43 +27,81 @@ VERIFY_TIMEOUT = 180
 MAX_OUT = 4 * 1024 * 1024
 
 
+# gh 2.68.0 added --source-ref / --source-digest to `attestation verify`; 2.67.x could exit 0 when no attestation matched
+# (fixed later, and re-checked here by parsing the verified JSON); 2.58.0 removed the auth requirement of
+# `attestation trusted-root`. 2.105.0 is the version this code was tested with.
+GH_MIN_VERSION = (2, 68, 0)
+GH_TESTED_VERSION = (2, 105, 0)
+VERSION_RE = re.compile(r"gh version ([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})")
+
+# environment variables gh may see (everything else is dropped); proxies and CA settings are the user's network setup
+ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+             "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy",
+             "SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+def _dir_ok(path: str) -> bool:
+    st = os.stat(path)
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
 def find_gh() -> str:
-    """Fixed absolute locations only (no PATH lookup); the binary must be root-owned and not group/world-writable."""
+    """Fixed absolute locations only (no PATH lookup). The binary and every parent directory must be root-owned and
+    not group/world-writable. Raises ConfigError (not a verification failure: nothing is wrong with a release)."""
     for p in GH_CANDIDATES:
         try:
             st = os.stat(p)
+            if not stat.S_ISREG(st.st_mode) or not os.access(p, os.X_OK):
+                continue
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                continue
+            parent = os.path.dirname(p)
+            ok = True
+            while True:
+                if not _dir_ok(parent):
+                    ok = False
+                    break
+                if parent == "/":
+                    break
+                parent = os.path.dirname(parent)
+            if ok:
+                return p
         except OSError:
             continue
-        if not stat.S_ISREG(st.st_mode) or not os.access(p, os.X_OK):
-            continue
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            continue
-        return p
-    raise VerifyError("gh not found at a trusted location (%s); install the `github-cli` package" % ", ".join(GH_CANDIDATES))
+    raise ConfigError("gh not found at a trusted root-owned location (%s); install the `github-cli` package"
+                      % ", ".join(GH_CANDIDATES))
 
 
 def gh_environment(gh_dir: str) -> Dict[str, str]:
-    """Child environment: no GH_*/GITHUB_* ambient credentials, private config + cache (TUF) dirs, no prompts."""
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("GH_", "GITHUB_")) and k not in ("GIT_ASKPASS", "SSH_ASKPASS")}
-    cfg = os.path.join(gh_dir, "config")
-    cache = os.path.join(gh_dir, "cache")
-    tmp = os.path.join(gh_dir, "tmp")
-    for d in (cfg, cache, tmp):
-        os.makedirs(d, mode=0o700, exist_ok=True)
+    """Child environment by ALLOWLIST: a few harmless variables, the user's proxy/CA settings, and private
+    HOME/config/cache/tmp directories under the state directory (no stored login or keyring token is ever used)."""
+    env = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
+    d = {n: os.path.join(gh_dir, n) for n in ("home", "config", "xdg-config", "cache", "tmp")}
+    for p in d.values():
+        os.makedirs(p, mode=0o700, exist_ok=True)
     env.update({
-        "GH_CONFIG_DIR": cfg,
-        "XDG_CONFIG_HOME": os.path.join(gh_dir, "xdg-config"),
-        "XDG_CACHE_HOME": cache,
-        "TMPDIR": tmp,
-        "GH_PROMPT_DISABLED": "1",
-        "GH_NO_UPDATE_NOTIFIER": "1",
-        "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
-        "GH_SPINNER_DISABLED": "1",
-        "NO_COLOR": "1",
-        "HOME": os.environ.get("HOME", gh_dir),
+        "HOME": d["home"], "GH_CONFIG_DIR": d["config"], "XDG_CONFIG_HOME": d["xdg-config"],
+        "XDG_CACHE_HOME": d["cache"], "TMPDIR": d["tmp"],
+        "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+        "GH_SPINNER_DISABLED": "1", "NO_COLOR": "1",
     })
     return env
+
+
+def prepare_gh(path: Optional[str], gh_dir: str, log=None) -> str:
+    """Locate (unless injected), then probe `gh --version` against the floor. ConfigError when unusable."""
+    gh = path or find_gh()
+    rc, out, err, timed_out = _run([gh, "--version"], gh_environment(gh_dir), 15)
+    m = VERSION_RE.match(out.decode("utf-8", "replace")) if rc == 0 else None
+    if not m:
+        raise ConfigError("`gh --version` failed or is not recognised")
+    ver = tuple(int(x) for x in m.groups())
+    if ver < GH_MIN_VERSION:
+        raise ConfigError("gh %s is older than the required %s (tested with %s)" % (
+            ".".join(map(str, ver)), ".".join(map(str, GH_MIN_VERSION)), ".".join(map(str, GH_TESTED_VERSION))))
+    if log:
+        log.info("gh_ok", path=gh, version=".".join(map(str, ver)))
+    return gh
 
 
 def _run(argv: List[str], env: Dict[str, str], timeout: int):
@@ -125,9 +163,14 @@ class Attestor:
         if source_digest:
             argv += ["--source-digest", source_digest]
         rc, out, err, timed_out = _run(argv, self.env, VERIFY_TIMEOUT)
+        if timed_out:
+            raise NetworkDeferral("gh attestation verify timed out for %s" % expected_name)
         if rc != 0:
             raise VerifyError("attestation verification failed for %s (rc=%s%s)" % (
                 expected_name, rc, ", timeout" if timed_out else ""))
+        # read-once discipline: the bytes gh looked at must still be the bytes we hashed and parsed
+        if fsio.sha256_file(file_path) != expected_sha256:
+            raise VerifyError("%s changed while it was being verified" % expected_name)
         cert_digest = self._recheck(out, source_ref, source_digest, expected_sha256, expected_name)
         if self.log:
             self.log.info("attestation_ok", subject=expected_name, source_ref=source_ref)

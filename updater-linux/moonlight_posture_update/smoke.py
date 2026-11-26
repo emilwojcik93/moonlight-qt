@@ -84,7 +84,9 @@ def _run(argv, env, timeout, cwd=None):
 
 
 def _sandbox_env(tmp: str, display: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """Throw-away HOME/XDG/TMPDIR: the smoke test must never see the real Moonlight settings."""
+    """Throw-away HOME/XDG/TMPDIR: the smoke test must never see the real Moonlight settings. TMPDIR matters: the
+    AppImage runtime extracts to $TMPDIR (verified), and under ProtectSystem=strict /tmp is read-only.
+    XDG_RUNTIME_DIR is passed only when a display is needed (it comes with `display`); the static mode never gets it."""
     keep = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
     for d in ("home", "config", "data", "cache", "tmp"):
         os.makedirs(os.path.join(tmp, d), mode=0o700, exist_ok=True)
@@ -92,6 +94,7 @@ def _sandbox_env(tmp: str, display: Optional[Dict[str, str]]) -> Dict[str, str]:
         "HOME": os.path.join(tmp, "home"), "XDG_CONFIG_HOME": os.path.join(tmp, "config"),
         "XDG_DATA_HOME": os.path.join(tmp, "data"), "XDG_CACHE_HOME": os.path.join(tmp, "cache"),
         "TMPDIR": os.path.join(tmp, "tmp"), "SDL_AUDIODRIVER": "dummy",
+        "DBUS_SESSION_BUS_ADDRESS": "disabled:",          # no session bus: the smoke test must not talk to the desktop
     })
     if display:
         keep.update(display)
