@@ -6,6 +6,8 @@
 # Writes only below DIR/.local/{bin,lib,share,state,opt} and DIR/.config/{systemd/user,moonlight-posture-updater}.
 # It NEVER touches DIR/.config/"Moonlight Game Streaming Project" (settings, pairing identity).
 # It does not start or enable anything unless --enable is given (only allowed for the real $HOME).
+# A fresh install creates policy.json with mode=report-only: the timer only reports "would install <tag>" until you
+# have run `moonlight-posture-update verify-only` and then `moonlight-posture-update set-mode install`.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -21,6 +23,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$prefix" ] || { echo "install.sh: no prefix and HOME is unset" >&2; exit 2; }
 case "$prefix" in /*) ;; *) echo "install.sh: prefix must be an absolute path" >&2; exit 2 ;; esac
+# the prefix ends up in sed expressions and unit files: only plain path characters
+if [ "$(printf '%s' "$prefix" | tr -d 'A-Za-z0-9._/-' | wc -c)" -ne 0 ] || [ "$(printf '%s' "$prefix" | wc -l)" -ne 0 ]; then
+  echo "install.sh: prefix may only contain [A-Za-z0-9._/-]" >&2; exit 2
+fi
 mkdir -p "$prefix"
 prefix=$(cd "$prefix" && pwd -P)
 
@@ -54,7 +60,14 @@ rm -rf "$lib/moonlight_posture_update.old"
 mv "$tmp" "$lib/moonlight_posture_update"
 rm -rf "$lib/moonlight_posture_update.old"
 
-install -m 755 "$here/bin/moonlight-posture-update" "$bindir/moonlight-posture-update"
+mkdir -p "$lib/bin"
+install -m 755 "$here/bin/moonlight-posture-update" "$lib/bin/moonlight-posture-update"
+# ~/.local/bin only holds symlinks, so the sandboxed job never needs write access to it
+ln -sfn "$lib/bin/moonlight-posture-update" "$bindir/moonlight-posture-update"
+ln -sfn "$prefix/.local/opt/moonlight-posture/launcher/moonlight-posture" "$bindir/moonlight-posture"
+if [ ! -e "$prefix/.config/moonlight-posture-updater/policy.json" ]; then
+  ( umask 077; printf '{\n "schema": 1,\n "mode": "report-only"\n}\n' > "$prefix/.config/moonlight-posture-updater/policy.json" )
+fi
 for u in moonlight-posture-update.service moonlight-posture-update.timer; do
   subst < "$here/systemd/$u" > "$unitdir/$u.new"
   chmod 644 "$unitdir/$u.new"
@@ -73,7 +86,8 @@ if [ "$enable" = 1 ]; then
   [ "$prefix" = "$real_home" ] || { echo "install.sh: --enable is only allowed for the real home directory" >&2; exit 2; }
   systemctl --user daemon-reload
   systemctl --user enable --now moonlight-posture-update.timer
+  echo "timer enabled; nothing is installed until policy.json says mode=install (currently: $(grep -o '"mode": *"[a-z-]*"' "$prefix/.config/moonlight-posture-updater/policy.json" || echo unknown))"
 else
   echo "not enabled. To enable:  systemctl --user daemon-reload && systemctl --user enable --now moonlight-posture-update.timer"
-  echo "check without installing: $bindir/moonlight-posture-update verify-only"
+  echo "mode is report-only: rehearse with  $bindir/moonlight-posture-update verify-only  and switch with  $bindir/moonlight-posture-update set-mode install"
 fi

@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/moonlight-posture-update update
+ExecStart=%h/.local/lib/moonlight-posture-updater/bin/moonlight-posture-update update
 # downloads (<= 10 min) + 3 attestation checks + smoke tests fit well below this
 TimeoutStartSec=30min
 # exit 0 = ok / noop / deferred / held; 8 = network or rate-limit deferral (retried by the next trigger)
@@ -16,13 +16,17 @@ IOSchedulingClass=idle
 UMask=0077
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 
+# /tmp is read-only under ProtectSystem=strict: every temporary file of the updater, gh and the AppImage runtime
+# (`--appimage-extract-and-run` extracts to $TMPDIR) goes to a private directory below the state dir.
 # Hardening available to a user unit. Not used on purpose: PrivateTmp (hides /tmp/.X11-unix from the smoke test),
 # PrivateDevices / SystemCallFilter / MemoryDenyWriteExecute (the smoke test starts Qt + Mesa), ProtectProc (the updater
 # reads /proc to see whether a Moonlight client is running).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/state/moonlight-posture-updater %h/.local/opt/moonlight-posture %h/.local/bin %h/.local/share/applications
+# the lib dir (code + entry script) and ~/.local/bin stay read-only for the sandboxed job and its smoke test;
+# the launcher lives in the opt dir, ~/.local/bin only holds symlinks made by install.sh
+ReadWritePaths=%h/.local/state/moonlight-posture-updater %h/.local/opt/moonlight-posture %h/.local/share/applications
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
