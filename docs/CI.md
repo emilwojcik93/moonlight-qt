@@ -31,14 +31,17 @@ cron (hourly 07-11 UTC + 6-hourly)            manual: workflow_dispatch (tag, dr
      build     (contents:read)   uses ./.github/workflows/build-win-mac.yml (ci_version 6.2.0-daily.B, source_ref = commit,
                                  build_macos false); no secrets exist in that workflow
      linux     (contents:read)   uses ./.github/workflows/build-appimage.yml (same ci_version and source_ref, in parallel with
-                                 build); no secrets exist in that workflow; artifact Moonlight-LinuxAppImage-<ci_version>
-     package   (no permissions)  needs validate + build + linux; MANDATORY version gate (section 3) and AppImage gate
-                                 (section 3, nothing executed) + preview manifest; uploads gate-summary (both summaries)
+                                 build); no secrets exist in that workflow; artifact Moonlight-LinuxAppImage-<ci_version>.
+                                 BEST EFFORT: a failed linux job never blocks the Windows release
+     package   (no permissions)  runs when validate + build succeeded (even if linux failed; not when cancelled);
+                                 MANDATORY version gate (section 3); only if linux succeeded: AppImage gate (section 3, nothing
+                                 executed); preview manifest; uploads gate-summary (+ appimage-gate-summary)
      publish   (contents/attestations/id-token:write; dry_run=false only)
                stage (bytes bound to the gate summaries) -> manifest.json + SHA256SUMS -> actions/attest
                -> self-verify like the Windows updater (online + offline) -> DRAFT release + upload -> digest check
                -> publish -> gh release verify + verify-asset + API immutable == true
-     notify    (actions:write)   dispatches notify.yml on automation (issue + GChat, 24 h de-duplication)
+     notify    (actions:write)   dispatches notify.yml on automation (issue + GChat, 24 h de-duplication); kinds failure
+                                 (Windows side), success, and a separate `linuxskipped` when the linux job failed or was cancelled
 ```
 
 ### Why the build starts from a push, not from `workflow_dispatch`
@@ -121,12 +124,16 @@ is only parsed, never run (no `--appimage-extract`, no `--version`):
 2. ELF header: 64-bit little-endian, machine x86-64, AppImage type-2 magic `AI\x02` at offset 8;
 3. the squashfs starts at `e_shoff + e_shentsize * e_shnum`, has the `hsqs` magic, is squashfs 4.x with a known compression
    (zstd today) and ends inside the file (<= 1 MiB trailing bytes);
-4. the payload is read with `unsquashfs -n -o <offset> -cat` (installed from `squashfs-tools` when absent; the preinstalled
+4. (reader) the payload is read, every reader run bounded by a 300 s wall-clock deadline and the member size cap (the process is
+   killed on timeout or overflow), with `unsquashfs -n -o <offset> -cat` (installed from `squashfs-tools` when absent; the preinstalled
    7-Zip of ubuntu-24.04 is 23.01 and cannot read zstd squashfs) or, when only 7-Zip >= 24.01 exists, `7z e -so -tsquashfs`
    after checking that 7-Zip opened the same offset: `com.moonlight_stream.Moonlight.desktop` must carry
    `X-AppImage-Version=<ci_version>` (linuxdeploy writes `$VERSION` = `$CI_VERSION`), and `usr/bin/moonlight` must be an
-   x86-64 ELF whose NUL-delimited strings contain `<ci_version>` (the `VERSION_STR` define, the string `moonlight --version`
-   prints, which upstream's build job checks by running it) and no other `6.2.0-daily.<n>` string.
+   x86-64 ELF that contains the delimited string `<ci_version>` (the `VERSION_STR` define, the string `moonlight --version`
+   prints, which upstream's build job checks by running it). A version string is delimited when it is not glued to letters, digits,
+   `_`, `-` or `.` (so `Moonlight/6.2.0-daily.N`, `v6.2.0-daily.N`, quoted and `=`-prefixed forms count, which also covers a
+   literal tail-merged into a longer string). Other `6.2.0-daily.<n>` strings are recorded in the summary (`other_versions`,
+   at most 16) and fail the gate only when one is higher than `<ci_version>`.
 
 Both versions exist in the real image (checked on the upstream v6.2.0-daily.202 AppImage: desktop entry and exactly one binary
 string `6.2.0-daily.202`). The gate is a consistency check against mislabelled or stale artifacts, not a defence against a
@@ -185,8 +192,16 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
   build branches cannot poison caches. The job has no `timeout-minutes` (a reusable-workflow call cannot set one; the
   called workflow's own default applies) and a cold first run compiles SDL, FFmpeg, libplacebo and Moonlight.
   The `package` job parses the untrusted AppImage (ELF header, squashfs superblock by hand; payload via `unsquashfs` or 7-Zip) with
-  `permissions: {}` and no secrets, so a reader bug cannot reach a token. A failed Linux build or gate blocks the whole release
-  (one immutable release per tag keeps the Windows and Linux assets under the same attestation; nothing can be added later).
+  `permissions: {}` and no secrets, so a reader bug cannot reach a token.
+* Linux is optional (CONTRACT v1.2): `package` and `publish` use `!cancelled() && validate/build succeeded` (and `package`
+  succeeded for `publish`), never `always()`, so an operator cancel cannot continue into publishing and a failed `linux` job cannot
+  block Windows. Every Linux step is guarded by `needs.linux.result == 'success'`; with it false the staged files, `manifest.json`,
+  `SHA256SUMS`, the attestation subjects, the upload and the verifications are exactly the Windows-only ones (tests execute the real
+  stage steps with `LINUX_OK=false` and compare with a golden generated by the pre-amendment code). Two exclusive attest steps
+  (`attest_both` / `attest_win`) keep one multi-subject bundle in both cases. A Linux build that succeeded but fails its gate
+  still fails `package`: a suspicious artifact stops the release (fail closed); only a missing Linux build is tolerated. Releases
+  are immutable, so a release published without the AppImage never gets one later; the next build (`-vp.N+1`) can.
+  `notify` sends `linuxskipped` (own marker, own 24 h de-duplication) when linux failed or was cancelled; it never counts as `failure`.
 * Secret-free upstream workflow: `build-win-mac.yml` declares **no secrets at all** (no SignPath, no symbol token, no signing
   identity; verified in the trial). Inputs: `ci_version`, `source_ref` (the exact commit SHA), `build_macos: false`. Never run on a
   tag ref.

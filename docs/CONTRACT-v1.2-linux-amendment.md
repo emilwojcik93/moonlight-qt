@@ -21,9 +21,12 @@ Producer implementation: `ci/appimage_gate.py`, `ci/stage_assets.py`, `ci/manife
 * Only x86-64 exists. A future architecture would use another name (`...-aarch64.AppImage`) and its own key; v1.2 consumers
   must ignore assets and keys they do not know.
 * The asset is a release asset of the same immutable release as `MoonlightSetup.exe`: one tag, one build run, one attestation.
-  A release is published only when the Windows build, the Linux build and both gates succeeded (immutable releases cannot be
-  completed later). Releases published before this amendment have no `linux` key and no AppImage: a Linux consumer must treat
-  them as "no Linux asset" (not eligible), never as an error.
+  The Linux part is OPTIONAL per release: if the Linux build fails or is cancelled, the release is published Windows-only
+  (no `linux`/`linux_checks` key, no AppImage, no AppImage line in `SHA256SUMS`, not an attestation subject; byte-identical to a
+  pre-amendment release) and the producer raises a separate `linuxskipped` alert. Immutable releases cannot be completed later,
+  so such a release never gets an AppImage; a later rebuild (`-vp.N+1`) can. Releases without a `linux` key (before the amendment
+  or Windows-only) mean "no Linux asset": a Linux consumer must treat them as not eligible, never as an error. A Linux build that
+  succeeded but fails the producer's gate stops the whole release (fail closed).
 
 ## 2. `manifest.json` additions (additive keys)
 
@@ -40,7 +43,8 @@ Producer implementation: `ci/appimage_gate.py`, `ci/stage_assets.py`, `ci/manife
     "image": {"name": "Moonlight-6.2.0-daily.61616-x86_64.AppImage", "sha256": "<64 hex>", "size": 76913144},
     "elf": {"machine": "x86_64", "appimage_type": 2, "squashfs_offset": 944632},
     "squashfs": {"compression": "zstd", "bytes_used": 75964970},
-    "embedded": {"desktop_version": "6.2.0-daily.61616", "binary_version": "6.2.0-daily.61616", "binary_machine": "x86_64"},
+    "embedded": {"desktop_version": "6.2.0-daily.61616", "binary_version": "6.2.0-daily.61616", "binary_machine": "x86_64",
+                 "other_versions": []},
     "reader": "unsquashfs"
   }
 }
@@ -88,7 +92,9 @@ Fail closed at every step; stop at the first failure and install nothing.
 * The `package` job (no permissions, no secrets) parses the AppImage without executing it and fails the run unless: the name is
   `Moonlight-<ci_version>-x86_64.AppImage`; size is within bounds; ELF 64-bit little-endian x86-64 with `AI\x02` at offset 8;
   the squashfs payload sits where the ELF ends and ends inside the file; the desktop entry `X-AppImage-Version` equals `ci_version`;
-  `usr/bin/moonlight` is an x86-64 ELF containing the `VERSION_STR` string `ci_version` and no other `6.2.0-daily.<n>` string.
+  `usr/bin/moonlight` is an x86-64 ELF containing the delimited `VERSION_STR` string `ci_version`; other `6.2.0-daily.<n>` strings are
+  recorded in `linux_checks.embedded.other_versions` and fail the gate only when higher than `ci_version`.
+* Every squashfs reader process is bounded by a 300 s deadline and a size cap and is killed on either.
 * `publish` re-hashes the staged AppImage against the sha256 the gate inspected, lists it in `manifest.json` / `SHA256SUMS`,
   attests it, self-verifies it online and offline with the flags of step 5, uploads it, compares the release digests and runs
   `gh release verify-asset` on it.
