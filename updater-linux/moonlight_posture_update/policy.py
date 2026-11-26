@@ -32,7 +32,6 @@ DEFAULTS: Dict[str, Any] = {
     "deny": [],
     "smoke_test": "display",        # "display": run `--version` (needs a display) | "static": extract + inspect
     "max_appimage_mb": 250,
-    "keep_previous": 1,
 }
 
 REPO_RE_PARTS = ("[A-Za-z0-9][A-Za-z0-9-]{0,38}", "[A-Za-z0-9._-]{1,100}")
@@ -50,7 +49,6 @@ class Policy:
     deny: List[str] = field(default_factory=list)
     smoke_test: str = "display"
     max_appimage_mb: int = 250
-    keep_previous: int = 1
 
     @property
     def signer_workflow(self) -> str:
@@ -138,11 +136,6 @@ def parse_policy(data: Dict[str, Any]) -> Policy:
         if not _is_int(v) or v < 1 or v > 1024:
             raise ConfigError("policy max_appimage_mb must be 1..1024")
         p.max_appimage_mb = v
-    if "keep_previous" in data:
-        v = data["keep_previous"]
-        if not _is_int(v) or v < 1 or v > 3:
-            raise ConfigError("policy keep_previous must be 1..3")
-        p.keep_previous = v
     return p
 
 

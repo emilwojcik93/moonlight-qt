@@ -14,7 +14,7 @@ import re
 import signal
 import stat
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from . import versioning
 from .errors import NetworkDeferral, VerifyError
@@ -48,12 +48,14 @@ def gh_environment(gh_dir: str) -> Dict[str, str]:
            if not k.startswith(("GH_", "GITHUB_")) and k not in ("GIT_ASKPASS", "SSH_ASKPASS")}
     cfg = os.path.join(gh_dir, "config")
     cache = os.path.join(gh_dir, "cache")
-    for d in (cfg, cache):
+    tmp = os.path.join(gh_dir, "tmp")
+    for d in (cfg, cache, tmp):
         os.makedirs(d, mode=0o700, exist_ok=True)
     env.update({
         "GH_CONFIG_DIR": cfg,
         "XDG_CONFIG_HOME": os.path.join(gh_dir, "xdg-config"),
         "XDG_CACHE_HOME": cache,
+        "TMPDIR": tmp,
         "GH_PROMPT_DISABLED": "1",
         "GH_NO_UPDATE_NOTIFIER": "1",
         "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",

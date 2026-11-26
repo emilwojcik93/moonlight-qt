@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import datetime
 import email.utils
 import errno
 import fcntl
@@ -270,6 +269,8 @@ class Updater:
     def _download_and_verify(self, policy: Policy, c: release.Candidate, run_dir: str) -> Dict[str, Any]:
         tag = c.key.tag
         api = c.assets
+        att = attest.Attestor(self.d.gh_path or attest.find_gh(), self.p.gh_dir, policy.repo, policy.signer_workflow,
+                              run_dir, self.log)             # fails before any download when gh is unusable
         cap_app = policy.max_appimage_mb * 1024 * 1024
         mp = self._fetch(policy, tag, "manifest.json", run_dir, release.MAX_MANIFEST, api)
         sp = self._fetch(policy, tag, "SHA256SUMS", run_dir, release.MAX_SUMS, api)
@@ -285,8 +286,6 @@ class Updater:
         self.log.info("manifest_ok", tag=tag, build=man.build_version, source_sha=man.source_sha)
 
         ref = versioning.source_ref_for(man.key)
-        att = attest.Attestor(self.d.gh_path or attest.find_gh(), self.p.gh_dir, policy.repo, policy.signer_workflow,
-                              run_dir, self.log)
         att.fetch_trusted_root()                       # the only network step of the attestation chain
 
         def verify_with_any(path: str, digest: Optional[str], sha: str, name: str) -> str:

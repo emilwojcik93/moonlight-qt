@@ -4,7 +4,6 @@ import os
 
 import pytest
 
-import fixtures
 from fixtures import Release
 from moonlight_posture_update import versioning
 

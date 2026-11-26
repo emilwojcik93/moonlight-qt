@@ -1,4 +1,3 @@
-import json
 import os
 import stat
 
@@ -76,7 +75,7 @@ def test_verify_only_explicit_tag(env):
 
 def test_launcher_runs_the_installed_appimage(env):
     import subprocess
-    r = env.fake.add(Release(203))
+    env.fake.add(Release(203))
     assert env.run().result == "updated"
     out = subprocess.run([env.paths.launcher, "--version"], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0 and "Moonlight 6.2.0-daily.61624" in out.stdout

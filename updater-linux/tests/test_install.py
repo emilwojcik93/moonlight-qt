@@ -8,9 +8,8 @@ import threading
 
 import pytest
 
-import fixtures
-from fixtures import Release, make_appimage, sha
-from moonlight_posture_update import fsio, policy as pol, state as st, versioning
+from fixtures import Release, make_appimage
+from moonlight_posture_update import fsio, policy as pol, state as st
 from moonlight_posture_update.errors import ConfigError
 
 pytestmark = pytest.mark.skipif(__import__("platform").machine() != "x86_64", reason="x86-64 fixture ELF")
@@ -166,7 +165,7 @@ def test_interrupted_download_leaves_nothing_and_is_transient(env):
 
 
 def test_oversize_asset_by_api_size(env):
-    r = env.fake.add(Release(203))
+    env.fake.add(Release(203))
     env.set_policy(max_appimage_mb=1)                  # fixture is 1.0x MiB
     res = env.run()
     assert res.result == "verify_failed" and "cap" in res.detail

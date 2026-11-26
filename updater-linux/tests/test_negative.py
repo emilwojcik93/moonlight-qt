@@ -5,7 +5,7 @@ import os
 import pytest
 
 import fixtures
-from fixtures import Release, make_appimage, sha, shim_calls
+from fixtures import Release, sha
 
 pytestmark = pytest.mark.skipif(__import__("platform").machine() != "x86_64", reason="x86-64 fixture ELF")
 
@@ -212,7 +212,7 @@ def test_redirect_inside_allowlist_works_and_evil_redirect_refused(env):
     assert env.run().result == "updated"
     # new sandbox state: evil redirect to a host that is not allow-listed
     env.fake.releases.clear()
-    r2 = env.fake.add(Release(204))
+    env.fake.add(Release(204))
     env.fake.redirect = set()
     env.fake.evil_redirect = {"manifest.json"}
     res = env.run()
@@ -236,7 +236,6 @@ def test_failures_back_off_then_deny(env):
     assert env.run().result == "verify_failed"
     assert env.state()["attempts"][r.tag]["verify"] == 1
     # backoff: the next run does not even download
-    n = len(env.fake.requests)
     res = env.run()
     assert res.result == "noop" and "backoff" in res.detail
     # after the backoff expires, two more failures deny the tag

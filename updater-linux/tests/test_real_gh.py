@@ -5,13 +5,12 @@ access for the Sigstore trusted root (fetched once with `gh attestation trusted-
 """
 import hashlib
 import os
-import shutil
 import urllib.request
 
 import pytest
 
 from moonlight_posture_update import attest
-from moonlight_posture_update.errors import NetworkDeferral, VerifyError
+from moonlight_posture_update.errors import VerifyError
 
 pytestmark = [pytest.mark.network,
               pytest.mark.skipif(os.environ.get("MLPU_NETWORK_TESTS") != "1", reason="set MLPU_NETWORK_TESTS=1"),
