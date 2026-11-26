@@ -45,16 +45,38 @@ def test_install_into_prefix_leaves_moonlight_config_alone(prefix, tmp_path):
     assert not marker.exists(), "install.sh must not start or enable anything without --enable"
     assert snapshot(cfg) == before
     assert (prefix / ".local/bin/moonlight-posture-update").stat().st_mode & 0o111
+    # ~/.local/bin holds only symlinks; the code and the entry script live in the (read-only for the job) lib dir
+    assert (prefix / ".local/bin/moonlight-posture-update").is_symlink() and (prefix / ".local/bin/moonlight-posture").is_symlink()
+    assert (prefix / ".local/lib/moonlight-posture-updater/bin/moonlight-posture-update").is_file()
+    # first install starts in report-only
+    pol = json.loads((prefix / ".config/moonlight-posture-updater/policy.json").read_text())
+    assert pol == {"schema": 1, "mode": "report-only"}
     unit = (prefix / ".config/systemd/user/moonlight-posture-update.service").read_text()
     assert "%h" not in unit and str(prefix) in unit              # absolute paths for a non-home prefix
     # nothing outside the documented locations
     for root, _d, files in os.walk(prefix):
         for f in files:
             rel = os.path.relpath(os.path.join(root, f), prefix)
-            assert rel.startswith((".local/", ".config/systemd/user/", ".config/Moonlight Game Streaming Project/")), rel
+            assert rel.startswith((".local/", ".config/systemd/user/", ".config/moonlight-posture-updater/",
+                                   ".config/Moonlight Game Streaming Project/")), rel
     # idempotent
     assert sh([os.path.join(ROOT, "install.sh"), "--prefix", str(prefix)], env=env).returncode == 0
     assert snapshot(cfg) == before
+
+
+def test_install_keeps_an_existing_policy(prefix):
+    d = prefix / ".config/moonlight-posture-updater"; d.mkdir(parents=True)
+    (d / "policy.json").write_text('{"schema": 1, "mode": "install", "hold": true}')
+    assert sh([os.path.join(ROOT, "install.sh"), "--prefix", str(prefix)]).returncode == 0
+    assert json.loads((d / "policy.json").read_text())["mode"] == "install"
+
+
+@pytest.mark.parametrize("bad", ["/tmp/a b", "/tmp/a&b", "/tmp/a$(id)", "/tmp/a;b", "/tmp/a|b", "/tmp/a\\b", "/tmp/a\nb",
+                                 "/tmp/a'b", "/tmp/\u00e4", "/tmp/a`id`", "/tmp/a*"])
+def test_prefix_with_unusual_characters_rejected(bad, tmp_path):
+    for script in ("install.sh", "uninstall.sh"):
+        r = sh([os.path.join(ROOT, script), "--prefix", bad])
+        assert r.returncode == 2 and "may only contain" in r.stderr, (script, bad, r.stderr)
 
 
 def test_enable_refused_for_foreign_prefix(prefix):
@@ -80,7 +102,9 @@ def test_unit_contents():
     svc = open(os.path.join(ROOT, "systemd/moonlight-posture-update.service")).read()
     tmr = open(os.path.join(ROOT, "systemd/moonlight-posture-update.timer")).read()
     assert "Type=oneshot" in svc and "NoNewPrivileges=yes" in svc and "ProtectSystem=strict" in svc
-    assert "ExecStart=%h/.local/bin/moonlight-posture-update update" in svc
+    assert "ExecStart=%h/.local/lib/moonlight-posture-updater/bin/moonlight-posture-update update" in svc
+    rw = [l for l in svc.splitlines() if l.startswith("ReadWritePaths=")][0]
+    assert ".local/bin" not in rw and ".local/lib" not in rw           # entry script + code are read-only for the job
     assert "Moonlight Game Streaming Project" not in svc          # the client's config is not even writable
     assert "OnCalendar=*-*-* 04:17:00" in tmr and "Persistent=true" in tmr
     assert "RandomizedDelaySec=" in tmr and "OnStartupSec=10min" in tmr and "WantedBy=timers.target" in tmr
@@ -106,6 +130,7 @@ def test_uninstall_keeps_client_and_moonlight_config(prefix):
     assert not (prefix / ".local/bin/moonlight-posture-update").exists()
     assert (prefix / ".local/opt/moonlight-posture/v6.2.0-daily.203-vp.1").is_dir()
     r = sh([os.path.join(ROOT, "uninstall.sh"), "--prefix", str(prefix), "--purge"])
+    assert not (prefix / ".local/bin/moonlight-posture").is_symlink()
     assert not (prefix / ".local/opt/moonlight-posture").exists()
     assert (prefix / ".config/Moonlight Game Streaming Project/Moonlight.conf").read_text().endswith("SENTINEL\n")
 

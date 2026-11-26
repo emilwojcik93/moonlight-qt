@@ -9,7 +9,7 @@ import threading
 import pytest
 
 from fixtures import Release, make_appimage
-from moonlight_posture_update import fsio, policy as pol, state as st
+from moonlight_posture_update import fsio, policy as pol, state as st, versioning
 from moonlight_posture_update.errors import ConfigError
 
 pytestmark = pytest.mark.skipif(__import__("platform").machine() != "x86_64", reason="x86-64 fixture ELF")
@@ -21,7 +21,7 @@ def path_of(fh):
 
 
 def tags_on_disk(env):
-    return sorted(n for n in os.listdir(env.paths.opt_dir) if not n.startswith(".") and n != "current")
+    return sorted(n for n in os.listdir(env.paths.opt_dir) if versioning.is_tag(n))
 
 
 # ---- smoke test / health --------------------------------------------------------------------------------------------
@@ -56,7 +56,8 @@ def test_no_display_defers_in_display_mode(env):
     env.display = None
     res = env.run()
     assert res.result == "deferred" and res.exit_code == 0 and "display" in res.detail
-    assert env.current() is None and os.listdir(env.paths.opt_dir) == []
+    assert env.current() is None and not os.path.exists(env.paths.opt_dir)
+    assert not any("/dl/" in p for p in env.fake.requests)          # decided BEFORE downloading anything
     assert env.state()["attempts"] == {}
 
 

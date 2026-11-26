@@ -195,11 +195,14 @@ def test_not_immutable_or_draft_never_chosen(env):
     res = env.run()
     assert res.result == "noop"
     assert not any("/dl/" in p for p in env.fake.requests)
+    log = open(env.paths.log_file).read()
+    assert 'event=release_not_immutable tag="v6.2.0-daily.203-vp.1"' in log
+    assert 'event=release_immutable_flag_absent tag="v6.2.0-daily.204-vp.1"' in log
 
 
 def test_gh_wrong_location_is_refused(monkeypatch, tmp_path):
     from moonlight_posture_update import attest
-    from moonlight_posture_update.errors import VerifyError
+    from moonlight_posture_update.errors import ConfigError as VerifyError
     f = tmp_path / "gh"; f.write_text("#!/bin/sh\n"); f.chmod(0o755)
     monkeypatch.setattr(attest, "GH_CANDIDATES", (str(f),))      # owned by us, not root -> refused
     with pytest.raises(VerifyError):

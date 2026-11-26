@@ -27,7 +27,7 @@ def test_good_feed_installs(env):
     assert "Exec=" in open(env.paths.desktop_file).read()
     # gh invoked with the contract flags, offline root, no token, manifest first
     calls = [c["argv"] for c in shim_calls(env.gh)]
-    assert calls[0] == ["attestation", "trusted-root"]
+    assert calls[0] == ["--version"] and calls[1] == ["attestation", "trusted-root"]
     verifies = [c for c in calls if c[:2] == ["attestation", "verify"]]
     assert len(verifies) == 3
     for v in verifies:

@@ -126,8 +126,26 @@ class Release:
         return e
 
 
+POLICY_YML = """# fixture policy
+schema: 1
+allow_upstream_owners: [Nonary]
+cooling_off_hours: {stable: 24, canary: 0}
+hold: false
+deny: []
+keep_releases: 10
+"""
+
+
 class FakeGitHub:
     def __init__(self) -> None:
+        self.policy_yml: str = POLICY_YML
+        self.branch_sha = "a" * 40
+        self.policy_status = 200                   # status served for the branch/contents calls
+        self.branch_requests = 0
+        self.contents_requests: List[str] = []
+        self.branch_conditional = 0
+        self.drip: set = set()                     # names sent 1 KB at a time with a pause (slow drip)
+        self.timeouts: Dict[str, float] = {}
         self.releases: List[Release] = []
         self.raw_api: Optional[Any] = None          # replace the release list body
         self.served: Dict[str, bytes] = {}          # (tag/name) -> bytes override
@@ -167,9 +185,31 @@ class FakeGitHub:
                 if body:
                     self.wfile.write(body)
 
+            def handle_error(self, *a):  # noqa: D401
+                pass
+
             def do_GET(self):  # noqa: N802
                 fake.requests.append(self.path)
                 p = self.path
+                if "/branches/automation" in p:
+                    fake.branch_requests += 1
+                    if fake.policy_status != 200:
+                        return self._send(fake.policy_status, b"{}")
+                    body = json.dumps({"name": "automation", "commit": {"sha": fake.branch_sha}}).encode()
+                    etag = '"b-%s"' % fake.branch_sha
+                    if self.headers.get("If-None-Match") == etag:
+                        fake.branch_conditional += 1
+                        return self._send(304, b"", {"ETag": etag})
+                    return self._send(200, body, {"ETag": etag})
+                if "/contents/policy.yml" in p:
+                    fake.contents_requests.append(p)
+                    if fake.policy_status != 200:
+                        return self._send(fake.policy_status, b"{}")
+                    import base64
+                    raw = fake.policy_yml.encode()
+                    body = json.dumps({"type": "file", "encoding": "base64", "size": len(raw),
+                                       "content": base64.encodebytes(raw).decode()}).encode()
+                    return self._send(200, body)
                 if p.startswith("/repos/") and "/releases" in p:
                     if fake.rate_limit:
                         return self._send(403, b"{}", {"x-ratelimit-remaining": "0"})
@@ -211,6 +251,19 @@ class FakeGitHub:
                     self.wfile.flush()
                     self.close_connection = True
                     return
+                if name in fake.drip:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    try:
+                        for i in range(0, len(data), 1024):
+                            self.wfile.write(data[i:i + 1024])
+                            self.wfile.flush()
+                            time.sleep(0.2)
+                    except OSError:
+                        pass
+                    self.close_connection = True
+                    return
                 if name in fake.chunked:
                     self.send_response(200)
                     self.send_header("Transfer-Encoding", "chunked")
@@ -234,19 +287,27 @@ class FakeGitHub:
 
     def settings(self) -> HttpSettings:
         base = "http://127.0.0.1:%d" % self.port
-        return HttpSettings(api_base=base, download_base=base + "/dl", allowed_hosts=frozenset({"127.0.0.1"}),
-                            require_https=False, use_env_proxy=False, api_timeout=10, small_timeout=10,
-                            big_timeout=20, socket_timeout=5)
+        kw = dict(api_base=base, download_base=base + "/dl", allowed_hosts=frozenset({"127.0.0.1"}),
+                  require_https=False, use_env_proxy=False, api_timeout=10, small_timeout=10,
+                  big_timeout=20, socket_timeout=5)
+        kw.update(self.timeouts)
+        return HttpSettings(**kw)
 
 
 GH_SHIM = r'''#!%(py)s
 import hashlib, json, os, sys
 a = sys.argv[1:]
 here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(here, "calls.jsonl"), "a") as f:
-    f.write(json.dumps({"argv": a, "env_has_token": any(k.startswith(("GH_TOKEN", "GITHUB_")) for k in os.environ)}) + "\n")
+try:
+    with open(os.path.join(here, "calls.jsonl"), "a") as f:
+        f.write(json.dumps({"argv": a, "env_has_token": any(k.startswith(("GH_TOKEN", "GITHUB_")) for k in os.environ)}) + "\n")
+except OSError:
+    pass
 if any(k in os.environ for k in ("GH_TOKEN", "GITHUB_TOKEN")):
     sys.stderr.write("ambient token leaked into gh\n"); sys.exit(9)
+if a == ["--version"]:
+    vf = os.path.join(here, "version")
+    print(open(vf).read().strip() if os.path.exists(vf) else "gh version 2.105.0 (2026-11-18)"); sys.exit(0)
 if a[:2] == ["attestation", "trusted-root"]:
     if os.path.exists(os.path.join(here, "root_fail")):
         sys.stderr.write("tuf down\n"); sys.exit(1)
@@ -265,6 +326,8 @@ for need in ("--repo", "--bundle", "--signer-workflow", "--source-ref", "--predi
              "--custom-trusted-root", "--deny-self-hosted-runners", "--format"):
     if need not in opts:
         sys.stderr.write("missing flag " + need + "\n"); sys.exit(1)
+if os.path.exists(os.path.join(here, "verify_hang")):
+    import time; time.sleep(60)
 if not os.path.exists(opts["--custom-trusted-root"]):
     sys.stderr.write("no trusted root\n"); sys.exit(1)
 bundle = json.load(open(opts["--bundle"]))
@@ -276,6 +339,9 @@ if opts["--repo"] != c["repo"] or opts["--signer-workflow"] != c["workflow"] or 
     sys.stderr.write("identity mismatch\n"); sys.exit(1)
 if "--source-digest" in opts and opts["--source-digest"] != c["digest"]:
     sys.stderr.write("digest mismatch\n"); sys.exit(1)
+if os.path.exists(os.path.join(here, "mutate_after")):
+    with open(fp, "ab") as f:
+        f.write(b"x")          # the file changes after gh has looked at it
 lie = c.get("liar")
 rep_digest = "f" * 64 if lie == "subject" else digest
 cert_digest = "0" * 40 if lie == "cert" else c["digest"]
@@ -324,6 +390,7 @@ class Env:
         self.display: Optional[Dict[str, str]] = {"WAYLAND_DISPLAY": "wayland-test"}
         self.clock_offset = 0.0
         self._n = 0
+        self.set_policy()
 
     def deps(self) -> Deps:
         self._n += 1
@@ -339,6 +406,7 @@ class Env:
         return self.updater().run(mode, tag)
 
     def set_policy(self, **kw) -> None:
+        kw.setdefault("mode", "install")
         os.makedirs(self.paths.config_dir, exist_ok=True)
         p = self.paths.policy_file
         with open(p, "w") as f:
