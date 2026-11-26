@@ -39,7 +39,7 @@ Producer implementation: `ci/appimage_gate.py`, `ci/stage_assets.py`, `ci/manife
     "ci_version": "6.2.0-daily.61616",
     "image": {"name": "Moonlight-6.2.0-daily.61616-x86_64.AppImage", "sha256": "<64 hex>", "size": 76913144},
     "elf": {"machine": "x86_64", "appimage_type": 2, "squashfs_offset": 944632},
-    "squashfs": {"compression": "zstd", "bytes_used": 75968512},
+    "squashfs": {"compression": "zstd", "bytes_used": 75964970},
     "embedded": {"desktop_version": "6.2.0-daily.61616", "binary_version": "6.2.0-daily.61616", "binary_machine": "x86_64"},
     "reader": "unsquashfs"
   }
