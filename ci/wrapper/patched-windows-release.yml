@@ -10,13 +10,24 @@
 # Trust boundaries:
 #   validate  contents:read           regex-validates ref + .vp-ci/build-meta.json, derives versions
 #   build     contents:read           upstream build-win-mac.yml (reusable, no secrets, no macOS)
-#   linux     contents:read           upstream build-appimage.yml (reusable, no secrets), in parallel
+#   linux     contents:read           upstream build-appimage.yml (reusable, no secrets), in parallel;
+#                                     BEST EFFORT: a failed/cancelled linux job never blocks the
+#                                     Windows release (see "Linux is optional" below)
 #   package   (none)                  parses the untrusted bundle (PE version resources, Burn
 #                                     manifest via 7-Zip); mandatory FileVersion gate 6.2.B.0;
-#                                     parses the untrusted AppImage (ELF/squashfs, never executed);
-#                                     mandatory embedded-version gate; builds a preview manifest
+#                                     only when linux succeeded: parses the untrusted AppImage
+#                                     (ELF/squashfs, never executed) behind a mandatory gate;
+#                                     builds a preview manifest
 #   publish   contents/attestations/id-token:write   hashes, manifests, attests, releases
 #   notify    actions:write           dispatches the alert workflow on the default branch
+#
+# Linux is optional: package/publish run with `always()` but require validate and the Windows
+# build to have succeeded.  Every Linux step (download, gate, stage, manifest keys, attestation
+# subject, upload, verification) runs only when needs.linux.result == 'success'.  Without it the
+# release is byte-for-byte what the Windows-only pipeline produced (no `linux` / `linux_checks`
+# key, no AppImage in SHA256SUMS or the attestation) and notify raises a separate
+# `linuxskipped` alert.  A Linux gate failure on an AppImage that was built still fails package
+# (fail closed on a suspicious artifact).  Dry runs and trials never publish.
 name: Patched Windows Release
 
 on:
@@ -106,7 +117,7 @@ jobs:
       build_macos: false
 
   linux:
-    name: Build Linux AppImage (upstream build-appimage.yml)
+    name: Build Linux AppImage (upstream build-appimage.yml, best effort)
     needs: validate
     permissions:
       contents: read
@@ -120,6 +131,9 @@ jobs:
   package:
     name: Version gates and preview manifest (unprivileged)
     needs: [validate, build, linux]
+    # Runs even when linux failed; Windows must have built.  !cancelled() (not always()) so that a
+    # run cancelled by an operator never continues into packaging or publishing.
+    if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions: {}
@@ -129,6 +143,17 @@ jobs:
         with:
           sparse-checkout: .vp-ci
           persist-credentials: false
+      - name: Make sure a squashfs reader is available (reads the AppImage payload, never runs it)
+        if: needs.linux.result == 'success'
+        run: |
+          set -euo pipefail
+          # unsquashfs handles the zstd squashfs of the AppImage; the preinstalled 7-Zip (23.01 on
+          # ubuntu-24.04) cannot, so install squashfs-tools when it is absent.
+          if ! command -v unsquashfs > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+          fi
+          echo "using $(command -v unsquashfs)"
       - name: Download release artifact (bundle + portable zip)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -145,6 +170,7 @@ jobs:
           name: Moonlight-Windows-arm64-${{ needs.validate.outputs.build_version }}
           path: in/arm64
       - name: Download Linux AppImage
+        if: needs.linux.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: Moonlight-LinuxAppImage-${{ needs.validate.outputs.build_version }}
@@ -158,16 +184,6 @@ jobs:
             sudo apt-get install -y -qq --no-install-recommends 7zip
           fi
           for b in 7zz 7z 7za; do if command -v "$b" > /dev/null; then echo "using $(command -v "$b")"; break; fi; done
-      - name: Make sure a squashfs reader is available (reads the AppImage payload, never runs it)
-        run: |
-          set -euo pipefail
-          # unsquashfs handles the zstd squashfs of the AppImage; the preinstalled 7-Zip (23.01 on
-          # ubuntu-24.04) cannot, so install squashfs-tools when it is absent.
-          if ! command -v unsquashfs > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends squashfs-tools
-          fi
-          echo "using $(command -v unsquashfs)"
       - name: Mandatory gate - bundle, embedded MSIs and Moonlight.exe must be exactly 6.2.B.0 (above upstream 6.2.U.0)
         env:
           UP_TAG: ${{ needs.validate.outputs.tag }}
@@ -179,6 +195,7 @@ jobs:
             --bundle "in/release/MoonlightSetup-${BUILD_VERSION}.exe" \
             --x64-exe in/x64/Moonlight.exe --arm64-exe in/arm64/Moonlight.exe --out gate-summary.json --markdown gate.md
       - name: Mandatory gate - AppImage name, ELF/type-2 magic, squashfs and embedded version must be exactly ci_version (nothing is executed)
+        if: needs.linux.result == 'success'
         env:
           UP_TAG: ${{ needs.validate.outputs.tag }}
           N: ${{ needs.validate.outputs.n }}
@@ -188,8 +205,10 @@ jobs:
           python3 .vp-ci/appimage_gate.py --tag "$UP_TAG" --n "$N" \
             --image "in/linux/Moonlight-${BUILD_VERSION}-x86_64.AppImage" \
             --out appimage-gate-summary.json --markdown appimage-gate.md
-      - name: Stage the installer and AppImage and build the preview manifest
+      - name: Stage the installer and the AppImage if linux succeeded and build the preview manifest
         env:
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
+          LINUX_RESULT: ${{ needs.linux.result }}
           TAG: ${{ needs.validate.outputs.release_tag }}
           UP_TAG: ${{ needs.validate.outputs.tag }}
           UP_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
@@ -205,31 +224,50 @@ jobs:
           GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
         run: |
           set -euo pipefail
+          stage_linux=(); gen_linux=()
+          if [ "$LINUX_OK" = "true" ]; then
+            stage_linux=(--appimage-dir in/linux --appimage-gate-summary appimage-gate-summary.json)
+            gen_linux=(--linux-gate-summary appimage-gate-summary.json)
+          fi
           python3 .vp-ci/stage_assets.py --release-dir in/release --dist preview --ci-version "$BUILD_VERSION" \
-            --gate-summary gate-summary.json --appimage-dir in/linux --appimage-gate-summary appimage-gate-summary.json
+            --gate-summary gate-summary.json "${stage_linux[@]}"
           python3 .vp-ci/manifest_gen.py generate --dist preview --tag "$TAG" --upstream-tag "$UP_TAG" \
             --upstream-commit "$UP_COMMIT" --release-id "$RELEASE_ID" --n "$N" \
             --build-version "$BUILD_VERSION" --file-version "$FILE_VERSION" --run-id "$RUN_ID" \
             --source-ref "$SOURCE_REF" --source-sha "$SOURCE_SHA" --series-sha "$SERIES_SHA" \
             --patch-count "$PATCH_COUNT" --groups "$GROUPS_CSV" \
             --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --gate-summary gate-summary.json \
-            --linux-gate-summary appimage-gate-summary.json --meta .vp-ci/build-meta.json
+            "${gen_linux[@]}" --meta .vp-ci/build-meta.json
           python3 .vp-ci/manifest_gen.py verify --dist preview
-          cp gate-summary.json appimage-gate-summary.json preview/
+          # files of the dry-run artifact: manifest, sums and the gate summaries, never the binaries
+          mkdir preview-upload
+          cp preview/manifest.json preview/SHA256SUMS gate-summary.json preview-upload/
+          if [ "$LINUX_OK" = "true" ]; then cp appimage-gate-summary.json preview-upload/; fi
           {
-            cat gate.md appimage-gate.md
+            cat gate.md
+            if [ "$LINUX_OK" = "true" ]; then
+              cat appimage-gate.md
+            else
+              echo "### Linux AppImage not included (linux job result: ${LINUX_RESULT})"
+            fi
             echo "### Preview manifest (SHA256SUMS)"
             echo '```'
             cat preview/SHA256SUMS
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload gate summaries for the publish job
+      - name: Upload Windows gate summary for the publish job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gate-summary
-          path: |
-            gate-summary.json
-            appimage-gate-summary.json
+          path: gate-summary.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload AppImage gate summary for the publish job
+        if: needs.linux.result == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: appimage-gate-summary
+          path: appimage-gate-summary.json
           retention-days: 7
           if-no-files-found: error
       - name: Upload preview (dry runs only; nothing here is published)
@@ -237,18 +275,18 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-preview
-          path: |
-            preview/manifest.json
-            preview/SHA256SUMS
-            preview/gate-summary.json
-            preview/appimage-gate-summary.json
+          path: preview-upload/
           retention-days: 7
           if-no-files-found: error
 
   publish:
     name: Attest and publish release
     needs: [validate, build, linux, package]
-    if: needs.validate.outputs.dry_run == 'false'
+    # Windows must have built and passed its gate; linux is optional (see the header); a cancelled run
+    # never publishes.  Dry runs and trials (dry_run == 'true') never publish.
+    if: >-
+      ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' &&
+      needs.package.result == 'success' && needs.validate.outputs.dry_run == 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: ${{ needs.validate.outputs.environment }}
@@ -268,14 +306,21 @@ jobs:
           name: Moonlight-Windows-Release-${{ needs.validate.outputs.build_version }}
           path: in/release
       - name: Download Linux AppImage
+        if: needs.linux.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: Moonlight-LinuxAppImage-${{ needs.validate.outputs.build_version }}
           path: in/linux
-      - name: Download gate summaries
+      - name: Download gate summary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: gate-summary
+          path: in/summary
+      - name: Download AppImage gate summary
+        if: needs.linux.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: appimage-gate-summary
           path: in/summary
       - name: Check for an existing release of this tag
         id: existing
@@ -324,9 +369,10 @@ jobs:
           TAG: ${{ needs.validate.outputs.release_tag }}
           REPO: ${{ github.repository }}
         run: gh release delete "$TAG" --repo "$REPO" --yes
-      - name: Stage the installer and AppImage, write manifest.json and SHA256SUMS
+      - name: Stage the installer and the AppImage if linux succeeded, write manifest.json and SHA256SUMS
         if: steps.existing.outputs.state != 'published'
         env:
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
           TAG: ${{ needs.validate.outputs.release_tag }}
           UP_TAG: ${{ needs.validate.outputs.tag }}
           UP_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
@@ -342,25 +388,38 @@ jobs:
           GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
         run: |
           set -euo pipefail
+          stage_linux=(); gen_linux=()
+          if [ "$LINUX_OK" = "true" ]; then
+            stage_linux=(--appimage-dir in/linux --appimage-gate-summary in/summary/appimage-gate-summary.json)
+            gen_linux=(--linux-gate-summary in/summary/appimage-gate-summary.json)
+          fi
           python3 .vp-ci/stage_assets.py --release-dir in/release --dist dist --ci-version "$BUILD_VERSION" \
-            --gate-summary in/summary/gate-summary.json \
-            --appimage-dir in/linux --appimage-gate-summary in/summary/appimage-gate-summary.json
+            --gate-summary in/summary/gate-summary.json "${stage_linux[@]}"
           python3 .vp-ci/manifest_gen.py generate --dist dist --tag "$TAG" --upstream-tag "$UP_TAG" \
             --upstream-commit "$UP_COMMIT" --release-id "$RELEASE_ID" --n "$N" \
             --build-version "$BUILD_VERSION" --file-version "$FILE_VERSION" --run-id "$RUN_ID" \
             --source-ref "$SOURCE_REF" --source-sha "$SOURCE_SHA" --series-sha "$SERIES_SHA" \
             --patch-count "$PATCH_COUNT" --groups "$GROUPS_CSV" \
             --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --gate-summary in/summary/gate-summary.json \
-            --linux-gate-summary in/summary/appimage-gate-summary.json --meta .vp-ci/build-meta.json
+            "${gen_linux[@]}" --meta .vp-ci/build-meta.json
           python3 .vp-ci/manifest_gen.py verify --dist dist
       - name: Attest installer, AppImage, SHA256SUMS and manifest
-        if: steps.existing.outputs.state != 'published'
-        id: attest
+        if: steps.existing.outputs.state != 'published' && needs.linux.result == 'success'
+        id: attest_both
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/MoonlightSetup.exe
             dist/Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage
+            dist/SHA256SUMS
+            dist/manifest.json
+      - name: Attest installer, SHA256SUMS and manifest - Windows only, linux did not succeed
+        if: steps.existing.outputs.state != 'published' && needs.linux.result != 'success'
+        id: attest_win
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/MoonlightSetup.exe
             dist/SHA256SUMS
             dist/manifest.json
       - name: Self-verify the attestation exactly as a consumer would
@@ -370,12 +429,15 @@ jobs:
           REPO: ${{ github.repository }}
           SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
-          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          BUNDLE: ${{ steps.attest_both.outputs.bundle-path || steps.attest_win.outputs.bundle-path }}
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
           LINUX_IMAGE: Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage
         run: |
           set -euo pipefail
           cp "$BUNDLE" dist/attestation.sigstore.json
-          for f in MoonlightSetup.exe "$LINUX_IMAGE" SHA256SUMS manifest.json; do
+          files=(MoonlightSetup.exe SHA256SUMS manifest.json)
+          if [ "$LINUX_OK" = "true" ]; then files+=("$LINUX_IMAGE"); fi
+          for f in "${files[@]}"; do
             ok=0
             for _ in 1 2 3 4; do
               if gh attestation verify "dist/$f" --repo "$REPO" \
@@ -406,6 +468,7 @@ jobs:
           BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
           FILE_VERSION: ${{ needs.validate.outputs.file_version }}
           GROUPS_CSV: ${{ needs.validate.outputs.patch_groups }}
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
           LINUX_IMAGE: Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage
         run: |
           set -euo pipefail
@@ -414,7 +477,6 @@ jobs:
           Unofficial patched build of Nonary/moonlight-qt ${UP_TAG} (upstream commit ${UP_COMMIT}).
 
           * ci_version: ${BUILD_VERSION} (FileVersion ${FILE_VERSION})
-          * Linux x86-64 AppImage: ${LINUX_IMAGE}
           * patch groups: ${GROUPS_CSV}
           * patch series sha256: ${SERIES_SHA}
           * source commit: ${SOURCE_SHA}
@@ -423,21 +485,27 @@ jobs:
           Verify before installing: \`gh release verify ${TAG} -R ${REPO}\` and
           \`gh attestation verify <file> -R ${REPO} --signer-workflow ${REPO}/.github/workflows/patched-windows-release.yml --deny-self-hosted-runners\`.
           NOTES
+          assets=(dist/MoonlightSetup.exe dist/SHA256SUMS dist/manifest.json dist/attestation.sigstore.json)
+          if [ "$LINUX_OK" = "true" ]; then
+            printf '\nLinux x86-64 AppImage: %s\n' "$LINUX_IMAGE" >> notes.md
+            assets=(dist/MoonlightSetup.exe "dist/$LINUX_IMAGE" dist/SHA256SUMS dist/manifest.json dist/attestation.sigstore.json)
+          fi
           gh release create "$TAG" --repo "$REPO" --draft --prerelease --latest=false \
-            --target "$SOURCE_SHA" --title "Moonlight ${TAG}" --notes-file notes.md \
-            dist/MoonlightSetup.exe "dist/$LINUX_IMAGE" dist/SHA256SUMS dist/manifest.json \
-            dist/attestation.sigstore.json
+            --target "$SOURCE_SHA" --title "Moonlight ${TAG}" --notes-file notes.md "${assets[@]}"
       - name: Check uploaded asset digests against local hashes
         if: steps.existing.outputs.state != 'published'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.release_tag }}
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
           LINUX_IMAGE: Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[] | "\(.digest) \(.name)"' > remote.txt
-          for f in MoonlightSetup.exe "$LINUX_IMAGE" SHA256SUMS manifest.json attestation.sigstore.json; do
+          files=(MoonlightSetup.exe SHA256SUMS manifest.json attestation.sigstore.json)
+          if [ "$LINUX_OK" = "true" ]; then files+=("$LINUX_IMAGE"); fi
+          for f in "${files[@]}"; do
             local_hash="sha256:$(sha256sum "dist/$f" | cut -d' ' -f1)"
             grep -qxF "$local_hash $f" remote.txt || { echo "::error::digest mismatch for $f"; exit 1; }
           done
@@ -453,6 +521,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.release_tag }}
+          LINUX_OK: ${{ needs.linux.result == 'success' }}
           LINUX_IMAGE: Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage
         run: |
           set -euo pipefail
@@ -462,8 +531,11 @@ jobs:
             sleep 15
           done
           [ "$ok" = 1 ] || { echo "::error::release is NOT verifiable: enable immutable releases in repository settings (consumers fail closed until then)"; exit 1; }
-          if [ -f dist/MoonlightSetup.exe ]; then gh release verify-asset "$TAG" dist/MoonlightSetup.exe --repo "$REPO"; fi
-          if [ -f "dist/$LINUX_IMAGE" ]; then gh release verify-asset "$TAG" "dist/$LINUX_IMAGE" --repo "$REPO"; fi
+          if [ -f dist/MoonlightSetup.exe ]; then
+            gh release verify-asset "$TAG" dist/MoonlightSetup.exe --repo "$REPO"
+            # no existence guard for the AppImage: when linux succeeded it was staged above, so a missing file is an error
+            if [ "$LINUX_OK" = "true" ]; then gh release verify-asset "$TAG" "dist/$LINUX_IMAGE" --repo "$REPO"; fi
+          fi
           # CONTRACT 3b: offline consumers rely on the API field immutable == true.
           imm="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.immutable')"
           [ "$imm" = "true" ] || { echo "::error::release API reports immutable=${imm}; enable immutable releases"; exit 1; }
@@ -471,7 +543,12 @@ jobs:
   notify:
     name: Alert
     needs: [validate, build, linux, package, publish]
-    if: always() && needs.validate.outputs.trial != 'true' && (contains(needs.*.result, 'failure') || needs.publish.result == 'success')
+    # linux is best effort: its failure raises its own alert kind and is not part of "failure".
+    if: >-
+      always() && needs.validate.outputs.trial != 'true' && (
+      needs.validate.result == 'failure' || needs.build.result == 'failure' || needs.package.result == 'failure' ||
+      needs.publish.result == 'failure' || needs.publish.result == 'success' ||
+      needs.linux.result == 'failure' || needs.linux.result == 'cancelled')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -484,10 +561,21 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           TAG: ${{ needs.validate.outputs.release_tag }}
+          VALIDATE: ${{ needs.validate.result }}
+          BUILD: ${{ needs.build.result }}
+          LINUX: ${{ needs.linux.result }}
+          PACKAGE: ${{ needs.package.result }}
           PUBLISHED: ${{ needs.publish.result }}
         run: |
           set -euo pipefail
-          kind=failure
-          [ "$PUBLISHED" = "success" ] && kind=success
-          gh workflow run notify.yml --repo "$REPO" --ref automation \
-            -f kind="$kind" -f run_id="$RUN_ID" -f tag="$TAG"
+          kinds=()
+          for r in "$VALIDATE" "$BUILD" "$PACKAGE" "$PUBLISHED"; do
+            if [ "$r" = "failure" ]; then kinds+=(failure); break; fi
+          done
+          if [ "$PUBLISHED" = "success" ]; then kinds+=(success); fi
+          # Distinct, separately de-duplicated alert (marker kind=linuxskipped): the Windows release is unaffected.
+          if [ "$LINUX" = "failure" ] || [ "$LINUX" = "cancelled" ]; then kinds+=(linuxskipped); fi
+          for kind in "${kinds[@]}"; do
+            gh workflow run notify.yml --repo "$REPO" --ref automation \
+              -f kind="$kind" -f run_id="$RUN_ID" -f tag="$TAG"
+          done

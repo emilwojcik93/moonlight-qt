@@ -11,7 +11,7 @@ Every issue body carries a hidden marker ``<!-- ml-alert:kind=K;tag=T -->`` that
 (a stuck build would otherwise comment on every hourly poll).
 
 Environment (``env:`` in the workflow):
-  KIND      failure | success | halt | stuck | deadman | moved
+  KIND      failure | success | linuxskipped | halt | stuck | deadman | moved
   TAG       optional upstream tag or release tag
   RUN_ID    optional numeric run id
   REPO      owner/repo of this fork (``github.repository``)
@@ -32,6 +32,7 @@ import vpcommon as v
 KINDS = {
     "failure": ("Build failed", True),
     "success": ("Release published", False),
+    "linuxskipped": ("Linux AppImage not built or not usable; the Windows release is unaffected", True),
     "halt": ("HALT: upstream tag moved", True),
     "moved": ("HALT: upstream tag moved", True),
     "stuck": ("Build stuck, manual action required", True),
