@@ -11,7 +11,7 @@ Steps (same code as the workflow): policy + hold check -> list upstream releases
 ``v6.2.0-daily.U`` (or ``--tag``) -> validate -> dereference the tag -> check the moved-tag pins -> plan (the
 next build number ``N``, build number ``B = 60000 + 8U + N - 1``) -> fetch the tag and verify the commit ->
 ``git am --3way`` the patch series -> sensitive-path report -> assemble ``build/<tag>-nN`` (every upstream
-workflow stripped except ``build-win-mac.yml``, which must end up ``workflow_call`` only; wrapper + ``.vp-ci`` +
+workflow stripped except ``build-win-mac.yml`` and ``build-appimage.yml``, which must end up ``workflow_call`` only; wrapper + ``.vp-ci`` +
 metadata) -> record ``upstream-seen.json`` (local commit on ``automation``) -> push the lock commit, then the
 build branch.
 

@@ -9,7 +9,7 @@ import sys
 import pytest
 
 import prepare_build_branch as pbb
-from test_series_apply_assemble import BUILD_WF, GIT_ENV
+from test_series_apply_assemble import APPIMAGE_WF, BUILD_WF, GIT_ENV
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 UP_TAG = "v6.2.0-daily.202"
@@ -30,6 +30,7 @@ def lab(tmp_path):
     _g(up, "init", "-q", "-b", "master")
     os.makedirs(up / ".github" / "workflows")
     (up / ".github" / "workflows" / "build-win-mac.yml").write_text(BUILD_WF)
+    (up / ".github" / "workflows" / "build-appimage.yml").write_text(APPIMAGE_WF)
     (up / ".github" / "workflows" / "daily.yml").write_text("on: push\njobs: {}\n")
     (up / "app").mkdir()
     (up / "app" / "a.txt").write_text("".join(f"line{i}\n" for i in range(1, 21)))
@@ -98,9 +99,11 @@ def test_dry_run_prints_branch_tip_tree_and_changes_nothing(lab, capsys):
     assert subprocess.run(["git", "-C", str(lab["bare"]), "branch", "-a"], capture_output=True,
                           text=True).stdout.strip() == ""
     src = str(lab["tmp"] / "work" / "src")
-    assert _g(src, "ls-files", ".github").splitlines() == [".github/workflows/build-win-mac.yml",
+    assert _g(src, "ls-files", ".github").splitlines() == [".github/workflows/build-appimage.yml",
+                                                           ".github/workflows/build-win-mac.yml",
                                                            ".github/workflows/patched-windows-release.yml"]
-    assert "workflow_dispatch" not in open(os.path.join(src, ".github", "workflows", "build-win-mac.yml")).read()
+    for name in ("build-win-mac.yml", "build-appimage.yml"):
+        assert "workflow_dispatch" not in open(os.path.join(src, ".github", "workflows", name)).read()
     meta = json.load(open(os.path.join(src, ".vp-ci", "build-meta.json")))
     assert meta["build"]["version"] == "6.2.0-daily.61616" and meta["patches"]["groups"] == ["posture-core"]
 

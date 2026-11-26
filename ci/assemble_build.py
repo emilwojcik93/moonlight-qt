@@ -4,12 +4,13 @@
 Run after ``apply_series.py``.  Steps (all on the already-patched work tree):
 
 1. guard: the patches must not touch submodule gitlinks, ``.gitmodules``, ``.github/``, the
-   installer / packaging / dependency-fetch surface (``wix/``, ``scripts/``, ``setup-deps.*``)
+   installer / packaging / dependency-fetch surface (``wix/``, ``scripts/``, ``app/deploy/``,
+   ``setup-deps.*``)
    or the version file (PLAN R-PAT-2: the pipeline owns every version and CI file);
-2. strip EVERYTHING under ``.github/`` except upstream's reusable ``build-win-mac.yml``
-   (upstream ``push``/``schedule`` workflows would otherwise run inside *our* repository on
-   every pushed build branch) and remove its ``workflow_dispatch`` trigger, so the kept file is
-   ``workflow_call`` only (fail closed if it is not);
+2. strip EVERYTHING under ``.github/`` except upstream's reusable ``build-win-mac.yml`` and
+   ``build-appimage.yml`` (upstream ``push``/``schedule`` workflows would otherwise run inside
+   *our* repository on every pushed build branch) and remove their ``workflow_dispatch`` trigger,
+   so each kept file is ``workflow_call`` only (fail closed if it is not);
 3. install the wrapper workflow template and the ``ci/`` helper scripts
    (as ``.vp-ci/``) and write ``.vp-ci/build-meta.json``;
 4. make one deterministic commit.
@@ -31,11 +32,14 @@ import vpcommon as v
 import workflow_check
 
 BUILD_WORKFLOW = "build-win-mac.yml"
-KEEP_WORKFLOWS = {BUILD_WORKFLOW}
+APPIMAGE_WORKFLOW = "build-appimage.yml"  # Linux AppImage, kept next to the Windows build (CONTRACT v1.2)
+KEEP_WORKFLOWS = {BUILD_WORKFLOW, APPIMAGE_WORKFLOW}
 WRAPPER_NAME = "patched-windows-release.yml"
 FORBIDDEN_PATCH_PATHS = (
     ".github/", ".gitmodules", "wix/", "scripts/", "setup-deps.ps1", "setup-deps.py", "libs/",
     "app/version.txt",
+    # app/deploy/linux/appimage/*.patch is applied to a dependency checkout by build-appimage.yml
+    "app/deploy/",
     # submodule work trees (gitlinks are rejected independently of the path)
     "moonlight-common-c/", "qmdnsengine/", "h264bitstream/", "app/SDL_GameControllerDB",
 )
@@ -57,37 +61,39 @@ def guard_patch_paths(repo: str, base: str) -> List[str]:
 
 
 def strip_github(repo: str) -> List[str]:
-    """Remove every tracked file below ``.github/`` except the reusable build workflow."""
-    keep = f".github/workflows/{BUILD_WORKFLOW}"
+    """Remove every tracked file below ``.github/`` except the reusable build workflows."""
+    keep = {f".github/workflows/{name}" for name in KEEP_WORKFLOWS}
     listed = ap_mod.git(repo, "ls-files", "-z", "--", ".github").stdout.split("\0")
     removed: List[str] = []
     for path in sorted(p for p in listed if p):
-        if path == keep:
+        if path in keep:
             continue
         ap_mod.git(repo, "rm", "-q", "-f", "--", path)
         removed.append(path)
     # ignored / untracked leftovers (e.g. an empty directory) must not survive either
     gh = os.path.join(repo, ".github")
+    keep_abs = {os.path.join(repo, k).replace("\\", "/") for k in keep}
     if os.path.isdir(gh):
         for root, dirs, files in os.walk(gh):
             for name in files:
-                if os.path.join(root, name).replace("\\", "/") != os.path.join(repo, keep).replace("\\", "/"):
+                if os.path.join(root, name).replace("\\", "/") not in keep_abs:
                     os.unlink(os.path.join(root, name))
     return removed
 
 
 def prepare_build_workflow(repo: str) -> None:
-    """Drop ``workflow_dispatch`` from upstream's reusable workflow and require ``workflow_call`` only."""
-    path = os.path.join(repo, ".github", "workflows", BUILD_WORKFLOW)
-    if not os.path.isfile(path) or os.path.islink(path):
-        raise v.ValidationError(f"upstream {BUILD_WORKFLOW} is missing")
-    with open(path, "r", encoding="utf-8", newline="") as fh:
-        text = fh.read()
-    new = workflow_check.drop_workflow_dispatch(text)
-    if new != text:
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(new)
-    workflow_check.require_workflow_call_only(path)  # fail closed on any other trigger
+    """Drop ``workflow_dispatch`` from each kept reusable workflow and require ``workflow_call`` only."""
+    for name in sorted(KEEP_WORKFLOWS):
+        path = os.path.join(repo, ".github", "workflows", name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise v.ValidationError(f"upstream {name} is missing")
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        new = workflow_check.drop_workflow_dispatch(text)
+        if new != text:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(new)
+        workflow_check.require_workflow_call_only(path)  # fail closed on any other trigger
 
 
 def sensitive_block(args: argparse.Namespace) -> Dict[str, Any]:
