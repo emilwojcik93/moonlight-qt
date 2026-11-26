@@ -180,13 +180,22 @@ def sanitize_linux_gate_summary(raw: Any, expected_version: str = "") -> Optiona
         return None
     if emb.get("desktop_version") != ci or emb.get("binary_version") != ci or emb.get("binary_machine") != "x86_64":
         return None
+    others = emb.get("other_versions", [])
+    number = int(ci.rsplit(".", 1)[1])
+    if not isinstance(others, list) or len(others) > appimage_gate.MAX_OTHER_VERSIONS:
+        return None
+    for o in others:  # recorded, never above the expected build
+        if not isinstance(o, str) or appimage_gate.ANY_DAILY_RE.fullmatch(o) is None or o == ci \
+                or int(o.rsplit(".", 1)[1]) > number:
+            return None
     if raw.get("reader") not in ("unsquashfs", "7z"):
         return None
     return {"tool": "appimage_gate", "ci_version": ci,
             "image": {"name": image["name"], "sha256": sha, "size": size},
             "elf": {"machine": "x86_64", "appimage_type": 2, "squashfs_offset": elf["squashfs_offset"]},
             "squashfs": {"compression": sq["compression"], "bytes_used": sq["bytes_used"]},
-            "embedded": {"desktop_version": ci, "binary_version": ci, "binary_machine": "x86_64"},
+            "embedded": {"desktop_version": ci, "binary_version": ci, "binary_machine": "x86_64",
+                         "other_versions": sorted(others, key=lambda x: int(x.rsplit(".", 1)[1]))},
             "reader": raw["reader"]}
 
 

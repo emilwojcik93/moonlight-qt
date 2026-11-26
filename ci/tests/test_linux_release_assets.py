@@ -161,7 +161,8 @@ def test_manifest_with_linux_keys(tmp_path):
     m = json.loads((dist / "manifest.json").read_text())
     data = image_bytes()
     assert m["linux"] == {"installer": NAME, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
-    assert m["linux_checks"]["embedded"] == {"desktop_version": CI, "binary_version": CI, "binary_machine": "x86_64"}
+    assert m["linux_checks"]["embedded"] == {"desktop_version": CI, "binary_version": CI, "binary_machine": "x86_64",
+                                             "other_versions": []}
     assert m["linux_checks"]["image"]["sha256"] == m["linux"]["sha256"] and m["linux_checks"]["image"]["name"] == NAME
     # the Windows contract is untouched: installer, assets[], attestation, build
     assert m["installer"] == "MoonlightSetup.exe" and [a["name"] for a in m["assets"]] == ["MoonlightSetup.exe"]
@@ -359,3 +360,31 @@ def test_cli_chain_gate_stage_manifest_like_the_wrapper(tmp_path, monkeypatch, c
     # the files the attest step lists as subjects all exist next to each other
     for f in ("MoonlightSetup.exe", NAME, "SHA256SUMS", "manifest.json"):
         assert os.path.isfile(os.path.join("dist", f))
+
+
+# --- other version-like strings recorded by the gate (embedded.other_versions) ----------------------------------------
+
+def test_sanitizer_keeps_lower_other_versions_and_defaults_to_empty():
+    s = good_summary()
+    assert mg.sanitize_linux_gate_summary(s, CI)["embedded"]["other_versions"] == []
+    s["embedded"]["other_versions"] = ["6.2.0-daily.61000", "6.2.0-daily.202"]
+    assert mg.sanitize_linux_gate_summary(s, CI)["embedded"]["other_versions"] == ["6.2.0-daily.202", "6.2.0-daily.61000"]
+
+
+@pytest.mark.parametrize("bad", [
+    ["6.2.0-daily.61617"], [CI], ["6.2.0-daily.616161"], ["x"], "6.2.0-daily.202", None, [1],
+    [f"6.2.0-daily.{i}" for i in range(1, 18)], ["6.2.0-daily.202\n"],
+])
+def test_sanitizer_rejects_bad_other_versions(bad):
+    s = good_summary()
+    s["embedded"]["other_versions"] = bad
+    assert mg.sanitize_linux_gate_summary(s, CI) is None
+
+
+def test_manifest_records_other_versions(tmp_path):
+    dist = stage_all(tmp_path)
+    summ = json.loads(open(linux_summary(tmp_path / "o.json")).read())
+    summ["embedded"]["other_versions"] = ["6.2.0-daily.202"]
+    (tmp_path / "o.json").write_text(json.dumps(summ))
+    m = mg.build_manifest(_ns(dist, tmp_path, linux_gate_summary=str(tmp_path / "o.json")))
+    assert m["linux_checks"]["embedded"]["other_versions"] == ["6.2.0-daily.202"]

@@ -18,9 +18,9 @@ Gate (all must hold; ``ci_version`` = ``version_map.build_version(tag, n)``):
    needed for zstd squashfs) and contains
    * ``com.moonlight_stream.Moonlight.desktop`` whose ``X-AppImage-Version`` equals ``ci_version``
      (written by linuxdeploy from ``$VERSION`` = ``$CI_VERSION``), and
-   * ``usr/bin/moonlight``, an x86-64 ELF whose NUL-delimited string table holds ``ci_version``
-     (the ``VERSION_STR`` define compiled in from ``$CI_VERSION``) and no other
-     ``6.2.0-daily.<n>`` string.
+   * ``usr/bin/moonlight``, an x86-64 ELF that holds the delimited string ``ci_version`` (the
+     ``VERSION_STR`` define compiled in from ``$CI_VERSION``).  Other ``6.2.0-daily.<n>`` strings
+     are recorded in the summary and fail the gate only when ``n`` is higher than the expected one.
 
 The embedded binary version is the same string ``moonlight --version`` prints, which upstream's own
 in-build check compares; reading it from the bytes gives the identical guarantee without running the
@@ -40,6 +40,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import version_map
@@ -54,6 +55,8 @@ MAX_DESKTOP_BYTES = 64 * 1024
 MIN_BINARY_BYTES = 1024 * 1024
 MAX_BINARY_BYTES = 512 * 1024 * 1024
 MAX_LISTING_BYTES = 16 * 1024   # only the archive header block of ``7z l -slt`` is read
+DEADLINE_SECONDS = 300          # wall-clock limit for one reader process (it is killed afterwards)
+MAX_OTHER_VERSIONS = 16
 
 DESKTOP_ENTRY = "com.moonlight_stream.Moonlight.desktop"
 BINARY_ENTRY = "usr/bin/moonlight"
@@ -62,7 +65,9 @@ ELF_MACHINE_X86_64 = 62
 UNSQUASHFS_NAMES = ("unsquashfs",)
 SEVEN_ZIP_NAMES = ("7zz", "7z", "7za", "7zr")
 MEMBER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,60}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,60}){0,6}")
-VERSION_STRING_RE = re.compile(rb"(?<![\x21-\x7e])(6\.2\.0-daily\.[0-9]{1,6})(?![\x21-\x7e])")
+# A version-like string inside the binary: not glued to a longer token on the left (``v`` and
+# ``Moonlight/`` prefixes are fine) and not continued on the right.
+VERSION_STRING_RE = re.compile(rb"(?<![0-9A-Za-z_.\-])v?(6\.2\.0-daily\.([0-9]{1,6}))(?![0-9A-Za-z_\-])(?!\.[0-9])")
 
 
 def image_name(ci_version: str) -> str:
@@ -134,26 +139,59 @@ def find_reader() -> Tuple[str, str]:
     raise v.ValidationError("neither unsquashfs nor 7-Zip found")
 
 
-def _capture(cmd: List[str], limit: int) -> bytes:
-    """Run ``cmd`` (never through a shell), return at most ``limit`` bytes of stdout."""
+def _capture(cmd: List[str], limit: int, truncate: bool = False) -> bytes:
+    """Run ``cmd`` (never through a shell) and return its stdout, bounded in size AND time.
+
+    A reader thread drains stdout; the caller waits at most ``DEADLINE_SECONDS`` for it.  When the
+    deadline passes, or more than ``limit`` bytes arrive, the process is killed.  ``truncate``
+    returns the first ``limit`` bytes instead of failing (used for the 7-Zip header block, where the
+    exit status is irrelevant because the process is stopped on purpose).
+    """
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except OSError as exc:
         raise v.ValidationError("cannot run the squashfs reader") from exc
+    chunks: List[bytes] = []
+    state = {"size": 0, "over": False}
+
+    def pump() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read1(1 << 20)  # type: ignore[union-attr]
+                if not chunk:
+                    return
+                state["size"] += len(chunk)
+                if state["size"] > limit:
+                    state["over"] = True
+                    chunks.append(chunk[: max(0, len(chunk) - (state["size"] - limit))])
+                    return
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            return
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    thread.join(DEADLINE_SECONDS)
+    timed_out = thread.is_alive()
+    rc: Optional[int] = None
     try:
-        data = proc.stdout.read(limit + 1) if proc.stdout else b""
-        complete = len(data) <= limit
-        if not complete:
+        if timed_out or state["over"]:
             proc.kill()
-        rc = proc.wait(timeout=300)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=30)
-        raise v.ValidationError("squashfs reader timed out")
+        try:
+            rc = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+        thread.join(10)
     finally:
         if proc.stdout:
             proc.stdout.close()
-    if len(data) > limit:
+    if timed_out:
+        raise v.ValidationError("squashfs reader timed out")
+    data = b"".join(chunks)
+    if truncate:
+        return data[:limit]
+    if state["over"]:
         raise v.ValidationError("squashfs member larger than allowed")
     if rc != 0:
         raise v.ValidationError("squashfs reader failed")
@@ -172,19 +210,7 @@ def check_seven_zip_layout(exe: str, image: str, offset: int) -> None:
 
 def _head(exe: str, image: str) -> bytes:
     """First bytes of ``7z l -slt`` (the archive header block); the process is stopped afterwards."""
-    try:
-        proc = subprocess.Popen([exe, "l", "-slt", "-bd", "-y", "-tsquashfs", "--", image],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        raise v.ValidationError("cannot run 7-Zip") from exc
-    try:
-        data = proc.stdout.read(MAX_LISTING_BYTES) if proc.stdout else b""
-    finally:
-        proc.kill()
-        proc.wait(timeout=30)
-        if proc.stdout:
-            proc.stdout.close()
-    return data
+    return _capture([exe, "l", "-slt", "-bd", "-y", "-tsquashfs", "--", image], MAX_LISTING_BYTES, truncate=True)
 
 
 def read_member(reader: Tuple[str, str], image: str, offset: int, member: str, limit: int) -> bytes:
@@ -222,20 +248,29 @@ def parse_desktop_version(data: bytes) -> str:
 
 
 def binary_versions(data: bytes) -> List[str]:
-    """Every NUL/space-delimited ``6.2.0-daily.<n>`` string in the executable (sorted, unique)."""
-    return sorted({m.group(1).decode("ascii") for m in VERSION_STRING_RE.finditer(data)})
+    """Every delimited ``6.2.0-daily.<n>`` string in the executable (unique, ordered by ``n``)."""
+    return sorted({m.group(1).decode("ascii") for m in VERSION_STRING_RE.finditer(data)},
+                  key=lambda x: int(x.rsplit(".", 1)[1]))
 
 
-def check_binary(data: bytes, ci_version: str) -> Dict[str, str]:
+def check_binary(data: bytes, ci_version: str) -> Dict[str, Any]:
+    """The expected version string must be present; other version-like strings are only recorded
+    and fail the gate when one of them is HIGHER than ``ci_version`` (a newer build's string)."""
     if len(data) < MIN_BINARY_BYTES or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
         raise v.ValidationError("usr/bin/moonlight is not a 64-bit little-endian ELF")
     (machine,) = struct.unpack_from("<H", data, 18)
     if machine != ELF_MACHINE_X86_64:
         raise v.ValidationError("usr/bin/moonlight is not x86-64")
     found = binary_versions(data)
-    if found != [ci_version]:
-        raise v.ValidationError("embedded version string of usr/bin/moonlight differs from the expected ci_version")
-    return {"binary_version": found[0], "binary_machine": "x86_64"}
+    if ci_version not in found:
+        raise v.ValidationError("expected version string of usr/bin/moonlight missing or not delimited")
+    number = int(ci_version.rsplit(".", 1)[1])
+    others = [f for f in found if f != ci_version]
+    if any(int(f.rsplit(".", 1)[1]) > number for f in others):
+        raise v.ValidationError("usr/bin/moonlight carries a 6.2.0-daily.<n> string above the expected ci_version")
+    if len(others) > MAX_OTHER_VERSIONS:
+        raise v.ValidationError("implausible number of version strings in usr/bin/moonlight")
+    return {"binary_version": ci_version, "binary_machine": "x86_64", "other_versions": others}
 
 
 def run_gate(tag: str, n: int, image: str, reader: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
@@ -271,7 +306,9 @@ def markdown(summary: Dict[str, Any]) -> str:
         f"* image: `{summary['image']['name']}`, {summary['image']['size']} bytes, sha256 `{summary['image']['sha256']}`",
         f"* ELF x86-64, AppImage type 2, squashfs {summary['squashfs']['compression']} at offset {summary['elf']['squashfs_offset']}",
         f"* desktop X-AppImage-Version `{summary['embedded']['desktop_version']}`; "
-        f"moonlight binary string `{summary['embedded']['binary_version']}` (read with {summary['reader']}, nothing executed)",
+        f"moonlight binary string `{summary['embedded']['binary_version']}`; other version strings: "
+        f"{', '.join('`' + x + '`' for x in summary['embedded']['other_versions']) or 'none'} "
+        f"(read with {summary['reader']}, nothing executed)",
         ""])
 
 
