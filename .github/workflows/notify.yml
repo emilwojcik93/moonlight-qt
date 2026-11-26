@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: 'failure | success | halt | stuck | deadman'
+        description: 'failure | success | linuxskipped | halt | stuck | deadman'
         type: string
         required: true
       tag:

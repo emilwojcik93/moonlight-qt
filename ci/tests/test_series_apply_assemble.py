@@ -48,6 +48,36 @@ jobs:
 """
 
 
+APPIMAGE_WF = """---
+name: Build - Linux AppImage
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      ci_version:
+        required: true
+        type: string
+      source_ref:
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Version string used for the release artifact
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo hi
+"""
+
+
 def git(repo, *args, check=True):
     env = dict(os.environ)
     env.update(GIT_ENV)
@@ -71,6 +101,7 @@ def world(tmp_path):
     write(repo, "app/a.txt", "".join(f"line{i}\n" for i in range(1, 21)))
     write(repo, "README.md", "hello\n")
     write(repo, ".github/workflows/build-win-mac.yml", BUILD_WF)
+    write(repo, ".github/workflows/build-appimage.yml", APPIMAGE_WF)
     write(repo, ".github/workflows/build.yml", "name: CI\non: push\njobs: {}\n")
     write(repo, ".github/workflows/daily-prerelease.yml", "name: daily\non:\n  schedule:\n    - cron: '47 6 * * *'\njobs: {}\n")
     write(repo, ".github/dependabot.yml", "version: 2\n")
@@ -205,19 +236,25 @@ def assemble_args(world, ci, repo, **over):
     return ns
 
 
-def test_assemble_strips_everything_but_the_reusable_workflow(world):
+def test_assemble_strips_everything_but_the_reusable_workflows(world):
     a = clone_at_base(world, "a")
     ci = make_ci_dir(world["tmp"])
     assert aps.apply(str(a), world["base"], str(world["patches"] / "series"), str(world["patches"])) == 0
     assert asb.assemble(assemble_args(world, ci, a)) == 0
     files = sorted(f for f in git(a, "ls-files").stdout.split() if f.startswith(".github"))
-    assert files == [".github/workflows/build-win-mac.yml", ".github/workflows/patched-windows-release.yml"]
+    assert files == [".github/workflows/build-appimage.yml", ".github/workflows/build-win-mac.yml",
+                     ".github/workflows/patched-windows-release.yml"]
     assert sorted(os.listdir(os.path.join(str(a), ".vp-ci"))) == ["build-meta.json", "vpcommon.py"]
-    # the kept upstream workflow is workflow_call ONLY (dispatch removed by the pipeline)
+    # the kept upstream workflows are workflow_call ONLY (dispatch removed by the pipeline)
     kept = os.path.join(str(a), ".github", "workflows", "build-win-mac.yml")
     wc.require_workflow_call_only(kept)
     text = open(kept, encoding="utf-8").read()
     assert "workflow_dispatch" not in text and "workflow_call:" in text and "runs-on: windows-2025" in text
+    kept_linux = os.path.join(str(a), ".github", "workflows", "build-appimage.yml")
+    wc.require_workflow_call_only(kept_linux)
+    text = open(kept_linux, encoding="utf-8").read()
+    assert "workflow_dispatch" not in text and "workflow_call:" in text and "runs-on: ubuntu-22.04" in text
+    assert "source_ref:" in text.split("jobs:")[0]  # workflow_call inputs untouched
     meta = json.load(open(os.path.join(str(a), ".vp-ci", "build-meta.json")))
     assert meta["build"]["version"] == "6.2.0-daily.61616" and meta["build"]["file_version"] == "6.2.61616.0"
     assert meta["build"]["build_number"] == 61616 and meta["build"]["n"] == 1
@@ -240,7 +277,9 @@ def test_assemble_is_reproducible(world):
 
 @pytest.mark.parametrize("forbidden", [".github/workflows/evil.yml", ".gitmodules", "wix/Moonlight/Product.wxs",
                                        "scripts/generate-bundle.bat", "setup-deps.ps1", "setup-deps.py",
-                                       "app/version.txt", "libs/windows/x.dll", "moonlight-common-c/x.c"])
+                                       "app/version.txt", "libs/windows/x.dll", "moonlight-common-c/x.c",
+                                       "app/deploy/linux/appimage/libplacebo.patch",
+                                       "app/deploy/linux/com.moonlight_stream.Moonlight.desktop"])
 def test_assemble_guard_rejects_protected_paths(world, forbidden):
     a = clone_at_base(world, "a")
     ci = make_ci_dir(world["tmp"])
@@ -322,7 +361,9 @@ def test_real_series_applies_to_daily_202_and_assembles(tmp_path):
                                 sensitive_count="0", trial=False)
         assert asb.assemble(ns) == 0
         files = sorted(f for f in git(wt, "ls-files").stdout.split("\n") if f.startswith(".github"))
-        assert files == [".github/workflows/build-win-mac.yml", ".github/workflows/patched-windows-release.yml"]
-        wc.require_workflow_call_only(os.path.join(str(wt), ".github", "workflows", "build-win-mac.yml"))
+        assert files == [".github/workflows/build-appimage.yml", ".github/workflows/build-win-mac.yml",
+                         ".github/workflows/patched-windows-release.yml"]
+        for name in ("build-win-mac.yml", "build-appimage.yml"):
+            wc.require_workflow_call_only(os.path.join(str(wt), ".github", "workflows", name))
     finally:
         subprocess.run(["git", "-C", ROOT, "worktree", "remove", "--force", str(wt)], capture_output=True)

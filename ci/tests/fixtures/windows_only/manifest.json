@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "product": "moonlight",
+  "tag": "v6.2.0-daily.202-vp.1",
+  "upstream": {
+    "owner": "Nonary",
+    "repo": "moonlight-qt",
+    "tag": "v6.2.0-daily.202",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "release_id": 454272425
+  },
+  "build": {
+    "n": 1,
+    "version": "6.2.0-daily.61616",
+    "msi_product_version": "6.2.61616.0",
+    "number": 61616,
+    "run_id": 123,
+    "workflow": ".github/workflows/patched-windows-release.yml",
+    "source_ref": "refs/heads/build/v6.2.0-daily.202-n1",
+    "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "patches": {
+    "series_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "count": 7,
+    "groups": [
+      "posture-core",
+      "touch-menu"
+    ]
+  },
+  "installer": "MoonlightSetup.exe",
+  "assets": [
+    {
+      "name": "MoonlightSetup.exe",
+      "sha256": "8432b135856d9331bbdb8c36e7c886a1f58f97758e51abc340b3de55b9adbffa",
+      "size": 18
+    }
+  ],
+  "attestation": [
+    "attestation.sigstore.json"
+  ],
+  "created_at": "2026-11-22T07:17:53Z",
+  "installer_checks": {
+    "tool": "bundle_gate",
+    "expected_file_version": "6.2.61616.0",
+    "upstream_file_version": "6.2.202.0",
+    "bundle": {
+      "sha256": "8432b135856d9331bbdb8c36e7c886a1f58f97758e51abc340b3de55b9adbffa",
+      "size": 18,
+      "file_version": "6.2.61616.0"
+    },
+    "burn": {
+      "registration_version": "6.2.61616.0",
+      "msi_packages": [
+        {
+          "id": "Moonlight_x64",
+          "version": "6.2.61616.0"
+        },
+        {
+          "id": "Moonlight_arm64",
+          "version": "6.2.61616.0"
+        }
+      ]
+    },
+    "executables": {
+      "x64": {
+        "file_version": "6.2.61616.0"
+      },
+      "arm64": {
+        "file_version": "6.2.61616.0"
+      }
+    }
+  }
+}

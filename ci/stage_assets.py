@@ -8,6 +8,12 @@ Only the bundle is released; it is staged under the contract name ``MoonlightSet
 value the unprivileged ``package`` job recorded when it ran the version gate on that same artifact
 (closes the gap between the file that was inspected and the file that is attested).
 
+With ``--appimage-dir`` (the contents of upstream's artifact ``Moonlight-LinuxAppImage-<ci_version>``,
+which must hold exactly ``Moonlight-<ci_version>-x86_64.AppImage``) the AppImage is staged under the
+same name.  ``--appimage-gate-summary`` is then mandatory: the staged bytes must hash to the sha256
+the ``appimage_gate.py`` run recorded (CONTRACT v1.2, Linux amendment).  Without the two options the
+behaviour is exactly what it was before.
+
 Files are only hashed / copied, never executed.  Symlinks, unexpected files and oversized files
 are rejected.
 """
@@ -22,6 +28,7 @@ import shutil
 import sys
 from typing import List
 
+import appimage_gate
 import vpcommon as v
 
 INSTALLER = "MoonlightSetup.exe"
@@ -38,6 +45,11 @@ def bundle_name(ci_version: str) -> str:
 def portable_name(ci_version: str) -> str:
     v.require(CI_VERSION_RE, ci_version, "ci_version")
     return f"MoonlightPortable-x64-{ci_version}.zip"
+
+
+def appimage_name(ci_version: str) -> str:
+    """``Moonlight-<ci_version>-x86_64.AppImage`` (validated)."""
+    return appimage_gate.image_name(ci_version)
 
 
 def _regular_files(directory: str) -> List[str]:
@@ -68,7 +80,36 @@ def check_release_dir(release_dir: str, ci_version: str) -> str:
     return path
 
 
-def stage(release_dir: str, dist: str, ci_version: str, gate_summary: str = "") -> List[str]:
+def check_appimage_dir(appimage_dir: str, ci_version: str) -> str:
+    """Validate the Linux artifact content and return the path of the AppImage."""
+    files = _regular_files(appimage_dir)
+    if files != [appimage_name(ci_version)]:
+        raise v.ValidationError("AppImage artifact content is not exactly the expected file")
+    path = os.path.join(appimage_dir, files[0])
+    appimage_gate.read_header(path)  # regular file, size bounds, ELF x86-64, AI 0x02, squashfs superblock
+    return path
+
+
+def _stage_appimage(appimage_dir: str, dist: str, ci_version: str, summary_path: str) -> str:
+    path = check_appimage_dir(appimage_dir, ci_version)
+    name = appimage_name(ci_version)
+    target = os.path.join(dist, name)
+    shutil.copyfile(path, target)
+    with open(summary_path, "r", encoding="utf-8") as fh:
+        summary = json.load(fh)
+    image = summary.get("image") if isinstance(summary, dict) else None
+    if not isinstance(summary, dict) or summary.get("status") != "ok" or summary.get("tool") != "appimage_gate" \
+            or summary.get("ci_version") != ci_version or not isinstance(image, dict) or image.get("name") != name:
+        raise v.ValidationError("AppImage gate summary does not describe this build")
+    if image.get("sha256") != appimage_gate.sha256_file(target) or image.get("size") != os.path.getsize(target):
+        raise v.ValidationError("staged AppImage differs from the file the AppImage gate inspected")
+    return name
+
+
+def stage(release_dir: str, dist: str, ci_version: str, gate_summary: str = "",
+          appimage_dir: str = "", appimage_gate_summary: str = "") -> List[str]:
+    if bool(appimage_dir) != bool(appimage_gate_summary):
+        raise v.ValidationError("--appimage-dir and --appimage-gate-summary go together")
     path = check_release_dir(release_dir, ci_version)
     os.makedirs(dist, exist_ok=True)
     target = os.path.join(dist, INSTALLER)
@@ -83,7 +124,10 @@ def stage(release_dir: str, dist: str, ci_version: str, gate_summary: str = "") 
         recorded = summary.get("bundle", {}).get("sha256") if isinstance(summary, dict) else None
         if recorded != h.hexdigest():
             raise v.ValidationError("staged installer differs from the file the version gate inspected")
-    return [INSTALLER]
+    staged = [INSTALLER]
+    if appimage_dir:
+        staged.append(_stage_appimage(appimage_dir, dist, ci_version, appimage_gate_summary))
+    return staged
 
 
 def main(argv=None) -> int:
@@ -92,9 +136,12 @@ def main(argv=None) -> int:
     ap.add_argument("--dist", required=True)
     ap.add_argument("--ci-version", required=True)
     ap.add_argument("--gate-summary", default="")
+    ap.add_argument("--appimage-dir", default="", help="contents of artifact Moonlight-LinuxAppImage-<ci_version>")
+    ap.add_argument("--appimage-gate-summary", default="", help="summary written by appimage_gate.py")
     args = ap.parse_args(argv)
     try:
-        staged = stage(args.release_dir, args.dist, args.ci_version, args.gate_summary)
+        staged = stage(args.release_dir, args.dist, args.ci_version, args.gate_summary,
+                       args.appimage_dir, args.appimage_gate_summary)
     except (v.ValidationError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         return v.fail(f"stage_assets: {type(exc).__name__}: {str(exc)[:200]}")
     print("staged: " + ", ".join(staged))

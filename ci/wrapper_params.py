@@ -105,11 +105,13 @@ def verify_ancestry(out: Dict[str, str]) -> None:
 
 
 def check_workflows(path: str = ".github/workflows") -> None:
-    allowed = {"build-win-mac.yml", "patched-windows-release.yml"}
+    reusable = ("build-win-mac.yml", "build-appimage.yml")
+    allowed = set(reusable) | {"patched-windows-release.yml"}
     present = set(os.listdir(path))
     if present != allowed:
         raise v.ValidationError("unexpected workflow files present in the build tree")
-    workflow_check.require_workflow_call_only(os.path.join(path, "build-win-mac.yml"))
+    for name in reusable:
+        workflow_check.require_workflow_call_only(os.path.join(path, name))
     extra = [p for p in os.listdir(os.path.dirname(path.rstrip("/")) or ".") if p != "workflows"]
     if extra:
         raise v.ValidationError("unexpected files below .github in the build tree")

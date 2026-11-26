@@ -3,14 +3,20 @@
 
 Both files are written into the ``--dist`` directory next to the assets.
 
-* ``assets[]`` lists the payload files (just ``MoonlightSetup.exe``) with sha256 + size.
-* ``SHA256SUMS`` covers every payload asset **and** ``manifest.json`` (but not itself and not
+* ``assets[]`` lists the Windows payload files (just ``MoonlightSetup.exe``) with sha256 + size.
+* ``SHA256SUMS`` covers every payload asset (the AppImage included, see below) **and** ``manifest.json`` (but not itself and not
   the attestation bundle) -- ``sha256  filename`` lines.
 * ``build.version`` is ``6.2.0-daily.B`` (CONTRACT 3b), ``build.msi_product_version`` the expected
   FileVersion ``6.2.B.0``; consumers read the expected build from the attested ``build.version``.
 * An optional ``--gate-summary`` JSON (from ``bundle_gate.py``, produced by an unprivileged job)
   is re-validated here and embedded under ``installer_checks`` (additive key; consumers ignore
   unknown keys).
+* Linux (CONTRACT v1.2 amendment, additive): with ``--linux-gate-summary`` (from ``appimage_gate.py``)
+  the manifest gains ``linux`` = ``{"installer": "Moonlight-<ci_version>-x86_64.AppImage",
+  "sha256": ..., "size": ...}`` and ``linux_checks`` (the re-validated gate summary); the AppImage
+  is also listed in ``SHA256SUMS``.  ``assets[]``, ``installer`` and every other existing key are
+  left exactly as they were, so a manifest generated without the option is byte-identical to the
+  pre-amendment output.
 
 ``validate_manifest`` is the schema check used by the unit tests and by the publish job right
 before attesting.
@@ -25,6 +31,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+import appimage_gate
 import vpcommon as v
 
 WORKFLOW = ".github/workflows/patched-windows-release.yml"
@@ -142,6 +149,56 @@ def sanitize_gate_summary(raw: Any, expected_version: str = "") -> Optional[Dict
     return out
 
 
+LINUX_NAME_RE = re.compile(r"Moonlight-(6\.2\.0-daily\.[1-9][0-9]{4})-x86_64\.AppImage")
+LINUX_COMPRESSION = ("gzip", "lzma", "lzo", "xz", "lz4", "zstd")
+
+
+def _is_int(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def sanitize_linux_gate_summary(raw: Any, expected_version: str = "") -> Optional[Dict[str, Any]]:
+    """Re-validate the untrusted AppImage gate summary; return a normalised copy (or None)."""
+    if not isinstance(raw, dict) or raw.get("status") != "ok":
+        return None
+    ci = raw.get("ci_version")
+    if not isinstance(ci, str) or appimage_gate.CI_VERSION_RE.fullmatch(ci) is None:
+        return None
+    if expected_version and ci != expected_version:
+        return None
+    image, elf, sq, emb = raw.get("image"), raw.get("elf"), raw.get("squashfs"), raw.get("embedded")
+    if not all(isinstance(x, dict) for x in (image, elf, sq, emb)):
+        return None
+    if image.get("name") != f"Moonlight-{ci}-x86_64.AppImage":
+        return None
+    sha, size = image.get("sha256"), image.get("size")
+    if not isinstance(sha, str) or v.SHA256_RE.fullmatch(sha) is None or not _is_int(size, 1, appimage_gate.MAX_BYTES):
+        return None
+    if elf.get("machine") != "x86_64" or elf.get("appimage_type") != 2 or not _is_int(elf.get("squashfs_offset"), 64, size):
+        return None
+    if sq.get("compression") not in LINUX_COMPRESSION or not _is_int(sq.get("bytes_used"), 1, size):
+        return None
+    if emb.get("desktop_version") != ci or emb.get("binary_version") != ci or emb.get("binary_machine") != "x86_64":
+        return None
+    others = emb.get("other_versions", [])
+    number = int(ci.rsplit(".", 1)[1])
+    if not isinstance(others, list) or len(others) > appimage_gate.MAX_OTHER_VERSIONS:
+        return None
+    for o in others:  # recorded, never above the expected build
+        if not isinstance(o, str) or appimage_gate.ANY_DAILY_RE.fullmatch(o) is None or o == ci \
+                or int(o.rsplit(".", 1)[1]) > number:
+            return None
+    if raw.get("reader") not in ("unsquashfs", "7z"):
+        return None
+    return {"tool": "appimage_gate", "ci_version": ci,
+            "image": {"name": image["name"], "sha256": sha, "size": size},
+            "elf": {"machine": "x86_64", "appimage_type": 2, "squashfs_offset": elf["squashfs_offset"]},
+            "squashfs": {"compression": sq["compression"], "bytes_used": sq["bytes_used"]},
+            "embedded": {"desktop_version": ci, "binary_version": ci, "binary_machine": "x86_64",
+                         "other_versions": sorted(others, key=lambda x: int(x.rsplit(".", 1)[1]))},
+            "reader": raw["reader"]}
+
+
 def sanitize_sensitive(block: Any) -> Dict[str, Any]:
     """Validate the ``sensitive`` block of build-meta.json (strict; raises on anything odd)."""
     if not isinstance(block, dict):
@@ -222,6 +279,29 @@ def validate_manifest(m: Dict[str, Any]) -> None:
             raise v.ValidationError("installer_checks describe a different file than the installer")
     if "sensitive_paths_touched" in m:
         sanitize_sensitive(m["sensitive_paths_touched"])
+    validate_linux(m)
+
+
+def validate_linux(m: Dict[str, Any]) -> None:
+    """Additive ``linux`` / ``linux_checks`` keys (CONTRACT v1.2); both or neither."""
+    lin, chk = m.get("linux"), m.get("linux_checks")
+    if lin is None and chk is None:
+        return
+    if not isinstance(lin, dict) or chk is None or set(lin) != {"installer", "sha256", "size"}:
+        raise v.ValidationError("bad linux block")
+    name = lin["installer"]
+    v.require(v.ASSET_NAME_RE, name, "linux installer name")
+    nm = LINUX_NAME_RE.fullmatch(name)
+    if nm is None or nm.group(1) != m["build"]["version"]:
+        raise v.ValidationError("linux installer name outside the contract or not the build version")
+    v.sha256(lin["sha256"], "linux sha256")
+    if not _is_int(lin["size"], 1, appimage_gate.MAX_BYTES):
+        raise v.ValidationError("bad linux size")
+    clean = sanitize_linux_gate_summary({**chk, "status": "ok"}, m["build"]["version"]) if isinstance(chk, dict) else None
+    if clean is None:
+        raise v.ValidationError("linux_checks inconsistent with the build version")
+    if chk["image"]["sha256"] != lin["sha256"] or chk["image"]["size"] != lin["size"] or chk["image"]["name"] != name:
+        raise v.ValidationError("linux_checks describe a different file than the linux installer")
 
 
 def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
@@ -255,6 +335,18 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
     if summary is None:
         raise v.ValidationError("gate summary failed validation")
     manifest["installer_checks"] = summary
+    linux_summary_path = getattr(args, "linux_gate_summary", None)
+    if linux_summary_path:
+        with open(linux_summary_path, "r", encoding="utf-8") as fh:
+            linux = sanitize_linux_gate_summary(json.load(fh), args.build_version)
+        if linux is None:
+            raise v.ValidationError("linux gate summary failed validation")
+        entry = asset_entry(dist, appimage_gate.image_name(args.build_version))
+        if entry["name"] != linux["image"]["name"] or entry["sha256"] != linux["image"]["sha256"] \
+                or entry["size"] != linux["image"]["size"]:
+            raise v.ValidationError("linux gate summary describes a different file than the staged AppImage")
+        manifest["linux"] = {"installer": entry["name"], "sha256": entry["sha256"], "size": entry["size"]}
+        manifest["linux_checks"] = linux
     validate_manifest(manifest)
     return manifest
 
@@ -282,6 +374,7 @@ def main(argv=None) -> int:
     g.add_argument("--groups", default="posture-core")
     g.add_argument("--created-at", required=True)
     g.add_argument("--gate-summary")
+    g.add_argument("--linux-gate-summary", help="appimage_gate.py summary; adds the additive linux keys")
     g.add_argument("--meta", help="build-meta.json (sensitive upstream paths)")
     sl = sub.add_parser("sensitive-line")
     sl.add_argument("--meta", required=True)
@@ -308,7 +401,10 @@ def main(argv=None) -> int:
         with open(os.path.join(args.dist, "manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
-        write_sums(args.dist, [a["name"] for a in manifest["assets"]] + ["manifest.json"])
+        listed = [a["name"] for a in manifest["assets"]] + ["manifest.json"]
+        if "linux" in manifest:
+            listed.append(manifest["linux"]["installer"])
+        write_sums(args.dist, listed)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         return v.fail(f"manifest_gen: {type(exc).__name__}: {str(exc)[:200]}")
     return 0

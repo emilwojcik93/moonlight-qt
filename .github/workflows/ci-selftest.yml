@@ -45,7 +45,7 @@ jobs:
           curl -sSfL -o al.tgz "https://github.com/rhysd/actionlint/releases/download/v${v}/actionlint_${v}_linux_amd64.tar.gz"
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  al.tgz" | sha256sum -c -
           tar -xzf al.tgz actionlint
-          ./actionlint -color -ignore 'could not read reusable workflow file for "./.github/workflows/build-win-mac.yml"' .github/workflows/*.yml ci/wrapper/patched-windows-release.yml
+          ./actionlint -color -ignore 'could not read reusable workflow file for "./.github/workflows/build-(win-mac|appimage).yml"' .github/workflows/*.yml ci/wrapper/patched-windows-release.yml
       - name: zizmor
         run: |
           set -euo pipefail

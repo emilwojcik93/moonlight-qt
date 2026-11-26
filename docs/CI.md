@@ -1,9 +1,11 @@
 # moonlight-qt patch pipeline: CI/release automation
 
 Scope: `emilwojcik93/moonlight-qt` (public fork of `Nonary/moonlight-qt`). Implements PLAN sections 4.2, 4.3, 4.7,
-5.4, 5.9 (tasks T-4.1, T-4.2) and the producer side of `CONTRACT.md` (v1.1 incl. 3b). It is the moonlight twin of the
+5.4, 5.9 (tasks T-4.1, T-4.2) and the producer side of `CONTRACT.md` (v1.1 incl. 3b, plus the additive Linux amendment v1.2,
+`docs/CONTRACT-v1.2-linux-amendment.md`). It is the moonlight twin of the
 Vibepollo automation (`emilwojcik93/Vibepollo`, branch `automation`, `docs/CI.md`): same design and the same security
-properties, adapted to the daily-tag feed, the `build-win-mac.yml` reusable workflow and the WiX Burn bundle.
+properties, adapted to the daily-tag feed, the `build-win-mac.yml` reusable workflow and the WiX Burn bundle; the same run also builds
+upstream's Linux AppImage (`build-appimage.yml`) and ships it in the same immutable release.
 Everything lives on the `automation` branch (the fork's default branch after the Owner switches it); build branches
 `build/<tag>-n<N>` are generated, never edited by hand.
 
@@ -19,8 +21,8 @@ cron (hourly 07-11 UTC + 6-hourly)            manual: workflow_dispatch (tag, dr
         v
   upstream-watch / prepare   (environment build-push; GITHUB_TOKEN contents:write for upstream-seen.json only)
         |  fetch tag (verify SHA again) -> git am --3way --keep-cr series (pinned identity/dates, reproducible)
-        |  guard: patches may not touch gitlinks, .gitmodules, .github/, wix/, scripts/, setup-deps.*, libs/, version.txt
-        |  strip EVERYTHING below .github/ except build-win-mac.yml (and drop its workflow_dispatch trigger)
+        |  guard: patches may not touch gitlinks, .gitmodules, .github/, wix/, scripts/, app/deploy/, setup-deps.*, libs/, version.txt
+        |  strip EVERYTHING below .github/ except build-win-mac.yml + build-appimage.yml (and drop their workflow_dispatch trigger)
         |  add wrapper + .vp-ci/ + build-meta.json; record upstream-seen.json BEFORE pushing the branch
         |  push build/<tag>-nN with the GitHub App token  ----> push event starts the wrapper
         v
@@ -28,12 +30,18 @@ cron (hourly 07-11 UTC + 6-hourly)            manual: workflow_dispatch (tag, dr
      validate  (contents:read)   regex-check ref + metadata, recompute versions, ancestry check, workflow set
      build     (contents:read)   uses ./.github/workflows/build-win-mac.yml (ci_version 6.2.0-daily.B, source_ref = commit,
                                  build_macos false); no secrets exist in that workflow
-     package   (no permissions)  MANDATORY version gate (section 3) + preview manifest; uploads gate-summary
+     linux     (contents:read)   uses ./.github/workflows/build-appimage.yml (same ci_version and source_ref, in parallel with
+                                 build); no secrets exist in that workflow; artifact Moonlight-LinuxAppImage-<ci_version>.
+                                 BEST EFFORT: a failed linux job never blocks the Windows release
+     package   (no permissions)  runs when validate + build succeeded (even if linux failed; not when cancelled);
+                                 MANDATORY version gate (section 3); only if linux succeeded: AppImage gate (section 3, nothing
+                                 executed); preview manifest; uploads gate-summary (+ appimage-gate-summary)
      publish   (contents/attestations/id-token:write; dry_run=false only)
-               stage (bytes bound to the gate summary) -> manifest.json + SHA256SUMS -> actions/attest
+               stage (bytes bound to the gate summaries) -> manifest.json + SHA256SUMS -> actions/attest
                -> self-verify like the Windows updater (online + offline) -> DRAFT release + upload -> digest check
                -> publish -> gh release verify + verify-asset + API immutable == true
-     notify    (actions:write)   dispatches notify.yml on automation (issue + GChat, 24 h de-duplication)
+     notify    (actions:write)   dispatches notify.yml on automation (issue + GChat, 24 h de-duplication); kinds failure
+                                 (Windows side), success, and a separate `linuxskipped` when the linux job failed or was cancelled
 ```
 
 ### Why the build starts from a push, not from `workflow_dispatch`
@@ -49,6 +57,8 @@ a re-run keeps the run id; then `stuck` + alert).
 |---|---|
 | `patches/`, `tools/`, `upstream.lock`, `policy.yml`, `docs/RESOLVING-ROT.md` | Patch Engineer (series, reference pin, CONTRACT section 5 policy) |
 | `.github/workflows/upstream-watch.yml` | poll, plan, create + push `build/*` branch, record `upstream-seen.json`, re-run failed builds |
+| `ci/appimage_gate.py` | mandatory Linux gate: name, size, ELF x86-64 + AppImage type 2, squashfs superblock, embedded version (never executes the image) |
+| `docs/CONTRACT-v1.2-linux-amendment.md` | additive contract amendment: AppImage asset, manifest key `linux`, consumer verification steps |
 | `ci/wrapper/patched-windows-release.yml` | TEMPLATE copied into each build branch as `.github/workflows/patched-windows-release.yml` |
 | `.github/workflows/notify.yml` | one alert issue (label `automation-alert`, de-duplicated per kind+tag for 24 h) + sanitized GChat post |
 | `.github/workflows/rot-matrix.yml` | apply the series to the last 5 upstream dailies at or above the floor (weekly, and on patch changes) |
@@ -64,7 +74,7 @@ a re-run keeps the run id; then `stuck` + alert).
 Helpers: `vpcommon` (regexes, safe `$GITHUB_OUTPUT` writer), `validate_tag`, `select_release`, `deref_commit`,
 `version_map` (build number rule), `series` (series parser + fingerprint), `policy` (strict `policy.yml` reader, `x-`
 extension keys ignored), `lock_update`, `plan_build`, `apply_series`, `assemble_build`, `workflow_check`,
-`sensitive_paths`, `wrapper_params`, `pe_version` + `bundle_gate` (the version gate), `stage_assets`, `manifest_gen`
+`sensitive_paths`, `wrapper_params`, `pe_version` + `bundle_gate` (the version gate), `appimage_gate` (the Linux gate), `stage_assets`, `manifest_gen`
 (manifest + SHA256SUMS), `notify_text`, `notify_dedupe`, `rot_matrix`.
 
 Differences to the Vibepollo implementation (everything else is a copy): moonlight tag regex / `U`-keyed ordering;
@@ -106,6 +116,32 @@ and embedded in `manifest.json` under the additive key `installer_checks`; `stag
 bytes staged for release hash to the sha256 the gate inspected. Upstream's own in-build checks (`check-daily-packages.ps1`)
 remain as a first line but run inside the untrusted build.
 
+**Mandatory Linux gate** (`package` job, `appimage_gate.py`, CONTRACT v1.2). The artifact `Moonlight-LinuxAppImage-<ci_version>`
+must hold exactly `Moonlight-<ci_version>-x86_64.AppImage` (`ci_version` recomputed from tag + N like the Windows one). The image
+is only parsed, never run (no `--appimage-extract`, no `--version`):
+
+1. name equals `Moonlight-<ci_version>-x86_64.AppImage`; regular file, 16 MiB <= size <= 400 MiB;
+2. ELF header: 64-bit little-endian, machine x86-64, AppImage type-2 magic `AI\x02` at offset 8;
+3. the squashfs starts at `e_shoff + e_shentsize * e_shnum`, has the `hsqs` magic, is squashfs 4.x with a known compression
+   (zstd today) and ends inside the file (<= 1 MiB trailing bytes);
+4. (reader) the payload is read, every reader run bounded by a 300 s wall-clock deadline and the member size cap (the process is
+   killed on timeout or overflow), with `unsquashfs -n -o <offset> -cat` (installed from `squashfs-tools` when absent; the preinstalled
+   7-Zip of ubuntu-24.04 is 23.01 and cannot read zstd squashfs) or, when only 7-Zip >= 24.01 exists, `7z e -so -tsquashfs`
+   after checking that 7-Zip opened the same offset: `com.moonlight_stream.Moonlight.desktop` must carry
+   `X-AppImage-Version=<ci_version>` (linuxdeploy writes `$VERSION` = `$CI_VERSION`), and `usr/bin/moonlight` must be an
+   x86-64 ELF that contains the delimited string `<ci_version>` (the `VERSION_STR` define, the string `moonlight --version`
+   prints, which upstream's build job checks by running it). A version string is delimited when it is not glued to letters, digits,
+   `_`, `-` or `.` (so `Moonlight/6.2.0-daily.N`, `v6.2.0-daily.N`, quoted and `=`-prefixed forms count, which also covers a
+   literal tail-merged into a longer string). Other `6.2.0-daily.<n>` strings are recorded in the summary (`other_versions`,
+   at most 16) and fail the gate only when one is higher than `<ci_version>`.
+
+Both versions exist in the real image (checked on the upstream v6.2.0-daily.202 AppImage: desktop entry and exactly one binary
+string `6.2.0-daily.202`). The gate is a consistency check against mislabelled or stale artifacts, not a defence against a
+malicious build job (same trust boundary as `bundle_gate.py`); the cryptographic guarantee is the attestation of the bytes
+published. The summary (`appimage-gate-summary.json`: name, sha256, size, ELF/squashfs facts, embedded versions) travels in the
+same `gate-summary` artifact, is re-validated by `manifest_gen.sanitize_linux_gate_summary`, embedded under the additive key
+`linux_checks`, and `stage_assets.py --appimage-gate-summary` requires the staged bytes to hash to the sha256 the gate inspected.
+
 ## 4. Security model
 
 Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for this repo:
@@ -123,12 +159,13 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
 * Triggers: `schedule`, `workflow_dispatch`, `push` on `build/**` / `ci-trial/**` only. No `pull_request_target`, no `workflow_run`,
   no comment triggers. Privileged workflows refuse to run off `refs/heads/automation`; the wrapper refuses anything except `build/**`
   and `ci-trial/**` (trial branches are forced dry runs: no attestation, no release, no alerts).
-* Build branches contain NOTHING below `.github/` except `workflows/build-win-mac.yml` and the wrapper (all other upstream
-  workflows, composite actions, dependabot/CODEOWNERS files are removed by `assemble_build.py`). The kept file must have
-  `on:` == exactly `workflow_call`: upstream's `workflow_dispatch` block is cut by a deterministic text transform and the result is
-  re-checked in `assemble_build.py` and again in the `validate` job (`wrapper_params.check_workflows`); any other trigger added by
-  upstream stops the pipeline (fail closed). Patches that touch `.github/`, `.gitmodules`, submodule gitlinks/paths, `wix/`,
-  `scripts/`, `setup-deps.*`, `libs/` or `app/version.txt` are rejected.
+* Build branches contain NOTHING below `.github/` except `workflows/build-win-mac.yml`, `workflows/build-appimage.yml` and the
+  wrapper (all other upstream workflows, composite actions, dependabot/CODEOWNERS files are removed by `assemble_build.py`). Each
+  kept file must have `on:` == exactly `workflow_call`: upstream's `workflow_dispatch` block is cut by a deterministic text
+  transform and the result is re-checked in `assemble_build.py` and again in the `validate` job (`wrapper_params.check_workflows`);
+  any other trigger added by upstream stops the pipeline (fail closed), as does a missing `build-appimage.yml`. Patches that touch
+  `.github/`, `.gitmodules`, submodule gitlinks/paths, `wix/`, `scripts/`, `app/deploy/` (the AppImage workflow applies
+  `app/deploy/linux/appimage/*.patch` to a libplacebo checkout), `setup-deps.*`, `libs/` or `app/version.txt` are rejected.
 * Branch push credentials: `actions/create-github-app-token` with `PUSH_APP_ID` / `PUSH_APP_PRIVATE_KEY`, scoped to this
   repository with `contents:write` + `workflows:write`, only in the `prepare` job (executes no upstream code), environment
   `build-push` (deployment branches: `automation` only). Missing credentials fail the job explicitly; there is deliberately no
@@ -147,6 +184,24 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
 * Moved upstream tag vs `upstream-seen.json` or the `upstream.lock` pin = HALT (job fails, issue + chat alert, nothing built).
 * State ordering: `upstream-seen.json` is committed and pushed to `automation` BEFORE the build branch is pushed; a recorded
   build whose branch push failed is `stuck` (alert), a published release without a state entry is also `stuck`.
+* Linux AppImage build (`linux` job): `build-appimage.yml` declares no secrets either, takes only `ci_version` and `source_ref`
+  (the exact commit), runs on `ubuntu-22.04` with `permissions: contents: read` and enforces `runner.environment == github-hosted`
+  for daily versions. Like `build-win-mac.yml` it is upstream code run inside the secret-free build job and is accepted on the
+  same terms; it additionally downloads unpinned tools (`linuxdeploy` `continuous` releases, the LunarG apt key, `actions/checkout@v5`)
+  and runs `scripts/*` that patches cannot touch. Its cache-save steps only run on the default branch, which never executes it, so
+  build branches cannot poison caches. The job has no `timeout-minutes` (a reusable-workflow call cannot set one; the
+  called workflow's own default applies) and a cold first run compiles SDL, FFmpeg, libplacebo and Moonlight.
+  The `package` job parses the untrusted AppImage (ELF header, squashfs superblock by hand; payload via `unsquashfs` or 7-Zip) with
+  `permissions: {}` and no secrets, so a reader bug cannot reach a token.
+* Linux is optional (CONTRACT v1.2): `package` and `publish` use `!cancelled() && validate/build succeeded` (and `package`
+  succeeded for `publish`), never `always()`, so an operator cancel cannot continue into publishing and a failed `linux` job cannot
+  block Windows. Every Linux step is guarded by `needs.linux.result == 'success'`; with it false the staged files, `manifest.json`,
+  `SHA256SUMS`, the attestation subjects, the upload and the verifications are exactly the Windows-only ones (tests execute the real
+  stage steps with `LINUX_OK=false` and compare with a golden generated by the pre-amendment code). Two exclusive attest steps
+  (`attest_both` / `attest_win`) keep one multi-subject bundle in both cases. A Linux build that succeeded but fails its gate
+  still fails `package`: a suspicious artifact stops the release (fail closed); only a missing Linux build is tolerated. Releases
+  are immutable, so a release published without the AppImage never gets one later; the next build (`-vp.N+1`) can.
+  `notify` sends `linuxskipped` (own marker, own 24 h de-duplication) when linux failed or was cancelled; it never counts as `failure`.
 * Secret-free upstream workflow: `build-win-mac.yml` declares **no secrets at all** (no SignPath, no symbol token, no signing
   identity; verified in the trial). Inputs: `ci_version`, `source_ref` (the exact commit SHA), `build_macos: false`. Never run on a
   tag ref.
@@ -159,9 +214,10 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
 * Immutable releases are checked BEFORE the draft is created (`GET /repos/{repo}/immutable-releases`; if `GITHUB_TOKEN` cannot read
   it the variable `IMMUTABLE_CONFIRMED=true` is required) and a pre-existing tag without a release aborts the job. After publishing:
   `gh release verify`, `verify-asset` and API `immutable == true` (also on re-runs of an already published release).
-* Release assets: `MoonlightSetup.exe` (the Burn bundle, renamed), `SHA256SUMS` (installer + manifest), `manifest.json` (schema 1,
-  `product: "moonlight"`, plus additive keys `installer_checks`, `sensitive_paths_touched`, `build.number`),
-  `attestation.sigstore.json` (ONE bundle covering installer, SHA256SUMS, manifest; verified offline per subject). Created as a draft,
+* Release assets: `MoonlightSetup.exe` (the Burn bundle, renamed), `Moonlight-<ci_version>-x86_64.AppImage` (upstream's AppImage,
+  name unchanged), `SHA256SUMS` (installer + AppImage + manifest), `manifest.json` (schema 1, `product: "moonlight"`, plus additive keys
+  `installer_checks`, `sensitive_paths_touched`, `build.number`, `linux`, `linux_checks`), `attestation.sigstore.json` (ONE bundle covering
+  installer, AppImage, SHA256SUMS, manifest; verified offline per subject). Created as a draft,
   `--prerelease --latest=false`, published after every digest matches. The portable zip is not published.
 * The publish job verifies its own attestation before the release exists, both online and **offline with exactly the flags the Windows
   updater passes** (`--bundle --repo --signer-workflow --source-ref --source-digest --deny-self-hosted-runners --predicate-type
@@ -186,6 +242,24 @@ Identical to the Vibepollo design (see its `docs/CI.md` section 4); restated for
 | Verify a release by hand | `gh release verify <tag> -R emilwojcik93/moonlight-qt`; `gh attestation verify MoonlightSetup.exe -R emilwojcik93/moonlight-qt --signer-workflow emilwojcik93/moonlight-qt/.github/workflows/patched-windows-release.yml --source-ref refs/heads/build/<tag>-n<N> --deny-self-hosted-runners` |
 | Local checks | `python -m pytest ci/tests`; `actionlint`; `zizmor .github/workflows ci/wrapper` |
 
+Trial of the Linux path (dry run: forced for `ci-trial/**`, no attestation, no release, no alerts; the workflow reads
+`.vp-ci/build-meta.json` with `trial: true`). Build the branch locally with the same code the workflow uses, from a clean
+checkout of the branch that carries this pipeline (`automation`), and push it by hand (needs an identity that may push workflow files):
+
+```
+U=9184cacd8d426316bdecc47634f0dbf4e6e34654; TAG=v6.2.0-daily.202; W=$(mktemp -d)
+git init -q $W/src && git -C $W/src fetch -q --no-tags https://github.com/Nonary/moonlight-qt.git refs/tags/$TAG:refs/tags/up
+git -C $W/src checkout -q --detach $U
+python3 ci/apply_series.py --repo $W/src --base $U --series patches/series --patches-dir patches
+python3 ci/assemble_build.py --repo $W/src --ci-dir ci --base $U --tag $TAG --n 0 --branch ci-trial/$TAG-n0 \
+  --release-id 454272425 --published-at 2026-11-22T07:17:53Z --series-sha "$(bash tools/series-sha.sh)" \
+  --patch-count 7 --groups posture-core,touch-menu --trial
+git -C $W/src push https://github.com/emilwojcik93/moonlight-qt.git HEAD:refs/heads/ci-trial/$TAG-n0
+```
+
+Expect `validate`, `build`, `linux`, `package` green and the artifact `release-preview` holding a `manifest.json` with the keys
+`linux` and `linux_checks`. The first `linux` run is cold (dependency and compiler caches are not shared with `build/*` branches).
+
 Alerts: failures open or comment on ONE issue labelled `automation-alert` (Issues must be enabled) and, when the secret
 `GCHAT_WEBHOOK_URL` exists, post a sanitized one-line message (webhook URL through curl `-K -` on stdin). The same kind+tag is not
 repeated within 24 hours (hidden marker `<!-- ml-alert:kind=K;tag=T -->` in the issue body/comments). Missing secret = silent skip.
@@ -201,7 +275,9 @@ repeated within 24 hours (hidden marker `<!-- ml-alert:kind=K;tag=T -->` in the 
 | `build.source_ref == refs/heads/build/v6.2.0-daily.U-nN`, `build.source_sha` 40 hex | exact; `source_sha` = `github.sha` of the signing run = attestation `SourceRepositoryDigest` |
 | `upstream.owner` in policy + local allow-list | `Nonary` |
 | attestation subjects include installer, `SHA256SUMS`, `manifest.json`; verified offline with `--source-digest manifest.source_sha` | one multi-subject SLSA provenance v1 bundle; self-verified with the identical flags in `publish` |
-| SHA256SUMS lines `sha256  name` for installer (+ `manifest.json`) | exact; `manifest.json` hash is in the sums |
+| SHA256SUMS lines `sha256  name` for installer (+ `manifest.json`) | exact; `manifest.json` hash is in the sums; one more line for the AppImage (ignored by the Windows updater: it looks up its installer by name) |
+| (Linux, v1.2) asset `Moonlight-<ci_version>-x86_64.AppImage`, manifest key `linux` = `{installer, sha256, size}` | additive: `assets[]`, `installer`, `installer_checks` and every other key unchanged; the AppImage is an attestation subject and a release asset; `linux_checks` carries the gate summary (`manifest_gen.validate_linux`) |
+| (Linux, v1.2) embedded version of the AppImage = `manifest.build.version` | enforced by the Linux gate (section 3) |
 | release flagged `immutable` (API) | enforced before creating the draft and asserted after publishing |
 | signer workflow `.github/workflows/patched-windows-release.yml` | the `publish` job lives in that file (attest runs directly in it) |
 | FileVersion of the installed Moonlight.exe = `6.2.B.0` | enforced by the version gate (section 3) |

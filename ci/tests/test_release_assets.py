@@ -310,15 +310,20 @@ def test_wrapper_workflow_set_check(tmp_path):
     call_only = "name: x\non:\n  workflow_call:\n    inputs: {}\njobs: {}\n"
     (d / "build-win-mac.yml").write_text(call_only)
     (d / "patched-windows-release.yml").write_text("x")
+    with pytest.raises(v.ValidationError):  # the AppImage workflow is part of the allowed set and required
+        wp.check_workflows(str(d))
+    (d / "build-appimage.yml").write_text(call_only)
     wp.check_workflows(str(d))
     (d / "build.yml").write_text("x")
     with pytest.raises(v.ValidationError):
         wp.check_workflows(str(d))
     (d / "build.yml").unlink()
-    (d / "build-win-mac.yml").write_text("name: x\non:\n  workflow_call:\n  workflow_dispatch:\njobs: {}\n")
-    with pytest.raises(v.ValidationError):  # dispatch trigger must have been removed by the assembler
-        wp.check_workflows(str(d))
-    (d / "build-win-mac.yml").write_text(call_only)
+    with_dispatch = "name: x\non:\n  workflow_call:\n  workflow_dispatch:\njobs: {}\n"
+    for name in ("build-win-mac.yml", "build-appimage.yml"):
+        (d / name).write_text(with_dispatch)
+        with pytest.raises(v.ValidationError):  # dispatch trigger must have been removed by the assembler
+            wp.check_workflows(str(d))
+        (d / name).write_text(call_only)
     (gh / "dependabot.yml").write_text("version: 2\n")
     with pytest.raises(v.ValidationError):
         wp.check_workflows(str(d))
