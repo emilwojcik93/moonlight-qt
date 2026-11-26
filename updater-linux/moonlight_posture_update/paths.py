@@ -59,7 +59,16 @@ class Paths:
         return os.path.join(self.home, ".local", "bin")
 
     @property
+    def launcher_dir(self) -> str:
+        """Real launcher lives inside the updater's writable tree; ~/.local/bin only holds symlinks made by install.sh."""
+        return os.path.join(self.opt_dir, "launcher")
+
+    @property
     def launcher(self) -> str:
+        return os.path.join(self.launcher_dir, "moonlight-posture")
+
+    @property
+    def launcher_link(self) -> str:
         return os.path.join(self.bin_dir, "moonlight-posture")
 
     @property

@@ -1,7 +1,9 @@
 """Orchestrator. Order (every step fails closed):
 
-  lock -> policy -> state -> hold -> idle check 1 -> release list (ETag) -> filter/select (tag regex, immutable,
-  deny, floor, build > installed, cooling-off, backoff) -> manifest + SHA256SUMS + bundle -> manifest checks ->
+  lock -> local policy -> state -> hold -> idle check 1 -> policy.yml of branch `automation` (narrows: hold, deny, owners,
+  cooling-off floor; network trouble defers) -> release list (ETag) -> filter/select (tag regex, immutable,
+  deny, floor, build > installed, cooling-off, backoff) -> report-only stops here ("would install") -> display check for
+  the smoke test -> gh usable? (ConfigError, never a verification failure) -> manifest + SHA256SUMS + bundle -> manifest checks ->
   trusted root -> attest manifest and SHA256SUMS -> AppImage (size == manifest == API) -> format gate -> attest
   AppImage -> SHA-256 == SUMS == manifest == API digest   (verify-only stops here)
   -> idle check 2 -> stage copy (hash while copying) -> smoke test -> idle check 3 -> commit -> launcher/desktop ->
@@ -13,6 +15,7 @@ from __future__ import annotations
 import email.utils
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -20,13 +23,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from . import attest, fsio, procs, release, smoke, state as st, versioning
+from . import attest, fsio, procs, release, remote_policy, smoke, state as st, versioning
 from .errors import (ConfigError, Deferred, InstallError, LockedError, NetworkDeferral, RollbackError,
                      UpdaterError, VerifyError)
 from .logutil import Logger
 from .net import Http, HttpSettings
 from .paths import Paths
-from .policy import Policy, load_policy, write_hold
+from .policy import Policy, load_policy, update_local, write_hold, write_mode
 from .store import Store
 
 RUN_DIRS_KEEP = 3
@@ -149,10 +152,17 @@ class Updater:
             self.log.info("held")
             return Result("held", "", "policy hold is set")
         link_tag = self.store.current_tag()
+        self._reconcile(state, link_tag)
         installed = st.installed_build(state, link_tag)
         self.log.info("installed", build=installed if installed is not None else "none", link=link_tag or "none")
         if not verify_only:
             self._idle_check("start")
+        # branch `automation` policy.yml: may only narrow (hold, deny, owners, higher cooling-off). Network trouble defers.
+        remote = remote_policy.fetch(self.http, policy.repo, self.p.cache_dir, self.log)
+        policy = policy.narrowed_by(remote)
+        if policy.hold and not verify_only:
+            self.log.info("held", source="remote" if remote.hold else "local")
+            return Result("held", "", "policy hold is set (remote)")
 
         releases, server_now = self._release_list(policy, state)
         now = self._now()
@@ -201,6 +211,12 @@ class Updater:
         self._tag = tag
         self.log.info("selected", tag=tag, build=chosen.key.build)
 
+        if not verify_only:
+            if policy.mode != "install":
+                self.log.info("would_install", tag=tag)
+                return Result("report-only", tag, "would install %s; run verify-only, then `set-mode install`" % tag)
+            if policy.smoke_test == "display" and self.d.display_env() is None:
+                raise Deferred("no display available for the smoke test (set smoke_test=static for headless hosts)", tag)
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         fsio.ensure_private_dir(run_dir)
         ver = self._download_and_verify(policy, chosen, run_dir)
@@ -208,6 +224,21 @@ class Updater:
             self.log.info("verified", tag=tag, sha256=ver["sha256"])
             return Result("verified", tag, "chain verified, nothing installed")
         return self._install(policy, state, chosen, ver, run_dir)
+
+    def _reconcile(self, state: Dict[str, Any], link_tag: Optional[str]) -> None:
+        """`current` is ahead of state.json (a run was killed between the symlink switch and the state write):
+        adopt the installed version recorded in its INSTALL.json."""
+        inst = state.get("installed")
+        if not link_tag or (inst and inst["tag"] == link_tag):
+            return
+        meta = self.store.read_meta(link_tag)
+        key = versioning.parse_tag(link_tag)
+        if not meta or not os.path.isfile(self.store.appimage_path(link_tag)) or (inst and inst["build"] > key.build):
+            return
+        state["previous"] = inst if inst and inst["build"] < key.build and inst["tag"] in self.store.installed_tags() else None
+        state["installed"] = {"tag": link_tag, "build": key.build, "sha256": meta["sha256"],
+                              "installed_at": meta.get("installed_at")}
+        self.log.warn("state_reconciled", tag=link_tag)
 
     # ---- release list --------------------------------------------------------------------------------------------
     def _release_list(self, policy: Policy, state: Dict[str, Any]):
@@ -247,7 +278,7 @@ class Updater:
 
     # ---- download + verification ------------------------------------------------------------------------------------
     def _fetch(self, policy: Policy, tag: str, name: str, run_dir: str, cap: int, api: Dict[str, Any],
-               expected_size: Optional[int] = None, big: bool = False) -> str:
+               expected_size: Optional[int] = None, big: bool = False):
         if name not in api:
             raise VerifyError("release has no asset '%s'" % name, tag)
         meta = api[name]
@@ -264,25 +295,32 @@ class Updater:
         if meta["digest"] is not None and meta["digest"] != "sha256:" + digest:
             raise VerifyError("%s does not match the release API digest" % name, tag)
         self.log.info("downloaded", asset=name, bytes=size)
-        return dest
+        return dest, digest
 
     def _download_and_verify(self, policy: Policy, c: release.Candidate, run_dir: str) -> Dict[str, Any]:
         tag = c.key.tag
         api = c.assets
-        att = attest.Attestor(self.d.gh_path or attest.find_gh(), self.p.gh_dir, policy.repo, policy.signer_workflow,
-                              run_dir, self.log)             # fails before any download when gh is unusable
+        # an unusable gh (missing, too old, untrusted location) is a configuration problem, never a verification failure
+        # of the release: ConfigError, found before anything is downloaded
+        os.makedirs(self.p.gh_dir, mode=0o700, exist_ok=True)
+        gh = attest.prepare_gh(self.d.gh_path, self.p.gh_dir, self.log)
+        att = attest.Attestor(gh, self.p.gh_dir, policy.repo, policy.signer_workflow, run_dir, self.log)
         cap_app = policy.max_appimage_mb * 1024 * 1024
-        mp = self._fetch(policy, tag, "manifest.json", run_dir, release.MAX_MANIFEST, api)
-        sp = self._fetch(policy, tag, "SHA256SUMS", run_dir, release.MAX_SUMS, api)
+        mp, m_sha = self._fetch(policy, tag, "manifest.json", run_dir, release.MAX_MANIFEST, api)
+        sp, s_sha = self._fetch(policy, tag, "SHA256SUMS", run_dir, release.MAX_SUMS, api)
+        # read once: the bytes that are hashed, parsed and handed to gh are the same (gh re-checks the hash afterwards)
         with open(mp, "rb") as f:
             raw_manifest = f.read()
-        man = release.parse_manifest(raw_manifest, tag, policy.upstream_owners, cap_app)
-        man.manifest_sha256 = fsio.sha256_file(mp)
         with open(sp, "rb") as f:
-            sums = release.parse_sums(f.read())
+            raw_sums = f.read()
+        if hashlib.sha256(raw_manifest).hexdigest() != m_sha or hashlib.sha256(raw_sums).hexdigest() != s_sha:
+            raise VerifyError("a downloaded file changed after it was written", tag)
+        man = release.parse_manifest(raw_manifest, tag, policy.upstream_owners, cap_app)
+        man.manifest_sha256 = m_sha
+        sums = release.parse_sums(raw_sums)
         if "manifest.json" in sums and sums["manifest.json"] != man.manifest_sha256:
             raise VerifyError("manifest.json does not match SHA256SUMS", tag)
-        bundles = [self._fetch(policy, tag, b, run_dir, release.MAX_BUNDLE, api) for b in man.bundles]
+        bundles = [self._fetch(policy, tag, b, run_dir, release.MAX_BUNDLE, api)[0] for b in man.bundles]
         self.log.info("manifest_ok", tag=tag, build=man.build_version, source_sha=man.source_sha)
 
         ref = versioning.source_ref_for(man.key)
@@ -303,12 +341,11 @@ class Updater:
             raise VerifyError("attested source digest differs from manifest build.source_sha", tag)
         if "SHA256SUMS" not in api:
             raise VerifyError("release has no SHA256SUMS", tag)
-        verify_with_any(sp, man.source_sha, fsio.sha256_file(sp), "SHA256SUMS")
+        verify_with_any(sp, man.source_sha, s_sha, "SHA256SUMS")
 
         # the AppImage is downloaded only after manifest + SUMS are attested
-        ap = self._fetch(policy, tag, man.appimage, run_dir, cap_app, api, expected_size=man.appimage_size, big=True)
+        ap, sha = self._fetch(policy, tag, man.appimage, run_dir, cap_app, api, expected_size=man.appimage_size, big=True)
         smoke.check_format(ap, cap_app)
-        sha = fsio.sha256_file(ap)
         verify_with_any(ap, man.source_sha, sha, man.appimage)
         meta = api[man.appimage]
         release.check_hashes(sha, man.appimage, sums, man, meta["digest"], meta["size"], os.path.getsize(ap))
@@ -344,7 +381,7 @@ class Updater:
                 os.makedirs(smoke_tmp2, mode=0o700, exist_ok=True)
                 smoke.run_smoke(os.path.join(self.p.current_link, "Moonlight.AppImage"), man.build_version,
                                 policy.smoke_test, smoke_tmp2, self.d.display_env())
-            except UpdaterError as e:
+            except (UpdaterError, OSError) as e:
                 self.log.error("post_switch_smoke_failed", detail=str(e))
                 self._undo_switch(prev_tag, tag)
                 switched = False
@@ -492,8 +529,24 @@ class Updater:
             state["last_result"] = "rolled_back"
             state["last_check"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._now()))
             self._save(state)
-            self.log.info("rolled_back", frm=cur, to=prev)
-            return self._emit(Result("rolled_back", prev, "current %s -> %s; %s is denied" % (cur, prev, cur)))
+            # also persist the denial in policy.json (a damaged state.json must not lose it) and raise the local floor
+            # above the build rolled back from, so an intermediate newer build is not installed next
+            floor = min(cur_build + 1, versioning.MAX_BUILD)
+
+            def mutate(d: Dict[str, Any]) -> None:
+                deny = [t for t in d.get("deny", []) if isinstance(t, str)]
+                if cur not in deny:
+                    deny.append(cur)
+                d["deny"] = deny
+                d["min_build"] = max(int(d.get("min_build", 0)), floor)
+            note = ""
+            try:
+                update_local(self.p.policy_file, mutate)
+            except (ConfigError, OSError) as e:
+                note = "; policy.json NOT updated (%s)" % str(e)[:60]
+                self.log.error("policy_update_failed", detail=str(e)[:100])
+            self.log.info("rolled_back", frm=cur, to=prev, min_build=floor)
+            return self._emit(Result("rolled_back", prev, "current %s -> %s; %s denied, min_build %d%s" % (cur, prev, cur, floor, note)))
         return self._locked(go)
 
     def _idle_check_rollback(self) -> None:
@@ -543,6 +596,11 @@ class Updater:
             out["gh"] = None
         return out
 
+    def set_mode(self, mode: str) -> Result:
+        write_mode(self.p.policy_file, mode)
+        self.log.info("mode_set", mode=mode)
+        return self._emit(Result("noop", "", "mode %s" % mode))
+
     def set_hold(self, on: bool) -> Result:
         write_hold(self.p.policy_file, on)
         self.log.info("hold_set", hold=on)
@@ -558,5 +616,11 @@ class Updater:
             for t in ([tag] if tag else list(state["attempts"])):
                 state["attempts"].pop(t, None)
             self._save(state)
+            if os.path.lexists(self.p.policy_file):
+                try:
+                    update_local(self.p.policy_file, lambda d: d.__setitem__(
+                        "deny", [t for t in d.get("deny", []) if tag is not None and t != tag]))
+                except (ConfigError, OSError) as e:
+                    self.log.error("policy_update_failed", detail=str(e)[:100])
             return self._emit(Result("noop", tag or "", "removed %d local deny entries" % (before - len(state["deny"]))))
         return self._locked(go)

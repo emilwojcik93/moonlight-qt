@@ -7,6 +7,7 @@ The local file can only NARROW the baked-in allow-lists (it can never add a repo
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ SIGNER_WORKFLOW_PATH = ".github/workflows/patched-windows-release.yml"
 CHANNEL_COOLING = {"canary": 0, "stable": 24}   # CONTRACT section 5 defaults
 
 DEFAULTS: Dict[str, Any] = {
+    "mode": "report-only",          # "report-only": select and log "would install", download nothing | "install"
     "repo": ALLOWED_REPOS[0],
     "upstream_owners": list(ALLOWED_UPSTREAM_OWNERS),
     "channel": "canary",
@@ -39,6 +41,8 @@ REPO_RE_PARTS = ("[A-Za-z0-9][A-Za-z0-9-]{0,38}", "[A-Za-z0-9._-]{1,100}")
 
 @dataclass
 class Policy:
+    mode: str = "report-only"
+    remote_floor_hours: float = 0           # from policy.yml on the automation branch; can only raise the cooling-off
     repo: str = DEFAULTS["repo"]
     upstream_owners: List[str] = field(default_factory=lambda: list(ALLOWED_UPSTREAM_OWNERS))
     channel: str = "canary"
@@ -56,10 +60,20 @@ class Policy:
 
     def effective_cooling_hours(self) -> float:
         return max(float(self.min_cooling_off_hours), float(self.cooling_off_hours),
-                   float(CHANNEL_COOLING[self.channel]))
+                   float(CHANNEL_COOLING[self.channel]), float(self.remote_floor_hours))
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in DEFAULTS}
+
+    def narrowed_by(self, remote: "Any") -> "Policy":
+        """Merge the remote policy (branch `automation`). It can only narrow: hold, deny (union), owners (intersection),
+        higher cooling-off floor."""
+        owners = [o for o in self.upstream_owners if o in remote.owners]
+        if not owners:
+            raise ConfigError("remote policy allows none of the local upstream owners")
+        return dataclasses.replace(
+            self, hold=self.hold or remote.hold, deny=list(dict.fromkeys(self.deny + remote.deny)),
+            upstream_owners=owners, remote_floor_hours=max(self.remote_floor_hours, float(remote.cooling[self.channel])))
 
 
 def _is_int(v: Any) -> bool:
@@ -93,6 +107,10 @@ def parse_policy(data: Dict[str, Any]) -> Policy:
     if "schema" in data and data["schema"] != 1:
         raise ConfigError("policy schema must be 1")
     p = Policy()
+    if "mode" in data:
+        if data["mode"] not in ("report-only", "install"):
+            raise ConfigError("policy mode must be report-only or install")
+        p.mode = data["mode"]
     if "repo" in data:
         if data["repo"] not in ALLOWED_REPOS:
             raise ConfigError("policy repo is not in the baked-in allow-list")
@@ -161,14 +179,24 @@ def load_policy(path: str) -> Policy:
     return parse_policy(data)
 
 
-def write_hold(path: str, hold: bool) -> None:
-    """Set `hold` in the local policy file (creates it when missing). Keeps other keys; refuses an invalid file."""
+def update_local(path: str, mutate) -> None:
+    """Read the (validated) local policy file, apply `mutate(dict)`, validate again and write atomically (0600).
+    A missing file starts from {}. An invalid existing file raises ConfigError and is left alone."""
     data: Dict[str, Any] = {}
     if os.path.lexists(path):
-        load_policy(path)  # validates (raises on invalid)
+        load_policy(path)
         with open(path, "rb") as f:
             data = json.loads(f.read().decode("utf-8"))
+    mutate(data)
     data["schema"] = 1
-    data["hold"] = bool(hold)
+    parse_policy(data)
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     fsio.atomic_write_json(path, data)
+
+
+def write_hold(path: str, hold: bool) -> None:
+    update_local(path, lambda d: d.__setitem__("hold", bool(hold)))
+
+
+def write_mode(path: str, mode: str) -> None:
+    update_local(path, lambda d: d.__setitem__("mode", mode))

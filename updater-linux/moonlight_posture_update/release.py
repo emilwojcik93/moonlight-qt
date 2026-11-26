@@ -90,7 +90,11 @@ def filter_releases(releases: Any, log=None) -> List[Candidate]:
             continue
         if r.get("immutable") is not True:
             if log:
-                log.warn("release_not_immutable", tag=tag)
+                # distinct reasons: the API does not show the flag at all (field removed / permissions) vs. it says false
+                if "immutable" not in r:
+                    log.warn("release_immutable_flag_absent", tag=tag)
+                else:
+                    log.warn("release_not_immutable", tag=tag)
             continue
         try:
             pub = parse_published(r.get("published_at"))

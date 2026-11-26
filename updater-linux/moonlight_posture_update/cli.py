@@ -24,6 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--tag", help="verify exactly this release (ignores cooling-off and installed version)")
     sub.add_parser("status", help="print JSON status (no network)")
     sub.add_parser("rollback", help="switch back to the previous verified version and deny the one rolled back from")
+    m = sub.add_parser("set-mode", help="report-only (select and log only) or install (the explicit switch to install)")
+    m.add_argument("mode", choices=("report-only", "install"))
     sub.add_parser("hold", help="set hold=true in the local policy (no installs)")
     sub.add_parser("unhold", help="set hold=false in the local policy")
     c = sub.add_parser("clear-deny", help="remove local deny entries / failure counters")
@@ -49,6 +51,8 @@ def main(argv: Optional[List[str]] = None, deps: Optional[Deps] = None) -> int:
             return 0
         if cmd == "rollback":
             return up.rollback().exit_code
+        if cmd == "set-mode":
+            return up.set_mode(args.mode).exit_code
         if cmd in ("hold", "unhold"):
             return up.set_hold(cmd == "hold").exit_code
         if cmd == "clear-deny":

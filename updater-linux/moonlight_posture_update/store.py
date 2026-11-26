@@ -205,7 +205,7 @@ class Store:
         ) % exe
 
     def write_launcher_and_desktop(self) -> None:
-        os.makedirs(self.p.bin_dir, mode=0o755, exist_ok=True)
+        os.makedirs(self.p.launcher_dir, mode=0o755, exist_ok=True)
         os.makedirs(self.p.apps_dir, mode=0o755, exist_ok=True)
         fsio.atomic_write(self.p.launcher, self.launcher_text().encode(), 0o755)
         fsio.atomic_write(self.p.desktop_file, self.desktop_text().encode(), 0o644)
