@@ -317,3 +317,45 @@ def test_the_appimage_is_covered_by_the_same_regexes_as_other_assets():
     for bad in ("Moonlight-6.2.0-daily.0123-x86_64.AppImage", "Moonlight-6.2.0-daily.61616-aarch64.AppImage",
                 "Moonlight-6.2.0-daily.61616-x86_64.AppImage\n", "moonlight-6.2.0-daily.61616-x86_64.AppImage"):
         assert mg.LINUX_NAME_RE.fullmatch(bad) is None
+
+
+# --- the package -> publish chain with the exact command lines of the wrapper ------------------------------------
+
+def test_cli_chain_gate_stage_manifest_like_the_wrapper(tmp_path, monkeypatch, capsys):
+    import sys
+    import test_appimage_gate as tag_
+    monkeypatch.setattr(tag_.g, "MIN_BINARY_BYTES", 64)
+    root, bindir = tmp_path / "fake", tmp_path / "bin"
+    root.mkdir()
+    bindir.mkdir()
+    exe = bindir / "unsquashfs"
+    exe.write_text(tag_.SHIM.format(py=sys.executable))
+    exe.chmod(0o755)
+    (root / "config.json").write_text(json.dumps({"offset": 192}))
+    (root / ("m_" + ag.DESKTOP_ENTRY)).write_bytes(tag_.desktop())
+    (root / ("m_" + ag.BINARY_ENTRY.replace("/", "__"))).write_bytes(tag_.binary(CI))
+    monkeypatch.setenv("FAKE_ROOT", str(root))
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    rel, lin = make_dirs(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    # package job
+    assert ag.main(["--tag", "v6.2.0-daily.202", "--n", "1", "--image", str(lin / NAME),
+                    "--out", "appimage-gate-summary.json", "--markdown", "appimage-gate.md"]) == 0
+    win = gate_summary(work / "gate-summary.json")
+    assert st.main(["--release-dir", str(rel), "--dist", "preview", "--ci-version", CI, "--gate-summary", win,
+                    "--appimage-dir", str(lin), "--appimage-gate-summary", "appimage-gate-summary.json"]) == 0
+    assert mg.main(gen_argv("preview", win, "appimage-gate-summary.json")) == 0
+    assert mg.main(["verify", "--dist", "preview"]) == 0
+    # publish job: same inputs, fresh dist; the staged files are byte-identical to the preview
+    assert st.main(["--release-dir", str(rel), "--dist", "dist", "--ci-version", CI, "--gate-summary", win,
+                    "--appimage-dir", str(lin), "--appimage-gate-summary", "appimage-gate-summary.json"]) == 0
+    assert mg.main(gen_argv("dist", win, "appimage-gate-summary.json")) == 0
+    for name in ("SHA256SUMS", NAME, "MoonlightSetup.exe"):
+        assert open(os.path.join("dist", name), "rb").read() == open(os.path.join("preview", name), "rb").read()
+    m = json.load(open("dist/manifest.json"))
+    assert m["linux"]["installer"] == NAME and m["linux_checks"]["reader"] == "unsquashfs"
+    # the files the attest step lists as subjects all exist next to each other
+    for f in ("MoonlightSetup.exe", NAME, "SHA256SUMS", "manifest.json"):
+        assert os.path.isfile(os.path.join("dist", f))

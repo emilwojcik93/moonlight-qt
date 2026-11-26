@@ -139,10 +139,12 @@ def test_wrapper_gate_is_mandatory_and_precedes_manifest():
     assert "continue-on-error" not in pub
 
 
-def test_wrapper_attests_exactly_installer_sums_and_manifest():
+def test_wrapper_attests_exactly_installer_appimage_sums_and_manifest():
     pub = jobs(read(WRAPPER))["publish"]
-    subjects = re.search(r"subject-path: \|\n((?:\s+dist/\S+\n)+)", pub).group(1).split()
-    assert subjects == ["dist/MoonlightSetup.exe", "dist/SHA256SUMS", "dist/manifest.json"]
+    subjects = [ln.strip() for ln in re.search(r"subject-path: \|\n((?:\s+dist/[^\n]+\n)+)", pub).group(1).splitlines()]
+    assert subjects == ["dist/MoonlightSetup.exe",
+                        "dist/Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage",
+                        "dist/SHA256SUMS", "dist/manifest.json"]
     assert "gh release create" in pub and "dist/attestation.sigstore.json" in pub
     # offline verify with the exact flags the Windows updater passes
     for flag in ("--bundle", "--signer-workflow", "--source-ref", "--source-digest", "--deny-self-hosted-runners",
@@ -181,3 +183,90 @@ def test_wrapper_template_pins_match_workflows():
         name, sha = ref.split("@")
         if name in wf_pins:
             assert sha in wf_pins[name], f"{name}: wrapper pin differs from .github/workflows (sync after Dependabot)"
+
+
+# --- Linux AppImage (CONTRACT v1.2 amendment) -----------------------------------------------------------------
+
+LINUX_IMAGE_EXPR = "Moonlight-${{ needs.validate.outputs.build_version }}-x86_64.AppImage"
+
+
+def needs_of(job):
+    m = re.search(r"(?m)^    needs: (.*)$", job)
+    assert m, "job has no needs"
+    return [n.strip() for n in m.group(1).strip("[]").split(",")]
+
+
+def test_wrapper_linux_job_mirrors_the_windows_build_job():
+    j = jobs(read(WRAPPER))
+    lin = j["linux"]
+    assert "uses: ./.github/workflows/build-appimage.yml" in lin
+    for expect in ("ci_version: ${{ needs.validate.outputs.build_version }}",
+                   "source_ref: ${{ needs.validate.outputs.source_sha }}"):
+        assert expect in lin and expect in j["build"], expect
+    assert "build_macos" not in lin  # the AppImage workflow has no such input
+    assert needs_of(lin) == ["validate"]
+    # same permission style as the Windows build: contents: read, nothing else, no secrets
+    assert "contents: read" in lin and "write" not in re.sub(r"#.*", "", lin)
+    assert "id-token" not in lin and "secrets" not in lin.replace("no secrets", "") and "inherit" not in lin
+    assert "runs-on" not in lin and "steps:" not in lin  # a pure reusable-workflow call
+
+
+def test_wrapper_job_graph_with_the_linux_job():
+    j = jobs(read(WRAPPER))
+    assert list(j) == ["validate", "build", "linux", "package", "publish", "notify"]
+    assert needs_of(j["package"]) == ["validate", "build", "linux"]
+    assert needs_of(j["publish"]) == ["validate", "build", "linux", "package"]
+    assert needs_of(j["notify"]) == ["validate", "build", "linux", "package", "publish"]
+    # dry runs: publish still only runs for real releases; notify still reports any failure (incl. linux)
+    assert "dry_run == 'false'" in j["publish"]
+    assert "contains(needs.*.result, 'failure')" in j["notify"]
+    assert "write" not in re.sub(r"#.*", "", j["linux"])
+
+
+def test_wrapper_adds_no_new_third_party_action():
+    refs = {ref.split("@")[0] for ref, _ in uses_lines(read(WRAPPER)) if not ref.startswith("./")}
+    assert refs == {"actions/checkout", "actions/download-artifact", "actions/upload-artifact", "actions/attest"}
+    local = {ref for ref, _ in uses_lines(read(WRAPPER)) if ref.startswith("./")}
+    assert local == {"./.github/workflows/build-win-mac.yml", "./.github/workflows/build-appimage.yml"}
+
+
+def test_wrapper_appimage_gate_is_mandatory_unprivileged_and_precedes_staging():
+    text = read(WRAPPER)
+    pkg = jobs(text)["package"]
+    assert "appimage_gate.py" in pkg and "continue-on-error" not in pkg and "permissions: {}" in pkg
+    assert pkg.index("bundle_gate.py") < pkg.index("appimage_gate.py") < pkg.index("stage_assets.py") \
+        < pkg.index("manifest_gen.py generate")
+    assert "name: Moonlight-LinuxAppImage-${{ needs.validate.outputs.build_version }}" in pkg
+    assert "path: in/linux" in pkg
+    assert '--image "in/linux/Moonlight-${BUILD_VERSION}-x86_64.AppImage"' in pkg
+    assert "--appimage-dir in/linux --appimage-gate-summary appimage-gate-summary.json" in pkg
+    assert "--linux-gate-summary appimage-gate-summary.json" in pkg
+    # a reader for the zstd squashfs is installed from the distribution when missing; the image is never run
+    assert "squashfs-tools" in pkg and "--appimage-extract" not in text and "chmod +x" not in text
+    # both summaries travel to publish in the same artifact; dry runs also preview the Linux one
+    assert re.search(r"name: gate-summary\n\s+path: \|\n\s+gate-summary.json\n\s+appimage-gate-summary.json\n", pkg)
+    assert "preview/appimage-gate-summary.json" in pkg
+
+
+def test_wrapper_publish_rebinds_stages_and_publishes_the_appimage():
+    pub = jobs(read(WRAPPER))["publish"]
+    assert "name: Moonlight-LinuxAppImage-${{ needs.validate.outputs.build_version }}" in pub and "path: in/linux" in pub
+    assert "--appimage-dir in/linux --appimage-gate-summary in/summary/appimage-gate-summary.json" in pub
+    assert "--linux-gate-summary in/summary/appimage-gate-summary.json" in pub
+    assert "continue-on-error" not in pub
+    # every step that lists the release files knows the AppImage: self-verify, upload, digest check, verify-asset
+    assert pub.count(f"LINUX_IMAGE: {LINUX_IMAGE_EXPR}") == 4
+    assert 'for f in MoonlightSetup.exe "$LINUX_IMAGE" SHA256SUMS manifest.json; do' in pub
+    assert 'dist/MoonlightSetup.exe "dist/$LINUX_IMAGE" dist/SHA256SUMS dist/manifest.json' in pub
+    assert 'for f in MoonlightSetup.exe "$LINUX_IMAGE" SHA256SUMS manifest.json attestation.sigstore.json; do' in pub
+    assert 'gh release verify-asset "$TAG" "dist/$LINUX_IMAGE"' in pub
+    # the offline verification loop covers it with the unchanged consumer flags
+    assert "--source-digest" in pub and "--signer-workflow" in pub
+    assert 'dist/$f' in pub
+
+
+def test_wrapper_never_executes_or_selects_the_appimage_by_pattern():
+    text = read(WRAPPER)
+    for block in run_blocks(text):
+        assert "*.AppImage" not in block and "./dist/Moonlight-" not in block
+        assert not re.search(r"(?m)^\s*\./\S*AppImage", block)
