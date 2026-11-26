@@ -54,7 +54,7 @@ def find_clients(proc_root: str = "/proc", exclude: Set[int] = frozenset(), opt_
     except OSError:
         return out
     for n in names:
-        if not n.isdigit():
+        if not re.fullmatch(r"[0-9]{1,10}", n):
             continue
         pid = int(n)
         if pid in exclude:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -54,6 +55,33 @@ class Response:
 
 def _lower(h) -> Dict[str, str]:
     return {k.lower(): v for k, v in h.items()}
+
+
+def parse_len(value: Optional[str]) -> Optional[int]:
+    """Content-Length: ASCII digits only (str.isdigit() accepts unicode digits that int() then rejects)."""
+    if value is not None and len(value) <= 15 and re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    return None
+
+
+def read_bounded(resp, max_bytes: int, deadline: float) -> bytes:
+    """Read a whole body in small reads; the deadline and the byte cap are enforced on EVERY read (a slow drip
+    cannot outlive the deadline by more than one socket timeout)."""
+    parts = []
+    total = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise NetworkDeferral("read deadline exceeded")
+        try:
+            chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+        except (http.client.HTTPException, OSError) as e:
+            raise NetworkDeferral("read failed: %s" % e)
+        if not chunk:
+            return b"".join(parts)
+        total += len(chunk)
+        if total > max_bytes:
+            raise VerifyError("response larger than the cap")
+        parts.append(chunk)
 
 
 class Http:
@@ -125,15 +153,10 @@ class Http:
                 return 304, None, h
             if status != 200:
                 raise NetworkDeferral("unexpected http status %d" % status)
-            cl = h.get("content-length")
-            if cl and cl.isdigit() and int(cl) > MAX_API_BYTES:
+            cl = parse_len(h.get("content-length"))
+            if cl is not None and cl > MAX_API_BYTES:
                 raise VerifyError("api response too large")
-            try:
-                raw = resp.read(MAX_API_BYTES + 1)
-            except (http.client.HTTPException, OSError) as e:
-                raise NetworkDeferral("api read failed: %s" % e)
-            if len(raw) > MAX_API_BYTES:
-                raise VerifyError("api response too large")
+            raw = read_bounded(resp, MAX_API_BYTES, time.monotonic() + self.s.api_timeout)
             try:
                 return 200, json.loads(raw.decode("utf-8")), h
             except ValueError:
@@ -160,8 +183,7 @@ class Http:
             if status != 200:
                 raise NetworkDeferral("unexpected http status %d" % status)
             h = _lower(resp.headers)
-            cl = h.get("content-length")
-            clen = int(cl) if cl and cl.isdigit() else None
+            clen = parse_len(h.get("content-length"))
             if clen is not None and clen > max_bytes:
                 raise VerifyError("asset larger than the cap (%d > %d)" % (clen, max_bytes))
             if expected_size is not None and clen is not None and clen != expected_size:
@@ -174,7 +196,7 @@ class Http:
                     if time.monotonic() > deadline:
                         raise NetworkDeferral("download deadline exceeded")
                     try:
-                        chunk = resp.read(256 * 1024)
+                        chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
                     except (http.client.HTTPException, OSError) as e:
                         raise NetworkDeferral("download interrupted: %s" % e)
                     if not chunk:
