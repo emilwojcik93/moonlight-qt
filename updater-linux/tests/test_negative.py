@@ -247,3 +247,14 @@ def test_failures_back_off_then_deny(env):
     assert r.tag in env.state()["deny"]
     res = env.run()
     assert res.result == "noop" and "denied" in res.detail
+
+
+def test_gh_environment_is_scrubbed_and_private(monkeypatch, tmp_path):
+    from moonlight_posture_update import attest
+    for k, v in (("GH_TOKEN", "x"), ("GITHUB_TOKEN", "y"), ("GH_HOST", "evil"), ("GITHUB_ENTERPRISE_TOKEN", "z"),
+                 ("GIT_ASKPASS", "/bin/evil")):
+        monkeypatch.setenv(k, v)
+    env = attest.gh_environment(str(tmp_path / "gh"))
+    assert not [k for k in env if k.startswith(("GH_TOKEN", "GITHUB_", "GH_HOST", "GIT_ASKPASS"))]
+    assert env["GH_CONFIG_DIR"].startswith(str(tmp_path)) and env["XDG_CACHE_HOME"].startswith(str(tmp_path))
+    assert env["GH_PROMPT_DISABLED"] == "1"

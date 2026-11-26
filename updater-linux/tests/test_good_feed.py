@@ -72,3 +72,18 @@ def test_verify_only_explicit_tag(env):
     res = env.run("verify-only", r2.tag)
     assert res.result == "verified" and res.tag == r2.tag
     assert env.run("verify-only", "v6.2.0-daily.999-vp.1").result == "verify_failed"
+
+
+def test_launcher_runs_the_installed_appimage(env):
+    import subprocess
+    r = env.fake.add(Release(203))
+    assert env.run().result == "updated"
+    out = subprocess.run([env.paths.launcher, "--version"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0 and "Moonlight 6.2.0-daily.61624" in out.stdout
+    out = subprocess.run([env.paths.launcher, "--version"], capture_output=True, text=True, timeout=30,
+                         env={"PATH": "/usr/bin:/bin", "MOONLIGHT_POSTURE_NO_FUSE": "1"})
+    assert out.returncode == 0
+    # no AppImage -> clear message, exit 127
+    os.unlink(env.paths.current_link)
+    out = subprocess.run([env.paths.launcher], capture_output=True, text=True)
+    assert out.returncode == 127 and "no verified AppImage" in out.stderr

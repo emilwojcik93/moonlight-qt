@@ -1,0 +1,17 @@
+#!/usr/bin/env -S python3 -I
+# Entry point of the Linux patched-Moonlight updater. Isolated mode (-I): no PYTHONPATH, no user site, no cwd on sys.path.
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for cand in (os.path.join(HERE, "..", "lib", "moonlight-posture-updater"), os.path.join(HERE, "..")):
+    cand = os.path.realpath(cand)
+    if os.path.isdir(os.path.join(cand, "moonlight_posture_update")):
+        sys.path.insert(0, cand)
+        break
+else:
+    sys.exit("moonlight-posture-update: python package not found next to this script")
+
+from moonlight_posture_update.cli import main  # noqa: E402
+
+sys.exit(main())

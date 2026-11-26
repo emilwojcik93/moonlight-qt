@@ -1,0 +1,37 @@
+[Unit]
+Description=Verify and install the patched Moonlight AppImage (emilwojcik93/moonlight-qt feed)
+Documentation=https://github.com/emilwojcik93/moonlight-qt/tree/automation-updater-linux/updater-linux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/moonlight-posture-update update
+# downloads (<= 10 min) + 3 attestation checks + smoke tests fit well below this
+TimeoutStartSec=30min
+# exit 0 = ok / noop / deferred / held; 8 = network or rate-limit deferral (retried by the next trigger)
+SuccessExitStatus=8
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+
+# Hardening available to a user unit. Not used on purpose: PrivateTmp (hides /tmp/.X11-unix from the smoke test),
+# PrivateDevices / SystemCallFilter / MemoryDenyWriteExecute (the smoke test starts Qt + Mesa), ProtectProc (the updater
+# reads /proc to see whether a Moonlight client is running).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/moonlight-posture-updater %h/.local/opt/moonlight-posture %h/.local/bin %h/.local/share/applications
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+SystemCallArchitectures=native

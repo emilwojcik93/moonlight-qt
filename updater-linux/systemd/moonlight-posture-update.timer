@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily check for a patched Moonlight AppImage
+
+[Timer]
+# around 04:17 local time, spread by up to 20 minutes
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=20min
+AccuracySec=1min
+# run once after a missed trigger (laptop was off or asleep)
+Persistent=true
+# catch-up shortly after the user manager starts (login / boot with linger)
+OnStartupSec=10min
+Unit=moonlight-posture-update.service
+
+[Install]
+WantedBy=timers.target
