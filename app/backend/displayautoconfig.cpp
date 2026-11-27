@@ -17,6 +17,12 @@ int snapFps(double refreshHz, const Limits& limits)
             best = rate;
         }
     }
+
+    // A rate well above the nearest standard one (a 48 Hz power-saving mode)
+    // is used as it is instead of dropping to 30
+    if (rounded > best && rounded - best > 10 && rounded <= limits.maxFps) {
+        best = rounded;
+    }
     return std::min(best, limits.maxFps);
 }
 
@@ -26,8 +32,10 @@ std::optional<StreamMode> chooseMode(const DisplayMode& display, const Limits& l
         return std::nullopt;
     }
 
-    int w = display.width;
-    int h = display.height;
+    // Always landscape: turning a tablet must not change the stream's shape (and
+    // restart it); the video is letterboxed in a portrait window
+    int w = std::max(display.width, display.height);
+    int h = std::min(display.width, display.height);
     if (w > limits.maxWidth || h > limits.maxHeight) {
         // Fit inside the cap and keep the aspect ratio
         const double scale = std::min(static_cast<double>(limits.maxWidth) / w,

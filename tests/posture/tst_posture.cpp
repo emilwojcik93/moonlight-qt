@@ -115,6 +115,8 @@ private slots:
         QCOMPARE(displayauto::snapFps(165.0), 144);   // capped
         QCOMPARE(displayauto::snapFps(29.97), 30);
         QCOMPARE(displayauto::snapFps(24.0), 30);     // floor
+        QCOMPARE(displayauto::snapFps(48.01), 48);    // far above 30: kept
+        QCOMPARE(displayauto::snapFps(56.0), 50);     // within 10 of a standard rate
         QCOMPARE(displayauto::snapFps(98.0), 90);
     }
 
@@ -157,6 +159,20 @@ private slots:
         QCOMPARE(m->height, 768);
 
         QVERIFY(!displayauto::chooseMode({0, 0, 60.0}).has_value());
+    }
+
+    void displayModeIsAlwaysLandscape()
+    {
+        // The Dell panel turned to portrait by the accelerometer
+        auto m = displayauto::chooseMode({800, 1280, 60.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 1280);
+        QCOMPARE(m->height, 800);
+
+        m = displayauto::chooseMode({1280, 800, 60.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 1280);
+        QCOMPARE(m->height, 800);
     }
 
     void displayBitrateRules()
