@@ -10,6 +10,8 @@
 
 #ifdef Q_OS_LINUX
 #include <QFile>
+#include <QGuiApplication>
+#include <QScreen>
 #endif
 
 #ifdef HAVE_POSTURE_DBUS
@@ -148,6 +150,34 @@ Signals collectLocalSignals()
 #endif
 
     s.hasGamepad = gameControllerPresent();
+
+#ifdef Q_OS_LINUX
+    // Docked laptop or 2-in-1 on an external display with its own panel disabled
+    // or the lid closed: the compositor lists only external outputs, so the
+    // integrated touchscreen has nothing behind it. Only claimed when every
+    // listed output is positively an external connector; unknown names leave
+    // the signal unset.
+    if (s.hasTouchscreen && s.portable.value_or(false)) {
+        bool builtin = false;
+        bool external = false;
+        bool unknown = false;
+        for (const QScreen* screen : QGuiApplication::screens()) {
+            const std::string name = screen->name().toStdString();
+            if (isBuiltinConnectorName(name)) {
+                builtin = true;
+            }
+            else if (isExternalConnectorName(name)) {
+                external = true;
+            }
+            else {
+                unknown = true;
+            }
+        }
+        if (!builtin && external && !unknown) {
+            s.builtinDisplayInUse = false;
+        }
+    }
+#endif
 
     return s;
 }

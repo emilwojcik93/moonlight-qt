@@ -59,6 +59,51 @@ private slots:
         QCOMPARE(classify(s).cls, PostureClass::Laptop);
     }
 
+    void touchscreenBehindDisabledPanelIsNotTouch()
+    {
+        // Dell 2-in-1 docked on an external display, own panel disabled; KWin
+        // keeps reporting tabletMode=true from the hinge switch.
+        Signals s;
+        s.hasTouchscreen = true;
+        s.hasKeyboard = s.hasPointer = true;
+        s.portable = true;
+        s.osTabletMode = true;
+        s.osTabletModeAvailable = false;
+        s.builtinDisplayInUse = false;
+        Result r = classify(s);
+        QCOMPARE(r.cls, PostureClass::Laptop);
+        QVERIFY(!r.touch);
+    }
+
+    void panelInUseOrUnknownKeepsTabletDecision()
+    {
+        Signals s;
+        s.hasTouchscreen = true;
+        s.hasKeyboard = s.hasPointer = true;
+        s.portable = true;
+        s.osTabletMode = true;
+        s.osTabletModeAvailable = false;
+        QCOMPARE(classify(s).cls, PostureClass::Tablet);
+        s.builtinDisplayInUse = true;
+        Result r = classify(s);
+        QCOMPARE(r.cls, PostureClass::Tablet);
+        QVERIFY(r.touch);
+    }
+
+    void connectorNames()
+    {
+        QVERIFY(isBuiltinConnectorName("eDP-1"));
+        QVERIFY(isBuiltinConnectorName("eDP1"));
+        QVERIFY(isBuiltinConnectorName("LVDS-1"));
+        QVERIFY(isBuiltinConnectorName("DSI-1"));
+        QVERIFY(!isBuiltinConnectorName("DP-2"));
+        QVERIFY(isExternalConnectorName("DP-2"));
+        QVERIFY(isExternalConnectorName("HDMI-A-1"));
+        QVERIFY(isExternalConnectorName("DisplayPort-0"));
+        QVERIFY(!isExternalConnectorName("eDP-1"));
+        QVERIFY(!isExternalConnectorName("Virtual-1"));
+    }
+
     void noTouchIgnoresTabletMode()
     {
         Signals s;

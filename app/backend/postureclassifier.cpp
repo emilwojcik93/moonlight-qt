@@ -1,5 +1,7 @@
 #include "postureclassifier.h"
 
+#include <cctype>
+
 #include <cstring>
 
 namespace posture {
@@ -31,10 +33,35 @@ bool parseClassName(const std::string& name, PostureClass& out)
     return false;
 }
 
+static bool startsWithNoCase(const std::string& name, const char* prefix)
+{
+    for (size_t i = 0; prefix[i]; i++) {
+        if (i >= name.size() || std::tolower(static_cast<unsigned char>(name[i])) != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isBuiltinConnectorName(const std::string& name)
+{
+    return startsWithNoCase(name, "edp") || startsWithNoCase(name, "lvds") || startsWithNoCase(name, "dsi");
+}
+
+bool isExternalConnectorName(const std::string& name)
+{
+    return startsWithNoCase(name, "hdmi") || startsWithNoCase(name, "dp") ||
+           startsWithNoCase(name, "displayport") || startsWithNoCase(name, "dvi") ||
+           startsWithNoCase(name, "vga");
+}
+
 Result classify(const Signals& s)
 {
     Result r;
-    r.touch = s.hasTouchscreen;
+    // A touchscreen behind a closed lid or a disabled panel is not a surface the
+    // user can touch (docked laptop on an external display).
+    const bool touchUsable = s.hasTouchscreen && s.builtinDisplayInUse.value_or(true);
+    r.touch = touchUsable;
 
     const bool tabletSignal = s.osTabletMode.has_value();
     // KWin can report tabletModeAvailable=false even on a detachable 2-in-1
@@ -47,7 +74,7 @@ Result classify(const Signals& s)
                           !*s.osTabletModeAvailable;
     const bool trustedTablet = tabletSignal && (!conflict || *s.osTabletMode);
 
-    if (!s.hasTouchscreen) {
+    if (!touchUsable) {
         // Nothing to touch: never a touch class, whatever the OS says
         r.cls = (s.portable.value_or(false)) ? PostureClass::Laptop : PostureClass::Desktop;
         r.confidence = (tabletSignal && *s.osTabletMode) ? Confidence::Low : Confidence::High;

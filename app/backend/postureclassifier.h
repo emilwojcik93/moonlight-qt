@@ -60,6 +60,12 @@ struct Signals {
     // signal is then not trustworthy.
     std::optional<bool> osTabletModeAvailable;
 
+    // False when the machine's own panel is not a usable surface right now: the
+    // lid is closed or the built-in output is disabled, so the session is shown
+    // on an external display only. The integrated touchscreen then cannot be
+    // touched and is ignored. Unset = unknown (treated as in use).
+    std::optional<bool> builtinDisplayInUse;
+
     bool hasTouchscreen = false;
     bool hasKeyboard = false;
     bool hasPointer = false;
@@ -107,6 +113,12 @@ inline HostMode hostMode(PostureClass cls)
 }
 
 // Classify from signals alone (the Auto path).
+// Output names as the compositor reports them ("eDP-1", "HDMI-A-1", "DP-2",
+// X11 "eDP1"). Built-in = the machine's own panel; external = a cable to
+// another display. Anything else (virtual, unknown) is neither.
+bool isBuiltinConnectorName(const std::string& name);
+bool isExternalConnectorName(const std::string& name);
+
 Result classify(const Signals& sig);
 
 // Build the payload for a user mode: Never and (on launch) a non-touch desktop
