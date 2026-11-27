@@ -46,8 +46,9 @@ int snapFps(double refreshHz, const Limits& limits = Limits());
 // - same mode: unchanged
 // - saved bitrate is the default of the saved mode (never changed): the default
 //   of the new mode
-// - user-set bitrate: scaled by the ratio of the defaults, limited to 0.4x..1.5x
-//   so a slow link is not overrun by a big display
+// - user-set bitrate: scaled by the ratio of the defaults, limited to 0.4x..1.0x.
+//   A bitrate the user chose is treated as the ceiling of their link: it is
+//   lowered for a smaller display, never raised for a bigger one
 int chooseBitrate(const StreamMode& savedMode,
                   int savedBitrate,
                   int defaultForSaved,

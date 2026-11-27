@@ -63,7 +63,7 @@ int chooseBitrate(const StreamMode& savedMode,
     if (defaultForSaved <= 0) {
         return savedBitrate;
     }
-    const double ratio = std::clamp(static_cast<double>(defaultForNew) / defaultForSaved, 0.4, 1.5);
+    const double ratio = std::clamp(static_cast<double>(defaultForNew) / defaultForSaved, 0.4, 1.0);
     return std::max(1000, static_cast<int>(std::lround(savedBitrate * ratio)));
 }
 

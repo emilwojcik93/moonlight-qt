@@ -171,8 +171,8 @@ private slots:
         // Never changed from the default: default of the new mode
         QCOMPARE(displayauto::chooseBitrate(p1080, 10000, 10000, p1440, 20000), 20000);
         QCOMPARE(displayauto::chooseBitrate(p1080, 10200, 10000, p720, 5000), 5000);
-        // User-set: scaled by the ratio of the defaults, 0.4x..1.5x
-        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p1440, 20000), 30000);   // 2x -> 1.5x
+        // User-set: scaled by the ratio of the defaults, 0.4x..1.0x (a ceiling)
+        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p1440, 20000), 20000);   // 2x -> 1.0x
         QCOMPARE(displayauto::chooseBitrate(p1440, 25000, 20000, p1080, 10000), 12500);   // 0.5x
         QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 5000), 10000);     // 0.5x
         QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 1000), 8000);      // floor 0.4x

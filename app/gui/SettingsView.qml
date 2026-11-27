@@ -999,7 +999,7 @@ FocusScope {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 8000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Match the stream resolution, frame rate and bitrate to the display it is shown on, when a stream starts and when that display changes (monitor connected, resolution or refresh rate changed). The resolution, frame rate and bitrate above are used as the reference. A bitrate you set yourself is scaled with the new mode, at most 1.5 times. A display change during a stream briefly resumes the stream.")
+                    ToolTip.text: qsTr("Match the stream resolution, frame rate and bitrate to the display it is shown on, when a stream starts and when that display changes (monitor connected, resolution or refresh rate changed). The resolution, frame rate and bitrate above are used as the reference. A bitrate you set yourself is treated as the limit of your connection: it is lowered for a smaller display but never raised. A display change during a stream briefly resumes the stream.")
                 }
 
                 ConsoleSettingRow {
