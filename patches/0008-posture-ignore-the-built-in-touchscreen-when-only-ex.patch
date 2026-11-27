@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: emilwojcik93 <34631176+emilwojcik93@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:52:01 +0100
+Subject: [PATCH 8/9] posture: ignore the built-in touchscreen when only
+ external displays are active
+
+A 2-in-1 docked on an external monitor with its own panel disabled kept
+reporting KWin tabletMode=true (hinge switch), so the host got
+clientPosture=tablet for a session used with keyboard and mouse. When every
+output the compositor lists is an external connector on a portable machine,
+the integrated touchscreen has nothing behind it: the classifier treats it as
+absent (class laptop/desktop, touch off). Unknown output names leave the signal
+unset, so behaviour elsewhere is unchanged.
+
+Adds Signals::builtinDisplayInUse, isBuiltinConnectorName() and
+isExternalConnectorName() with unit tests.
+---
+ app/backend/postureclassifier.cpp | 31 +++++++++++++++++++--
+ app/backend/postureclassifier.h   | 12 +++++++++
+ app/backend/posturedetector.cpp   | 30 +++++++++++++++++++++
+ tests/posture/tst_posture.cpp     | 45 +++++++++++++++++++++++++++++++
+ 4 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/app/backend/postureclassifier.cpp b/app/backend/postureclassifier.cpp
+index 1863d9df..9fb2f88c 100644
+--- a/app/backend/postureclassifier.cpp
++++ b/app/backend/postureclassifier.cpp
+@@ -1,5 +1,7 @@
+ #include "postureclassifier.h"
+ 
++#include <cctype>
++
+ #include <cstring>
+ 
+ namespace posture {
+@@ -31,10 +33,35 @@ bool parseClassName(const std::string& name, PostureClass& out)
+     return false;
+ }
+ 
++static bool startsWithNoCase(const std::string& name, const char* prefix)
++{
++    for (size_t i = 0; prefix[i]; i++) {
++        if (i >= name.size() || std::tolower(static_cast<unsigned char>(name[i])) != prefix[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool isBuiltinConnectorName(const std::string& name)
++{
++    return startsWithNoCase(name, "edp") || startsWithNoCase(name, "lvds") || startsWithNoCase(name, "dsi");
++}
++
++bool isExternalConnectorName(const std::string& name)
++{
++    return startsWithNoCase(name, "hdmi") || startsWithNoCase(name, "dp") ||
++           startsWithNoCase(name, "displayport") || startsWithNoCase(name, "dvi") ||
++           startsWithNoCase(name, "vga");
++}
++
+ Result classify(const Signals& s)
+ {
+     Result r;
+-    r.touch = s.hasTouchscreen;
++    // A touchscreen behind a closed lid or a disabled panel is not a surface the
++    // user can touch (docked laptop on an external display).
++    const bool touchUsable = s.hasTouchscreen && s.builtinDisplayInUse.value_or(true);
++    r.touch = touchUsable;
+ 
+     const bool tabletSignal = s.osTabletMode.has_value();
+     // KWin can report tabletModeAvailable=false even on a detachable 2-in-1
+@@ -47,7 +74,7 @@ Result classify(const Signals& s)
+                           !*s.osTabletModeAvailable;
+     const bool trustedTablet = tabletSignal && (!conflict || *s.osTabletMode);
+ 
+-    if (!s.hasTouchscreen) {
++    if (!touchUsable) {
+         // Nothing to touch: never a touch class, whatever the OS says
+         r.cls = (s.portable.value_or(false)) ? PostureClass::Laptop : PostureClass::Desktop;
+         r.confidence = (tabletSignal && *s.osTabletMode) ? Confidence::Low : Confidence::High;
+diff --git a/app/backend/postureclassifier.h b/app/backend/postureclassifier.h
+index 322337eb..5c061e43 100644
+--- a/app/backend/postureclassifier.h
++++ b/app/backend/postureclassifier.h
+@@ -60,6 +60,12 @@ struct Signals {
+     // signal is then not trustworthy.
+     std::optional<bool> osTabletModeAvailable;
+ 
++    // False when the machine's own panel is not a usable surface right now: the
++    // lid is closed or the built-in output is disabled, so the session is shown
++    // on an external display only. The integrated touchscreen then cannot be
++    // touched and is ignored. Unset = unknown (treated as in use).
++    std::optional<bool> builtinDisplayInUse;
++
+     bool hasTouchscreen = false;
+     bool hasKeyboard = false;
+     bool hasPointer = false;
+@@ -107,6 +113,12 @@ inline HostMode hostMode(PostureClass cls)
+ }
+ 
+ // Classify from signals alone (the Auto path).
++// Output names as the compositor reports them ("eDP-1", "HDMI-A-1", "DP-2",
++// X11 "eDP1"). Built-in = the machine's own panel; external = a cable to
++// another display. Anything else (virtual, unknown) is neither.
++bool isBuiltinConnectorName(const std::string& name);
++bool isExternalConnectorName(const std::string& name);
++
+ Result classify(const Signals& sig);
+ 
+ // Build the payload for a user mode: Never and (on launch) a non-touch desktop
+diff --git a/app/backend/posturedetector.cpp b/app/backend/posturedetector.cpp
+index b8b02283..16db6b42 100644
+--- a/app/backend/posturedetector.cpp
++++ b/app/backend/posturedetector.cpp
+@@ -10,6 +10,8 @@
+ 
+ #ifdef Q_OS_LINUX
+ #include <QFile>
++#include <QGuiApplication>
++#include <QScreen>
+ #endif
+ 
+ #ifdef HAVE_POSTURE_DBUS
+@@ -149,6 +151,34 @@ Signals collectLocalSignals()
+ 
+     s.hasGamepad = gameControllerPresent();
+ 
++#ifdef Q_OS_LINUX
++    // Docked laptop or 2-in-1 on an external display with its own panel disabled
++    // or the lid closed: the compositor lists only external outputs, so the
++    // integrated touchscreen has nothing behind it. Only claimed when every
++    // listed output is positively an external connector; unknown names leave
++    // the signal unset.
++    if (s.hasTouchscreen && s.portable.value_or(false)) {
++        bool builtin = false;
++        bool external = false;
++        bool unknown = false;
++        for (const QScreen* screen : QGuiApplication::screens()) {
++            const std::string name = screen->name().toStdString();
++            if (isBuiltinConnectorName(name)) {
++                builtin = true;
++            }
++            else if (isExternalConnectorName(name)) {
++                external = true;
++            }
++            else {
++                unknown = true;
++            }
++        }
++        if (!builtin && external && !unknown) {
++            s.builtinDisplayInUse = false;
++        }
++    }
++#endif
++
+     return s;
+ }
+ 
+diff --git a/tests/posture/tst_posture.cpp b/tests/posture/tst_posture.cpp
+index c5cfe496..20462cfe 100644
+--- a/tests/posture/tst_posture.cpp
++++ b/tests/posture/tst_posture.cpp
+@@ -59,6 +59,51 @@ private slots:
+         QCOMPARE(classify(s).cls, PostureClass::Laptop);
+     }
+ 
++    void touchscreenBehindDisabledPanelIsNotTouch()
++    {
++        // Dell 2-in-1 docked on an external display, own panel disabled; KWin
++        // keeps reporting tabletMode=true from the hinge switch.
++        Signals s;
++        s.hasTouchscreen = true;
++        s.hasKeyboard = s.hasPointer = true;
++        s.portable = true;
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = false;
++        s.builtinDisplayInUse = false;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Laptop);
++        QVERIFY(!r.touch);
++    }
++
++    void panelInUseOrUnknownKeepsTabletDecision()
++    {
++        Signals s;
++        s.hasTouchscreen = true;
++        s.hasKeyboard = s.hasPointer = true;
++        s.portable = true;
++        s.osTabletMode = true;
++        s.osTabletModeAvailable = false;
++        QCOMPARE(classify(s).cls, PostureClass::Tablet);
++        s.builtinDisplayInUse = true;
++        Result r = classify(s);
++        QCOMPARE(r.cls, PostureClass::Tablet);
++        QVERIFY(r.touch);
++    }
++
++    void connectorNames()
++    {
++        QVERIFY(isBuiltinConnectorName("eDP-1"));
++        QVERIFY(isBuiltinConnectorName("eDP1"));
++        QVERIFY(isBuiltinConnectorName("LVDS-1"));
++        QVERIFY(isBuiltinConnectorName("DSI-1"));
++        QVERIFY(!isBuiltinConnectorName("DP-2"));
++        QVERIFY(isExternalConnectorName("DP-2"));
++        QVERIFY(isExternalConnectorName("HDMI-A-1"));
++        QVERIFY(isExternalConnectorName("DisplayPort-0"));
++        QVERIFY(!isExternalConnectorName("eDP-1"));
++        QVERIFY(!isExternalConnectorName("Virtual-1"));
++    }
++
+     void noTouchIgnoresTabletMode()
+     {
+         Signals s;
+-- 
+2.56.1
+

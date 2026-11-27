@@ -163,7 +163,7 @@ def test_real_series_fingerprint_equals_patch_engineer_value():
         for ln in fh:
             if ln.startswith("patch_series_sha256:"):
                 pin = ln.split(":", 1)[1].strip()
-    assert info["count"] == 7 and info["groups"] == ["posture-core", "touch-menu"]
+    assert info["count"] == 9 and info["groups"] == ["posture-core", "touch-menu", "display"]
     assert info["series_sha256"] == pin
 
 

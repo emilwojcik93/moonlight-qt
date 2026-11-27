@@ -8,7 +8,7 @@ commit: 9184cacd8d426316bdecc47634f0dbf4e6e34654
 release_id: 454272425
 upstream_published_at: 2026-11-22T07:17:53Z
 upstream_daily: 202
-patch_series_sha256: 838eb05f3f5c4b531f5401e2110fac313b7731457e4202a2555086cc3bfe76cd
+patch_series_sha256: fae184b99cb2a13e8eca285722e26cf55e8d63b19da53938f1bfb805c34d5042
 series_base_commit: ea12abb41914565db391a23e69cd7264b038edba
 verified_tree_reference: feature/stream-posture-sync
 verified_tree: 10ffc5ef98d0351c52b984d421a431469be6f04a
