@@ -1060,6 +1060,10 @@ FocusScope {
                     visible: settingsShell.adaptShown
                     role: "secondary"
                     wrapMode: Text.Wrap
+                    leftPadding: Style.px(16, settingsShell.Window.window)
+                    rightPadding: Style.px(16, settingsShell.Window.window)
+                    topPadding: Style.px(4, settingsShell.Window.window)
+                    bottomPadding: Style.px(8, settingsShell.Window.window)
                     text: qsTr("Display %1: %2×%3 at %4 Hz").arg(DisplayAdapt.targetName)
                               .arg(DisplayAdapt.displaySize.width).arg(DisplayAdapt.displaySize.height)
                               .arg(DisplayAdapt.displayRefresh) + "\n" +
