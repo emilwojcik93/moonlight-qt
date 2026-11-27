@@ -73,6 +73,8 @@
 #define SER_CAPTURESYSKEYS "capturesyskeys"
 #define SER_CLIENTPOSTURE "clientposture"
 #define SER_RECONNECTONPOSTURE "reconnectonposture"
+#define SER_AUTOADAPTDISPLAY "autoadaptdisplay"
+#define SER_STREAMDISPLAY "streamdisplay"
 #define SER_STEAMCONTROLLERDRIVER "steamcontrollerdriver"
 #define SER_STEAMCONTROLLERMOTION "steamcontrollermotion"
 #define SER_STEAMCONTROLLERSPLITPADS "steamcontrollersplitpads"
@@ -265,6 +267,12 @@ void StreamingPreferences::reload()
         clientPostureMode = POSTURE_AUTO;
     }
     reconnectOnPosture = settings.value(SER_RECONNECTONPOSTURE, true).toBool();
+    autoAdaptDisplay = settings.value(SER_AUTOADAPTDISPLAY, true).toBool();
+    streamDisplay = static_cast<StreamDisplay>(settings.value(SER_STREAMDISPLAY,
+                                                              static_cast<int>(StreamDisplay::SD_WINDOW)).toInt());
+    if (streamDisplay < SD_WINDOW || streamDisplay > SD_PRIMARY) {
+        streamDisplay = SD_WINDOW;
+    }
     steamControllerDriver = settings.value(SER_STEAMCONTROLLERDRIVER, true).toBool();
     steamControllerMotion = settings.value(SER_STEAMCONTROLLERMOTION, true).toBool();
     steamControllerSplitPads = settings.value(SER_STEAMCONTROLLERSPLITPADS, true).toBool();
@@ -515,6 +523,8 @@ void StreamingPreferences::save()
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_CLIENTPOSTURE, clientPostureMode);
     settings.setValue(SER_RECONNECTONPOSTURE, reconnectOnPosture);
+    settings.setValue(SER_AUTOADAPTDISPLAY, autoAdaptDisplay);
+    settings.setValue(SER_STREAMDISPLAY, streamDisplay);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
     settings.setValue(SER_STEAMCONTROLLERDRIVER, steamControllerDriver);
     settings.setValue(SER_STEAMCONTROLLERMOTION, steamControllerMotion);

@@ -181,6 +181,7 @@ SOURCES += \
     backend/nvcomputer.cpp \
     backend/nvhttp.cpp \
     backend/postureclassifier.cpp \
+    backend/displayautoconfig.cpp \
     backend/posturedetector.cpp \
     streaming/posturemonitor.cpp \
     backend/pyrowaveudpprobe.cpp \
@@ -235,6 +236,7 @@ SOURCES += \
 
 HEADERS += \
     backend/postureclassifier.h \
+    backend/displayautoconfig.h \
     backend/posturedetector.h \
     streaming/posturemonitor.h \
     streaming/video/videothreadpriority.h \

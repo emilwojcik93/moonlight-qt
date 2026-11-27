@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include "backend/postureclassifier.h"
+#include "backend/displayautoconfig.h"
 
 using namespace posture;
 using std::chrono::milliseconds;
@@ -102,6 +103,107 @@ private slots:
         QVERIFY(isExternalConnectorName("DisplayPort-0"));
         QVERIFY(!isExternalConnectorName("eDP-1"));
         QVERIFY(!isExternalConnectorName("Virtual-1"));
+    }
+
+    void displayFpsSnaps()
+    {
+        QCOMPARE(displayauto::snapFps(59.94), 60);
+        QCOMPARE(displayauto::snapFps(60.0), 60);
+        QCOMPARE(displayauto::snapFps(143.98), 144);
+        QCOMPARE(displayauto::snapFps(74.97), 75);
+        QCOMPARE(displayauto::snapFps(119.88), 120);
+        QCOMPARE(displayauto::snapFps(165.0), 144);   // capped
+        QCOMPARE(displayauto::snapFps(29.97), 30);
+        QCOMPARE(displayauto::snapFps(24.0), 30);     // floor
+        QCOMPARE(displayauto::snapFps(98.0), 90);
+    }
+
+    void displayModeFollowsDisplay()
+    {
+        auto m = displayauto::chooseMode({2560, 1440, 59.94});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 2560);
+        QCOMPARE(m->height, 1440);
+        QCOMPARE(m->fps, 60);
+
+        m = displayauto::chooseMode({1920, 1280, 60.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 1920);
+        QCOMPARE(m->height, 1280);
+
+        // Unknown refresh rate falls back to 60
+        m = displayauto::chooseMode({1920, 1080, 0.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->fps, 60);
+    }
+
+    void displayModeCapsAndEvens()
+    {
+        // Bigger than 4K: fitted inside the cap, aspect kept
+        auto m = displayauto::chooseMode({5120, 2880, 60.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 3840);
+        QCOMPARE(m->height, 2160);
+
+        m = displayauto::chooseMode({3840, 2400, 60.0});
+        QVERIFY(m.has_value());
+        QVERIFY(m->width <= 3840 && m->height <= 2160);
+        QCOMPARE(m->width % 2, 0);
+        QCOMPARE(m->height % 2, 0);
+
+        m = displayauto::chooseMode({1367, 769, 60.0});
+        QVERIFY(m.has_value());
+        QCOMPARE(m->width, 1366);
+        QCOMPARE(m->height, 768);
+
+        QVERIFY(!displayauto::chooseMode({0, 0, 60.0}).has_value());
+    }
+
+    void displayBitrateRules()
+    {
+        using displayauto::StreamMode;
+        const StreamMode p1080{1920, 1080, 60};
+        const StreamMode p1440{2560, 1440, 60};
+        const StreamMode p720{1280, 720, 60};
+
+        // Same mode: unchanged
+        QCOMPARE(displayauto::chooseBitrate(p1080, 12345, 10000, p1080, 10000), 12345);
+        // Never changed from the default: default of the new mode
+        QCOMPARE(displayauto::chooseBitrate(p1080, 10000, 10000, p1440, 20000), 20000);
+        QCOMPARE(displayauto::chooseBitrate(p1080, 10200, 10000, p720, 5000), 5000);
+        // User-set: scaled by the ratio of the defaults, 0.4x..1.5x
+        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p1440, 20000), 30000);   // 2x -> 1.5x
+        QCOMPARE(displayauto::chooseBitrate(p1440, 25000, 20000, p1080, 10000), 12500);   // 0.5x
+        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 5000), 10000);     // 0.5x
+        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 1000), 8000);      // floor 0.4x
+    }
+
+    void displayGateDebouncesAndCools()
+    {
+        using displayauto::StreamMode;
+        using Clock = displayauto::AdaptGate::Clock;
+        const StreamMode a{1920, 1080, 60};
+        const StreamMode b{2560, 1440, 60};
+        const StreamMode c{2560, 1440, 120};
+        const Clock::time_point t0 = Clock::now();
+        auto at = [&](int ms) { return t0 + milliseconds(ms); };
+
+        displayauto::AdaptGate gate(milliseconds(3000), milliseconds(20000));
+        QVERIFY(!gate.update(a, a, at(0)));              // nothing wanted
+        QVERIFY(!gate.update(b, a, at(1000)));           // difference seen
+        QVERIFY(!gate.update(b, a, at(3000)));           // 2 s: still debouncing
+        QVERIFY(gate.update(b, a, at(4000)));            // 3 s: restart once
+        QVERIFY(!gate.update(b, a, at(4500)));           // pending reset, new debounce
+
+        // The wanted mode keeps changing: the debounce restarts each time
+        QVERIFY(!gate.update(c, a, at(5000)));
+        QVERIFY(!gate.update(b, a, at(7000)));
+        QVERIFY(!gate.update(c, a, at(9000)));
+
+        // Stable again but inside the 20 s cooldown of the restart at 4 s
+        QVERIFY(!gate.update(c, a, at(12500)));
+        QVERIFY(!gate.update(c, a, at(23000)));          // 19 s after the restart
+        QVERIFY(gate.update(c, a, at(24500)));           // cooldown over
     }
 
     void noTouchIgnoresTabletMode()

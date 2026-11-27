@@ -394,6 +394,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("yuv444", "YUV 4:4:4 sampling, if supported");
     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
     parser.addChoiceOption("client-posture", "touch tablet posture sent to the host", m_PostureModeMap.keys());
+    parser.addToggleOption("auto-adapt-display", "match resolution, frame rate and bitrate to the display (off for a run that sets them)");
     parser.addToggleOption("reconnect-on-posture", "resume the stream when a posture change needs a new host display");
     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
@@ -555,6 +556,14 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --client-posture option
     if (parser.isSet("client-posture")) {
         preferences->clientPostureMode = mapValue(m_PostureModeMap, parser.getChoiceOptionValue("client-posture"));
+    }
+
+    // Resolve --auto-adapt-display and --no-auto-adapt-display. A command line that
+    // sets the video mode itself keeps it unless the toggle is given explicitly.
+    {
+        const bool videoModeGiven = parser.isSet("fps") || parser.isSet("bitrate") || displaySet;
+        preferences->autoAdaptDisplay = parser.getToggleOptionValue("auto-adapt-display",
+                                                                    videoModeGiven ? false : preferences->autoAdaptDisplay);
     }
 
     // Resolve --reconnect-on-posture and --no-reconnect-on-posture options

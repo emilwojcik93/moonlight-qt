@@ -960,6 +960,47 @@ FocusScope {
                 }
 
                 ConsoleCheckBox {
+                    id: autoAdaptDisplayCheck
+                    objectName: "autoAdaptDisplayCheck"
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Adapt to the display")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.autoAdaptDisplay
+                    onCheckedChanged: {
+                        StreamingPreferences.autoAdaptDisplay = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 8000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Match the stream resolution, frame rate and bitrate to the display it is shown on, when a stream starts and when that display changes (monitor connected, resolution or refresh rate changed). The resolution, frame rate and bitrate above are used as the reference. A bitrate you set yourself is scaled with the new mode, at most 1.5 times. A display change during a stream briefly resumes the stream.")
+                }
+
+                ConsoleSettingRow {
+                    width: parent.width
+                    objectName: "streamDisplayRow"
+                    visible: StreamingPreferences.autoAdaptDisplay
+                    labelItem: ConsoleText { text: qsTr("Stream display") }
+                    description: qsTr("Which display the stream opens on and adapts to. Moonlight window: the display this window is on. Primary display: the display your system marks as primary.")
+                    editor: AutoResizingComboBox {
+                        id: streamDisplayCombo
+                        textRole: "text"
+                        model: ListModel {
+                            ListElement { text: qsTr("Moonlight window"); val: StreamingPreferences.SD_WINDOW }
+                            ListElement { text: qsTr("Primary display"); val: StreamingPreferences.SD_PRIMARY }
+                        }
+                        Component.onCompleted: {
+                            for (var i = 0; i < count; ++i) {
+                                if (model.get(i).val === StreamingPreferences.streamDisplay) { currentIndex = i; break }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: StreamingPreferences.streamDisplay = model.get(currentIndex).val
+                    }
+                }
+
+                ConsoleCheckBox {
                     id: enableYUV444
                     width: parent.width
                     text: qsTr("Enable YUV 4:4:4")

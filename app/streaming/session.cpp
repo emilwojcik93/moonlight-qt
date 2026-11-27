@@ -820,6 +820,45 @@ bool Session::initialize(QQuickWindow* qtWindow)
     LiInitializeStreamConfiguration(&m_StreamConfig);
     m_StreamConfig.width = m_Preferences->width;
     m_StreamConfig.height = m_Preferences->height;
+    m_StreamConfig.fps = m_Preferences->fps;
+    m_AdaptActiveMode = {m_Preferences->width, m_Preferences->height, m_Preferences->fps};
+
+    // Match the mode to the display the stream is shown on
+    m_AdaptEnabled = m_Preferences->autoAdaptDisplay;
+    if (m_AdaptEnabled) {
+        displayauto::DisplayMode display;
+        std::optional<displayauto::StreamMode> wanted;
+        if (readTargetDisplayMode(display)) {
+            wanted = displayauto::chooseMode(display);
+        }
+
+        if (wanted) {
+            const displayauto::StreamMode saved = m_AdaptActiveMode;
+            const bool yuv444 = m_Preferences->enableYUV444;
+            if (m_Preferences->videoCodecConfig != StreamingPreferences::VCC_FORCE_PYROWAVE) {
+                m_AdaptBitrate = displayauto::chooseBitrate(
+                            saved, m_Preferences->bitrateKbps,
+                            StreamingPreferences::getDefaultBitrate(saved.width, saved.height, saved.fps, yuv444),
+                            *wanted,
+                            StreamingPreferences::getDefaultBitrate(wanted->width, wanted->height, wanted->fps, yuv444));
+            }
+            m_StreamConfig.width = wanted->width;
+            m_StreamConfig.height = wanted->height;
+            m_StreamConfig.fps = wanted->fps;
+            m_AdaptActiveMode = *wanted;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Display auto-adapt: display %dx%d at %.0f Hz -> stream %dx%d at %d fps, bitrate %d kbps (saved %dx%d at %d fps, %d kbps)",
+                        display.width, display.height, display.refreshHz,
+                        wanted->width, wanted->height, wanted->fps,
+                        m_AdaptBitrate.value_or(m_Preferences->bitrateKbps),
+                        saved.width, saved.height, saved.fps, m_Preferences->bitrateKbps);
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Display auto-adapt: the display mode is not readable, using the saved video settings");
+            m_AdaptEnabled = false;
+        }
+    }
 
     int x, y, width, height;
     getWindowDimensions(x, y, width, height);
@@ -846,9 +885,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
     LiInitializeVideoCallbacks(&m_VideoCallbacks);
     m_VideoCallbacks.setup = drSetup;
 
-    m_StreamConfig.fps = m_Preferences->fps;
     snapshotPresentationSettings(testWindow);
-    m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
+    m_StreamConfig.bitrate = m_AdaptBitrate.value_or(m_Preferences->bitrateKbps);
 
 #ifndef STEAM_LINK
     // Opt-in to all encryption features if we detect that the platform
@@ -1562,53 +1600,102 @@ private:
     Session* m_Session;
 };
 
+// The SDL display whose origin matches a Qt screen, or -1.
+static int sdlDisplayForQtScreen(const QScreen* screen)
+{
+    if (screen == nullptr) {
+        return -1;
+    }
+
+    const QRect displayRect = screen->geometry();
+    for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
+        SDL_Rect displayBounds;
+
+        if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
+            if (displayBounds.x == displayRect.x() &&
+                displayBounds.y == displayRect.y()) {
+                return i;
+            }
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "SDL_GetDisplayBounds(%d) failed: %s",
+                        i, SDL_GetError());
+        }
+    }
+    return -1;
+}
+
+int Session::getTargetDisplayIndex()
+{
+    // The primary display, when chosen and found
+    if (m_Preferences->streamDisplay == StreamingPreferences::SD_PRIMARY) {
+        const int primary = sdlDisplayForQtScreen(QGuiApplication::primaryScreen());
+        if (primary >= 0) {
+            return primary;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Primary display not found among the SDL displays, using the Moonlight window's display");
+    }
+
+    if (m_Window != nullptr) {
+        const int index = SDL_GetWindowDisplayIndex(m_Window);
+        SDL_assert(index >= 0);
+        return index >= 0 ? index : 0;
+    }
+
+    // Create our window on the same display that Qt's UI
+    // was being displayed on.
+    Q_ASSERT(m_QtWindow != nullptr);
+    if (m_QtWindow != nullptr) {
+        QScreen* screen = m_QtWindow->screen();
+        if (screen != nullptr) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Qt UI screen is at (%d,%d)",
+                        screen->geometry().x(), screen->geometry().y());
+            const int index = sdlDisplayForQtScreen(screen);
+            if (index >= 0) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "SDL found matching display %d",
+                            index);
+                return index;
+            }
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Qt window is not associated with a QScreen!");
+        }
+    }
+    return 0;
+}
+
+// Resolution as Moonlight's own "native" choice (true panel pixels), refresh
+// rate of the mode the desktop runs in now.
+bool Session::readTargetDisplayMode(displayauto::DisplayMode& out)
+{
+    const int displayIndex = getTargetDisplayIndex();
+
+    SDL_DisplayMode native;
+    SDL_Rect safeArea;
+    if (!StreamUtils::getNativeDesktopMode(displayIndex, &native, &safeArea)) {
+        return false;
+    }
+
+    out.width = native.w;
+    out.height = native.h;
+    out.refreshHz = native.refresh_rate;
+
+    SDL_DisplayMode current;
+    if (SDL_GetDesktopDisplayMode(displayIndex, &current) == 0 && current.refresh_rate > 0) {
+        out.refreshHz = current.refresh_rate;
+    }
+    return true;
+}
+
 void Session::getWindowDimensions(int& x, int& y,
                                   int& width, int& height)
 {
-    int displayIndex = 0;
-
-    if (m_Window != nullptr) {
-        displayIndex = SDL_GetWindowDisplayIndex(m_Window);
-        SDL_assert(displayIndex >= 0);
-    }
-    // Create our window on the same display that Qt's UI
-    // was being displayed on.
-    else {
-        Q_ASSERT(m_QtWindow != nullptr);
-        if (m_QtWindow != nullptr) {
-            QScreen* screen = m_QtWindow->screen();
-            if (screen != nullptr) {
-                QRect displayRect = screen->geometry();
-
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Qt UI screen is at (%d,%d)",
-                            displayRect.x(), displayRect.y());
-                for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
-                    SDL_Rect displayBounds;
-
-                    if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
-                        if (displayBounds.x == displayRect.x() &&
-                            displayBounds.y == displayRect.y()) {
-                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                        "SDL found matching display %d",
-                                        i);
-                            displayIndex = i;
-                            break;
-                        }
-                    }
-                    else {
-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                    "SDL_GetDisplayBounds(%d) failed: %s",
-                                    i, SDL_GetError());
-                    }
-                }
-            }
-            else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Qt window is not associated with a QScreen!");
-            }
-        }
-    }
+    const int displayIndex = getTargetDisplayIndex();
 
     SDL_Rect usableBounds;
     if (SDL_GetDisplayUsableBounds(displayIndex, &usableBounds) == 0) {
@@ -1807,6 +1894,8 @@ void Session::notifyMouseEmulationMode(bool enabled)
 
 // Time of the last automatic posture restart; the cooldown spans sessions.
 static std::optional<std::chrono::steady_clock::time_point> s_LastPostureRestart;
+// Same for restarts that follow a display change (display auto-adapt).
+static std::optional<std::chrono::steady_clock::time_point> s_LastDisplayRestart;
 
 static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
 {
@@ -2401,7 +2490,37 @@ void Session::exec()
                                                           s_LastPostureRestart);
     }
 
+    // A changed display (monitor connected or removed, resolution or refresh rate
+    // changed, other display primary) wants another mode: resume the stream with it.
+    // Only for a host that rebuilds its display on resume, like the posture restart.
+    std::optional<displayauto::AdaptGate> adaptGate;
+    if (m_AdaptEnabled && !m_Computer->isNvidiaServerSoftware) {
+        adaptGate.emplace(std::chrono::seconds(3), std::chrono::seconds(20), s_LastDisplayRestart);
+    }
+    auto nextAdaptSample = std::chrono::steady_clock::now();
+
     for (;;) {
+        if (adaptGate && std::chrono::steady_clock::now() >= nextAdaptSample) {
+            const auto now = std::chrono::steady_clock::now();
+            nextAdaptSample = now + std::chrono::seconds(1);
+
+            displayauto::DisplayMode display;
+            std::optional<displayauto::StreamMode> wanted;
+            if (readTargetDisplayMode(display)) {
+                wanted = displayauto::chooseMode(display);
+            }
+            if (wanted && adaptGate->update(*wanted, m_AdaptActiveMode, now) &&
+                    !m_ShouldExit && !m_UnexpectedTermination && !SDL_HasEvent(SDL_QUIT)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Display changed: restarting the stream from %dx%d at %d fps to %dx%d at %d fps",
+                            m_AdaptActiveMode.width, m_AdaptActiveMode.height, m_AdaptActiveMode.fps,
+                            wanted->width, wanted->height, wanted->fps);
+                s_LastDisplayRestart = now;
+                m_PostureRestartRequested = true;
+                goto DispatchDeferredCleanup;
+            }
+        }
+
         if (postureMonitor) {
             postureMonitor->tick();
 

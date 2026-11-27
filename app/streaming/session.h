@@ -13,6 +13,9 @@
 #include "video/clientpacingwarning.h"
 #include "diagnostics/diagnosticcapture.h"
 #include "backend/postureclassifier.h"
+#include "backend/displayautoconfig.h"
+
+#include <optional>
 #ifdef HAVE_KWIN_SCANOUT_GUARD
 #include "streaming/kwinscanoutguard.h"
 #endif
@@ -198,6 +201,8 @@ private:
 
     int getAudioRendererCapabilities(int audioConfiguration);
 
+    int getTargetDisplayIndex();
+    bool readTargetDisplayMode(displayauto::DisplayMode& out);
     void getWindowDimensions(int& x, int& y,
                              int& width, int& height);
 
@@ -346,6 +351,12 @@ private:
     // This session ends by an automatic posture restart (set on the SDL thread
     // before cleanup is dispatched).
     bool m_PostureRestartRequested = false;
+
+    // Display auto-adapt (displayautoconfig.h): the mode and bitrate applied at
+    // start, kept to detect that the display wants something else later.
+    bool m_AdaptEnabled = false;
+    displayauto::StreamMode m_AdaptActiveMode;
+    std::optional<int> m_AdaptBitrate;
     int m_PortTestResults;
 
     int m_ActiveVideoFormat;

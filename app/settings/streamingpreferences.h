@@ -166,6 +166,15 @@ public:
     };
     Q_ENUM(PostureMode);
 
+    // Which display the stream is shown on and adapts to. Window = the display
+    // Moonlight's own window is on (the long-standing behaviour).
+    enum StreamDisplay
+    {
+        SD_WINDOW,
+        SD_PRIMARY,
+    };
+    Q_ENUM(StreamDisplay);
+
     // What opens the touch-only stream menu. The default is the swipe alone:
     // nothing is drawn over the stream. Off leaves only the keyboard and
     // gamepad shortcuts.
@@ -250,6 +259,8 @@ public:
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(PostureMode clientPostureMode MEMBER clientPostureMode NOTIFY clientPostureModeChanged)
     Q_PROPERTY(bool reconnectOnPosture MEMBER reconnectOnPosture NOTIFY reconnectOnPostureChanged)
+    Q_PROPERTY(bool autoAdaptDisplay MEMBER autoAdaptDisplay NOTIFY autoAdaptDisplayChanged)
+    Q_PROPERTY(StreamDisplay streamDisplay MEMBER streamDisplay NOTIFY streamDisplayChanged)
     Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
@@ -332,6 +343,10 @@ public:
     // boundary (see streaming/posturemonitor.h), so the host recreates its
     // virtual display for the new posture.
     bool reconnectOnPosture = true;
+    // Match resolution, frame rate and bitrate to the display the stream is shown
+    // on, at stream start and when that display changes (displayautoconfig.h).
+    bool autoAdaptDisplay = true;
+    StreamDisplay streamDisplay = SD_WINDOW;
     RendererSelection rendererSelection;
     // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
     bool steamControllerDriver;
@@ -398,6 +413,8 @@ signals:
     void captureSysKeysModeChanged();
     void clientPostureModeChanged();
     void reconnectOnPostureChanged();
+    void autoAdaptDisplayChanged();
+    void streamDisplayChanged();
     void steamControllerChanged();
     void keepAwakeChanged();
     void languageChanged();
