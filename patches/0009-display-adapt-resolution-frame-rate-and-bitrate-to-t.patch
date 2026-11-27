@@ -1,0 +1,1322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: emilwojcik93 <34631176+emilwojcik93@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:52:01 +0100
+Subject: [PATCH 9/9] display: adapt resolution, frame rate and bitrate to the
+ display
+
+New option "Adapt to the display" (default on). The stream mode follows the
+display the stream is shown on, at every stream start and, through the existing
+restart path, when that display changes (connection, resolution, refresh rate,
+primary display). The saved resolution, frame rate and bitrate are the reference.
+
+- Resolution: native size of the display, always landscape (a rotated 2-in-1
+  keeps the stream shape), even numbers, capped at 3840x2160.
+- Frame rate: largest standard rate not above the refresh rate, capped at 144
+  (a rate far above the nearest standard one, such as 48 Hz, is kept).
+- Bitrate: a value the user never changed follows Moonlight's default for the
+  new mode; a user-set value is a ceiling, scaled 0.4x to 1.0x.
+- Stream display: primary display (default), the Moonlight window's display
+  (the previous behaviour), or a display by output name.
+- A running stream samples the display once a second and restarts after the
+  wanted mode has differed for 3 s, at most once every 20 s; not for GFE hosts.
+- Settings: live status of the target display and the stream now (resolution,
+  frame rate, codec, bitrate, HDR), Auto (value) on the resolution and frame rate
+  rows, display list. The command line keeps its own values unless
+  --auto-adapt-display is given.
+
+Policy and debounce gate are pure code (backend/displayautoconfig) with unit
+tests; the session and the settings page share backend/displayadapt.
+---
+ app/app.pro                           |   4 +
+ app/backend/displayadapt.cpp          | 247 ++++++++++++++++++++++++++
+ app/backend/displayadapt.h            |  90 ++++++++++
+ app/backend/displayautoconfig.cpp     | 111 ++++++++++++
+ app/backend/displayautoconfig.h       |  79 ++++++++
+ app/cli/commandlineparser.cpp         |   9 +
+ app/gui/SettingsView.qml              | 116 ++++++++++++
+ app/main.cpp                          |   6 +
+ app/settings/streamingpreferences.cpp |  13 ++
+ app/settings/streamingpreferences.h   |  24 +++
+ app/streaming/session.cpp             | 153 ++++++++++++----
+ app/streaming/session.h               |  11 ++
+ tests/posture/posture.pro             |   6 +-
+ tests/posture/tst_posture.cpp         | 118 ++++++++++++
+ 14 files changed, 946 insertions(+), 41 deletions(-)
+ create mode 100644 app/backend/displayadapt.cpp
+ create mode 100644 app/backend/displayadapt.h
+ create mode 100644 app/backend/displayautoconfig.cpp
+ create mode 100644 app/backend/displayautoconfig.h
+
+diff --git a/app/app.pro b/app/app.pro
+index 57603e70..200c7954 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -181,6 +181,8 @@ SOURCES += \
+     backend/nvcomputer.cpp \
+     backend/nvhttp.cpp \
+     backend/postureclassifier.cpp \
++    backend/displayautoconfig.cpp \
++    backend/displayadapt.cpp \
+     backend/posturedetector.cpp \
+     streaming/posturemonitor.cpp \
+     backend/pyrowaveudpprobe.cpp \
+@@ -235,6 +237,8 @@ SOURCES += \
+ 
+ HEADERS += \
+     backend/postureclassifier.h \
++    backend/displayautoconfig.h \
++    backend/displayadapt.h \
+     backend/posturedetector.h \
+     streaming/posturemonitor.h \
+     streaming/video/videothreadpriority.h \
+diff --git a/app/backend/displayadapt.cpp b/app/backend/displayadapt.cpp
+new file mode 100644
+index 00000000..cb0187de
+--- /dev/null
++++ b/app/backend/displayadapt.cpp
+@@ -0,0 +1,247 @@
++#include "displayadapt.h"
++
++#include "settings/streamingpreferences.h"
++#include "streaming/streamutils.h"
++
++#include <QGuiApplication>
++#include <QScreen>
++#include <QWindow>
++
++#include "SDL_compat.h"
++
++namespace displayadapt {
++
++QScreen* pickScreen(const StreamingPreferences* prefs, QScreen* windowScreen)
++{
++    switch (prefs->streamDisplay) {
++    case StreamingPreferences::SD_WINDOW:
++        return windowScreen;
++    case StreamingPreferences::SD_NAMED:
++        for (QScreen* screen : QGuiApplication::screens()) {
++            if (screen->name() == prefs->streamDisplayName) {
++                return screen;
++            }
++        }
++        // Not connected now: the primary display
++        return QGuiApplication::primaryScreen();
++    case StreamingPreferences::SD_PRIMARY:
++    default:
++        return QGuiApplication::primaryScreen();
++    }
++}
++
++int sdlDisplayForScreen(const QScreen* screen)
++{
++    if (screen == nullptr) {
++        return -1;
++    }
++
++    const QRect displayRect = screen->geometry();
++    for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
++        SDL_Rect displayBounds;
++
++        if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
++            if (displayBounds.x == displayRect.x() &&
++                displayBounds.y == displayRect.y()) {
++                return i;
++            }
++        }
++        else {
++            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                        "SDL_GetDisplayBounds(%d) failed: %s",
++                        i, SDL_GetError());
++        }
++    }
++    return -1;
++}
++
++bool readDisplayMode(int sdlDisplayIndex, displayauto::DisplayMode& out)
++{
++    SDL_DisplayMode native;
++    SDL_Rect safeArea;
++    if (!StreamUtils::getNativeDesktopMode(sdlDisplayIndex, &native, &safeArea)) {
++        return false;
++    }
++
++    out.width = native.w;
++    out.height = native.h;
++    out.refreshHz = native.refresh_rate;
++
++    SDL_DisplayMode current;
++    if (SDL_GetDesktopDisplayMode(sdlDisplayIndex, &current) == 0 && current.refresh_rate > 0) {
++        out.refreshHz = current.refresh_rate;
++    }
++    return true;
++}
++
++std::optional<Result> compute(const StreamingPreferences* prefs, const displayauto::DisplayMode& display)
++{
++    const auto wanted = displayauto::chooseMode(display);
++    if (!wanted) {
++        return std::nullopt;
++    }
++
++    Result r;
++    r.display = display;
++    r.mode = *wanted;
++    r.bitrateKbps = prefs->bitrateKbps;
++
++    // PyroWave has its own bitrate scale
++    if (prefs->videoCodecConfig != StreamingPreferences::VCC_FORCE_PYROWAVE) {
++        const displayauto::StreamMode saved{prefs->width, prefs->height, prefs->fps};
++        const bool yuv444 = prefs->enableYUV444;
++        r.bitrateKbps = displayauto::chooseBitrate(
++                    saved, prefs->bitrateKbps,
++                    StreamingPreferences::getDefaultBitrate(saved.width, saved.height, saved.fps, yuv444),
++                    r.mode,
++                    StreamingPreferences::getDefaultBitrate(r.mode.width, r.mode.height, r.mode.fps, yuv444));
++        r.bitrateAdapted = r.bitrateKbps != prefs->bitrateKbps;
++    }
++    return r;
++}
++
++} // namespace displayadapt
++
++DisplayAdapt::DisplayAdapt(QObject* parent)
++    : QObject(parent)
++{
++    m_Debounce.setSingleShot(true);
++    m_Debounce.setInterval(400);
++    connect(&m_Debounce, &QTimer::timeout, this, &DisplayAdapt::refresh);
++
++    connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen* screen) {
++        watchScreen(screen);
++        schedule();
++    });
++    connect(qGuiApp, &QGuiApplication::screenRemoved, this, &DisplayAdapt::schedule);
++    connect(qGuiApp, &QGuiApplication::primaryScreenChanged, this, &DisplayAdapt::schedule);
++    for (QScreen* screen : QGuiApplication::screens()) {
++        watchScreen(screen);
++    }
++
++    // Everything the result depends on
++    StreamingPreferences* prefs = StreamingPreferences::get();
++    connect(prefs, &StreamingPreferences::autoAdaptDisplayChanged, this, &DisplayAdapt::schedule);
++    connect(prefs, &StreamingPreferences::streamDisplayChanged, this, &DisplayAdapt::schedule);
++    connect(prefs, &StreamingPreferences::streamDisplayNameChanged, this, &DisplayAdapt::schedule);
++    connect(prefs, &StreamingPreferences::bitrateChanged, this, &DisplayAdapt::schedule);
++    connect(prefs, &StreamingPreferences::enableYUV444Changed, this, &DisplayAdapt::schedule);
++    connect(prefs, &StreamingPreferences::videoCodecConfigChanged, this, &DisplayAdapt::schedule);
++}
++
++void DisplayAdapt::watchScreen(QScreen* screen)
++{
++    connect(screen, &QScreen::geometryChanged, this, &DisplayAdapt::schedule);
++    connect(screen, &QScreen::refreshRateChanged, this, &DisplayAdapt::schedule);
++    connect(screen, &QScreen::physicalSizeChanged, this, &DisplayAdapt::schedule);
++}
++
++void DisplayAdapt::schedule()
++{
++    if (m_Active) {
++        m_Debounce.start();
++    }
++}
++
++void DisplayAdapt::setActive(bool active)
++{
++    if (m_Active == active) {
++        return;
++    }
++    m_Active = active;
++    emit activeChanged();
++    if (active) {
++        refresh();
++    }
++    else {
++        m_Debounce.stop();
++    }
++}
++
++void DisplayAdapt::refresh()
++{
++    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
++        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
++                     "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s",
++                     SDL_GetError());
++        return;
++    }
++
++    const StreamingPreferences* prefs = StreamingPreferences::get();
++    QScreen* const primary = QGuiApplication::primaryScreen();
++
++    QVariantList displays;
++    for (QScreen* screen : QGuiApplication::screens()) {
++        displayauto::DisplayMode mode;
++        const int sdlIndex = displayadapt::sdlDisplayForScreen(screen);
++        if (sdlIndex < 0 || !displayadapt::readDisplayMode(sdlIndex, mode)) {
++            // SDL and Qt disagree on where the screen is: Qt's own numbers
++            mode.width = qRound(screen->size().width() * screen->devicePixelRatio());
++            mode.height = qRound(screen->size().height() * screen->devicePixelRatio());
++            mode.refreshHz = screen->refreshRate();
++        }
++
++        QString label = screen->name();
++        const QString model = (screen->manufacturer() + QLatin1Char(' ') + screen->model()).trimmed();
++        if (!model.isEmpty()) {
++            label += QStringLiteral(" - ") + model;
++        }
++
++        QVariantMap entry;
++        entry.insert(QStringLiteral("id"), screen->name());
++        entry.insert(QStringLiteral("label"), label);
++        entry.insert(QStringLiteral("primary"), screen == primary);
++        entry.insert(QStringLiteral("width"), mode.width);
++        entry.insert(QStringLiteral("height"), mode.height);
++        entry.insert(QStringLiteral("refresh"), qRound(mode.refreshHz));
++        displays.append(entry);
++    }
++
++    // What the stream would use: the Moonlight window is the first window's screen
++    QScreen* windowScreen = nullptr;
++    for (QWindow* window : QGuiApplication::topLevelWindows()) {
++        if (window->isVisible()) {
++            windowScreen = window->screen();
++            break;
++        }
++    }
++    QScreen* target = displayadapt::pickScreen(prefs, windowScreen ? windowScreen : primary);
++
++    bool valid = false;
++    QString targetName;
++    QSize displaySize, streamSize;
++    int displayRefresh = 0, streamFps = 0, bitrate = 0;
++
++    if (target != nullptr) {
++        displayauto::DisplayMode mode;
++        const int sdlIndex = displayadapt::sdlDisplayForScreen(target);
++        if (sdlIndex >= 0 && displayadapt::readDisplayMode(sdlIndex, mode)) {
++            if (const auto result = displayadapt::compute(prefs, mode)) {
++                valid = true;
++                targetName = target->name();
++                displaySize = QSize(mode.width, mode.height);
++                displayRefresh = qRound(mode.refreshHz);
++                streamSize = QSize(result->mode.width, result->mode.height);
++                streamFps = result->mode.fps;
++                bitrate = result->bitrateKbps;
++            }
++        }
++    }
++
++    SDL_QuitSubSystem(SDL_INIT_VIDEO);
++
++    const bool differs = displays != m_Displays || valid != m_Valid || targetName != m_TargetName ||
++                         displaySize != m_DisplaySize || displayRefresh != m_DisplayRefresh ||
++                         streamSize != m_StreamSize || streamFps != m_StreamFps || bitrate != m_BitrateKbps;
++    if (differs) {
++        m_Displays = displays;
++        m_Valid = valid;
++        m_TargetName = targetName;
++        m_DisplaySize = displaySize;
++        m_DisplayRefresh = displayRefresh;
++        m_StreamSize = streamSize;
++        m_StreamFps = streamFps;
++        m_BitrateKbps = bitrate;
++        emit changed();
++    }
++}
+diff --git a/app/backend/displayadapt.h b/app/backend/displayadapt.h
+new file mode 100644
+index 00000000..6de5d5df
+--- /dev/null
++++ b/app/backend/displayadapt.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++#include "backend/displayautoconfig.h"
++
++#include <QObject>
++#include <QSize>
++#include <QString>
++#include <QTimer>
++#include <QVariantList>
++
++#include <optional>
++
++class QScreen;
++class StreamingPreferences;
++
++// Shared by the stream session and the settings page, so the settings show the
++// numbers the next stream will really use.
++namespace displayadapt {
++
++struct Result {
++    displayauto::DisplayMode display;
++    displayauto::StreamMode mode;
++    int bitrateKbps = 0;
++    bool bitrateAdapted = false;
++};
++
++// The Qt screen the stream is shown on, per the stream-display preference.
++// windowScreen is the Moonlight window's screen (used for "Moonlight window").
++QScreen* pickScreen(const StreamingPreferences* prefs, QScreen* windowScreen);
++
++// The SDL display that sits where the Qt screen sits, or -1. SDL video must be
++// initialised.
++int sdlDisplayForScreen(const QScreen* screen);
++
++// Native pixels of an SDL display (Moonlight's own "native" choice) and the
++// refresh rate of the mode the desktop runs in now. SDL video must be initialised.
++bool readDisplayMode(int sdlDisplayIndex, displayauto::DisplayMode& out);
++
++// Stream mode and bitrate for a display, with the saved video settings as the
++// reference. Nothing when the display mode is unusable.
++std::optional<Result> compute(const StreamingPreferences* prefs, const displayauto::DisplayMode& display);
++
++} // namespace displayadapt
++
++// Live view for the settings page: connected displays and what "Adapt to the
++// display" would use now. Updates when displays or the relevant settings change.
++class DisplayAdapt : public QObject
++{
++    Q_OBJECT
++
++    // Only refresh while the settings page is visible (SDL is started per refresh)
++    Q_PROPERTY(bool active MEMBER m_Active WRITE setActive NOTIFY activeChanged)
++
++    // [{id, label, primary, width, height, refresh}]
++    Q_PROPERTY(QVariantList displays MEMBER m_Displays NOTIFY changed)
++
++    Q_PROPERTY(bool valid MEMBER m_Valid NOTIFY changed)
++    Q_PROPERTY(QString targetName MEMBER m_TargetName NOTIFY changed)
++    Q_PROPERTY(QSize displaySize MEMBER m_DisplaySize NOTIFY changed)
++    Q_PROPERTY(int displayRefresh MEMBER m_DisplayRefresh NOTIFY changed)
++    Q_PROPERTY(QSize streamSize MEMBER m_StreamSize NOTIFY changed)
++    Q_PROPERTY(int streamFps MEMBER m_StreamFps NOTIFY changed)
++    Q_PROPERTY(int bitrateKbps MEMBER m_BitrateKbps NOTIFY changed)
++
++public:
++    explicit DisplayAdapt(QObject* parent = nullptr);
++
++    Q_INVOKABLE void refresh();
++
++    void setActive(bool active);
++
++signals:
++    void changed();
++    void activeChanged();
++
++private:
++    void schedule();
++    void watchScreen(QScreen* screen);
++
++    QTimer m_Debounce;
++    bool m_Active = false;
++    QVariantList m_Displays;
++    bool m_Valid = false;
++    QString m_TargetName;
++    QSize m_DisplaySize;
++    int m_DisplayRefresh = 0;
++    QSize m_StreamSize;
++    int m_StreamFps = 0;
++    int m_BitrateKbps = 0;
++};
+diff --git a/app/backend/displayautoconfig.cpp b/app/backend/displayautoconfig.cpp
+new file mode 100644
+index 00000000..b00651a0
+--- /dev/null
++++ b/app/backend/displayautoconfig.cpp
+@@ -0,0 +1,111 @@
++#include "displayautoconfig.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace displayauto {
++
++int snapFps(double refreshHz, const Limits& limits)
++{
++    static const int kRates[] = { 30, 50, 60, 75, 90, 100, 120, 144, 165, 240 };
++
++    // Panels report 59.94 or 143.98; compare against the rounded value
++    const int rounded = static_cast<int>(std::lround(refreshHz));
++    int best = limits.minFps;
++    for (int rate : kRates) {
++        if (rate <= rounded && rate <= limits.maxFps && rate >= limits.minFps) {
++            best = rate;
++        }
++    }
++
++    // A rate well above the nearest standard one (a 48 Hz power-saving mode)
++    // is used as it is instead of dropping to 30
++    if (rounded > best && rounded - best > 10 && rounded <= limits.maxFps) {
++        best = rounded;
++    }
++    return std::min(best, limits.maxFps);
++}
++
++std::optional<StreamMode> chooseMode(const DisplayMode& display, const Limits& limits)
++{
++    if (display.width <= 0 || display.height <= 0) {
++        return std::nullopt;
++    }
++
++    // Always landscape: turning a tablet must not change the stream's shape (and
++    // restart it); the video is letterboxed in a portrait window
++    int w = std::max(display.width, display.height);
++    int h = std::min(display.width, display.height);
++    if (w > limits.maxWidth || h > limits.maxHeight) {
++        // Fit inside the cap and keep the aspect ratio
++        const double scale = std::min(static_cast<double>(limits.maxWidth) / w,
++                                      static_cast<double>(limits.maxHeight) / h);
++        w = static_cast<int>(w * scale);
++        h = static_cast<int>(h * scale);
++    }
++
++    StreamMode m;
++    m.width = w & ~1;
++    m.height = h & ~1;
++    m.fps = snapFps(display.refreshHz > 0 ? display.refreshHz : 60.0, limits);
++    return m;
++}
++
++int chooseBitrate(const StreamMode& savedMode,
++                  int savedBitrate,
++                  int defaultForSaved,
++                  const StreamMode& newMode,
++                  int defaultForNew)
++{
++    if (savedMode == newMode) {
++        return savedBitrate;
++    }
++
++    // Within 5 % of the default for the saved mode: the user never changed it
++    const bool isDefault = defaultForSaved > 0 &&
++                           std::abs(savedBitrate - defaultForSaved) <= defaultForSaved / 20;
++    if (isDefault) {
++        return defaultForNew;
++    }
++
++    if (defaultForSaved <= 0) {
++        return savedBitrate;
++    }
++    const double ratio = std::clamp(static_cast<double>(defaultForNew) / defaultForSaved, 0.4, 1.0);
++    return std::max(1000, static_cast<int>(std::lround(savedBitrate * ratio)));
++}
++
++AdaptGate::AdaptGate(std::chrono::milliseconds debounce,
++                     std::chrono::milliseconds cooldown,
++                     std::optional<Clock::time_point> lastRestart)
++    : m_Debounce(debounce), m_Cooldown(cooldown), m_LastRestart(lastRestart)
++{
++}
++
++bool AdaptGate::update(const StreamMode& wanted, const StreamMode& active, Clock::time_point now)
++{
++    if (wanted == active) {
++        m_Pending.reset();
++        return false;
++    }
++
++    if (!m_Pending || *m_Pending != wanted) {
++        // A new difference, or the display changed again: restart the debounce
++        m_Pending = wanted;
++        m_PendingSince = now;
++        return false;
++    }
++
++    if (now - m_PendingSince < m_Debounce) {
++        return false;
++    }
++    if (m_LastRestart && now - *m_LastRestart < m_Cooldown) {
++        return false;
++    }
++
++    m_LastRestart = now;
++    m_Pending.reset();
++    return true;
++}
++
++} // namespace displayauto
+diff --git a/app/backend/displayautoconfig.h b/app/backend/displayautoconfig.h
+new file mode 100644
+index 00000000..f979bf6b
+--- /dev/null
++++ b/app/backend/displayautoconfig.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <chrono>
++#include <optional>
++
++// Picks the stream mode (resolution, frame rate, bitrate) that suits the display
++// the stream is shown on. Pure code: the caller reads the display and the saved
++// preferences and applies the result; nothing here touches SDL or Qt.
++namespace displayauto {
++
++struct DisplayMode {
++    int width = 0;
++    int height = 0;
++    double refreshHz = 0;
++};
++
++struct StreamMode {
++    int width = 0;
++    int height = 0;
++    int fps = 0;
++
++    bool operator==(const StreamMode& o) const
++    {
++        return width == o.width && height == o.height && fps == o.fps;
++    }
++    bool operator!=(const StreamMode& o) const { return !(*this == o); }
++};
++
++struct Limits {
++    int maxWidth = 3840;
++    int maxHeight = 2160;
++    int maxFps = 144;
++    int minFps = 30;
++};
++
++// Resolution and frame rate for a display. Returns nothing when the display
++// mode is unusable (zero size), so the caller keeps its saved values.
++std::optional<StreamMode> chooseMode(const DisplayMode& display, const Limits& limits = Limits());
++
++// Largest standard frame rate not above the refresh rate (59.94 -> 60,
++// 143.98 -> 144, 74.97 -> 75), within the limits.
++int snapFps(double refreshHz, const Limits& limits = Limits());
++
++// Bitrate for a new mode. savedBitrate belongs to savedMode. defaultForSaved and
++// defaultForNew are Moonlight's own default bitrates for the two modes.
++// - same mode: unchanged
++// - saved bitrate is the default of the saved mode (never changed): the default
++//   of the new mode
++// - user-set bitrate: scaled by the ratio of the defaults, limited to 0.4x..1.0x.
++//   A bitrate the user chose is treated as the ceiling of their link: it is
++//   lowered for a smaller display, never raised for a bigger one
++int chooseBitrate(const StreamMode& savedMode,
++                  int savedBitrate,
++                  int defaultForSaved,
++                  const StreamMode& newMode,
++                  int defaultForNew);
++
++// Debounce and cooldown for restarting a running stream when the wanted mode
++// differs from the active one. Feed it the current wanted/active modes about
++// once a second; update() returns true once when a restart is due.
++class AdaptGate {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    AdaptGate(std::chrono::milliseconds debounce,
++              std::chrono::milliseconds cooldown,
++              std::optional<Clock::time_point> lastRestart = std::nullopt);
++
++    bool update(const StreamMode& wanted, const StreamMode& active, Clock::time_point now);
++
++private:
++    std::chrono::milliseconds m_Debounce;
++    std::chrono::milliseconds m_Cooldown;
++    std::optional<Clock::time_point> m_LastRestart;
++    std::optional<StreamMode> m_Pending;
++    Clock::time_point m_PendingSince;
++};
++
++} // namespace displayauto
+diff --git a/app/cli/commandlineparser.cpp b/app/cli/commandlineparser.cpp
+index aa0f3e91..e1babd2b 100644
+--- a/app/cli/commandlineparser.cpp
++++ b/app/cli/commandlineparser.cpp
+@@ -394,6 +394,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
+     parser.addToggleOption("yuv444", "YUV 4:4:4 sampling, if supported");
+     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
+     parser.addChoiceOption("client-posture", "touch tablet posture sent to the host", m_PostureModeMap.keys());
++    parser.addToggleOption("auto-adapt-display", "match resolution, frame rate and bitrate to the display (off for a run that sets them)");
+     parser.addToggleOption("reconnect-on-posture", "resume the stream when a posture change needs a new host display");
+     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
+     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
+@@ -557,6 +558,14 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
+         preferences->clientPostureMode = mapValue(m_PostureModeMap, parser.getChoiceOptionValue("client-posture"));
+     }
+ 
++    // Resolve --auto-adapt-display and --no-auto-adapt-display. A command line that
++    // sets the video mode itself keeps it unless the toggle is given explicitly.
++    {
++        const bool videoModeGiven = parser.isSet("fps") || parser.isSet("bitrate") || displaySet;
++        preferences->autoAdaptDisplay = parser.getToggleOptionValue("auto-adapt-display",
++                                                                    videoModeGiven ? false : preferences->autoAdaptDisplay);
++    }
++
+     // Resolve --reconnect-on-posture and --no-reconnect-on-posture options
+     preferences->reconnectOnPosture = parser.getToggleOptionValue("reconnect-on-posture", preferences->reconnectOnPosture);
+ 
+diff --git a/app/gui/SettingsView.qml b/app/gui/SettingsView.qml
+index 07226cbe..191e3e6a 100644
+--- a/app/gui/SettingsView.qml
++++ b/app/gui/SettingsView.qml
+@@ -9,6 +9,7 @@ import ComputerManager 1.0
+ import ComputerModel 1.0
+ import SdlGamepadKeyNavigation 1.0
+ import SystemProperties 1.0
++import DisplayAdapt 1.0
+ import PyroWaveCalibrator 1.0
+ import NetworkBuffers 1.0
+ import "ConsoleStyle.js" as Style
+@@ -16,6 +17,23 @@ import QtQuick.Controls.Material 2.2
+ 
+ FocusScope {
+     id: settingsShell
++
++    function codecText() {
++        switch (StreamingPreferences.videoCodecConfig) {
++        case StreamingPreferences.VCC_FORCE_H264: return "H.264"
++        case StreamingPreferences.VCC_FORCE_HEVC:
++        case StreamingPreferences.VCC_FORCE_HEVC_HDR_DEPRECATED: return "HEVC (H.265)"
++        case StreamingPreferences.VCC_FORCE_AV1: return "AV1"
++        case StreamingPreferences.VCC_FORCE_PYROWAVE: return "PyroWave"
++        default: return qsTr("automatic codec")
++        }
++    }
++
++    // "Adapt to the display" is on and the display could be read
++    readonly property bool adaptShown: StreamingPreferences.autoAdaptDisplay && DisplayAdapt.valid
++
++    // The live display data is only refreshed while this page is visible
++    Binding { target: DisplayAdapt; property: "active"; value: settingsShell.visible }
+     objectName: qsTr("Settings")
+     property int category: 0
+     readonly property real uiScale: Style.windowScale(Window.window)
+@@ -465,6 +483,10 @@ FocusScope {
+                         id: resolutionComboBox
+                         maximumWidth: parent.width
+                         textRole: "text"
++                        // With "Adapt to the display" the stream uses what the display wants; show it live
++                        displayText: settingsShell.adaptShown
++                                     ? qsTr("Auto (%1×%2)").arg(DisplayAdapt.streamSize.width).arg(DisplayAdapt.streamSize.height)
++                                     : (settingsRowHost ? currentText.replace(/\s*\(Recommended\)/, "") : currentText)
+                         model: ListModel {
+                             id: resolutionListModel
+                             // Other elements may be added at runtime
+@@ -864,6 +886,9 @@ FocusScope {
+                         id: fpsComboBox
+                         maximumWidth: parent.width
+                         textRole: "text"
++                        displayText: settingsShell.adaptShown
++                                     ? qsTr("Auto (%1 FPS)").arg(DisplayAdapt.streamFps)
++                                     : (settingsRowHost ? currentText.replace(/\s*\(Recommended\)/, "") : currentText)
+                         // ::onActivated must be used, as it only listens for when the index is changed by a human
+                         onActivated : {
+                             if (model.get(currentIndex).is_custom) {
+@@ -959,6 +984,97 @@ FocusScope {
+                 }
+                 }
+ 
++                ConsoleCheckBox {
++                    id: autoAdaptDisplayCheck
++                    objectName: "autoAdaptDisplayCheck"
++                    hoverEnabled: true
++                    width: parent.width
++                    text: qsTr("Adapt to the display")
++                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
++                    checked: StreamingPreferences.autoAdaptDisplay
++                    onCheckedChanged: {
++                        StreamingPreferences.autoAdaptDisplay = checked
++                    }
++
++                    ToolTip.delay: 1000
++                    ToolTip.timeout: 8000
++                    ToolTip.visible: hovered
++                    ToolTip.text: qsTr("Match the stream resolution, frame rate and bitrate to the display it is shown on, when a stream starts and when that display changes (monitor connected, resolution or refresh rate changed). The resolution, frame rate and bitrate above are used as the reference. A bitrate you set yourself is treated as the limit of your connection: it is lowered for a smaller display but never raised. A display change during a stream briefly resumes the stream.")
++                }
++
++                ConsoleSettingRow {
++                    width: parent.width
++                    objectName: "streamDisplayRow"
++                    visible: StreamingPreferences.autoAdaptDisplay
++                    labelItem: ConsoleText { text: qsTr("Stream display") }
++                    description: qsTr("Which display the stream opens on and adapts to. Primary display is the one your system marks as primary. Moonlight window: the display this window is on.")
++                    editor: AutoResizingComboBox {
++                        id: streamDisplayCombo
++                        textRole: "text"
++                        model: ListModel { id: streamDisplayModel }
++
++                        function rebuild() {
++                            streamDisplayModel.clear()
++                            streamDisplayModel.append({ text: qsTr("Primary display"), kind: StreamingPreferences.SD_PRIMARY, name: "" })
++                            streamDisplayModel.append({ text: qsTr("Moonlight window"), kind: StreamingPreferences.SD_WINDOW, name: "" })
++                            var displays = DisplayAdapt.displays
++                            var wanted = -1
++                            for (var i = 0; i < displays.length; i++) {
++                                var d = displays[i]
++                                streamDisplayModel.append({
++                                    text: d.label + " (" + d.width + "×" + d.height + " @ " + d.refresh + " Hz)" + (d.primary ? " ★" : ""),
++                                    kind: StreamingPreferences.SD_NAMED, name: d.id })
++                                if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_NAMED &&
++                                        StreamingPreferences.streamDisplayName === d.id) {
++                                    wanted = streamDisplayModel.count - 1
++                                }
++                            }
++                            if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_NAMED && wanted < 0) {
++                                // The chosen display is not connected now; it is kept and used again when it returns
++                                streamDisplayModel.append({
++                                    text: StreamingPreferences.streamDisplayName + " (" + qsTr("not connected, primary display is used") + ")",
++                                    kind: StreamingPreferences.SD_NAMED, name: StreamingPreferences.streamDisplayName })
++                                wanted = streamDisplayModel.count - 1
++                            }
++                            if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_WINDOW) wanted = 1
++                            else if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_PRIMARY) wanted = 0
++                            currentIndex = wanted
++                            recalculateWidth()
++                        }
++
++                        Component.onCompleted: rebuild()
++                        Connections {
++                            target: DisplayAdapt
++                            function onChanged() { streamDisplayCombo.rebuild() }
++                        }
++                        onActivated: {
++                            var entry = streamDisplayModel.get(currentIndex)
++                            StreamingPreferences.streamDisplayName = entry.name
++                            StreamingPreferences.streamDisplay = entry.kind
++                        }
++                    }
++                }
++
++                ConsoleText {
++                    width: parent.width
++                    visible: settingsShell.adaptShown
++                    role: "secondary"
++                    wrapMode: Text.Wrap
++                    leftPadding: Style.px(16, settingsShell.Window.window)
++                    rightPadding: Style.px(16, settingsShell.Window.window)
++                    topPadding: Style.px(4, settingsShell.Window.window)
++                    bottomPadding: Style.px(8, settingsShell.Window.window)
++                    text: qsTr("Display %1: %2×%3 at %4 Hz").arg(DisplayAdapt.targetName)
++                              .arg(DisplayAdapt.displaySize.width).arg(DisplayAdapt.displaySize.height)
++                              .arg(DisplayAdapt.displayRefresh) + "\n" +
++                          qsTr("Stream now: %1×%2, %3 FPS, %4, %5 Mbps, %6")
++                              .arg(DisplayAdapt.streamSize.width).arg(DisplayAdapt.streamSize.height)
++                              .arg(DisplayAdapt.streamFps)
++                              .arg(settingsShell.codecText())
++                              .arg((DisplayAdapt.bitrateKbps / 1000).toFixed(1))
++                              .arg(StreamingPreferences.enableHdr ? qsTr("HDR on") : qsTr("HDR off"))
++                }
++
+                 ConsoleCheckBox {
+                     id: enableYUV444
+                     width: parent.width
+diff --git a/app/main.cpp b/app/main.cpp
+index ba9ae77a..7e3a393a 100644
+--- a/app/main.cpp
++++ b/app/main.cpp
+@@ -55,6 +55,7 @@
+ #include "backend/autoupdatechecker.h"
+ #include "backend/computermanager.h"
+ #include "backend/systemproperties.h"
++#include "backend/displayadapt.h"
+ #include "streaming/session.h"
+ #include "settings/streamingpreferences.h"
+ #include "streaming/video/pyrowave/pyrowavecalibrator.h"
+@@ -1026,6 +1027,11 @@ int main(int argc, char *argv[])
+                                                 [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                     return new AutoUpdateChecker();
+                                                 });
++    qmlRegisterSingletonType<DisplayAdapt>("DisplayAdapt", 1, 0,
++                                           "DisplayAdapt",
++                                           [](QQmlEngine*, QJSEngine*) -> QObject* {
++                                               return new DisplayAdapt();
++                                           });
+     qmlRegisterSingletonType<SystemProperties>("SystemProperties", 1, 0,
+                                                "SystemProperties",
+                                                [](QQmlEngine*, QJSEngine*) -> QObject* {
+diff --git a/app/settings/streamingpreferences.cpp b/app/settings/streamingpreferences.cpp
+index 8c1ddd8c..613fb099 100644
+--- a/app/settings/streamingpreferences.cpp
++++ b/app/settings/streamingpreferences.cpp
+@@ -73,6 +73,9 @@
+ #define SER_CAPTURESYSKEYS "capturesyskeys"
+ #define SER_CLIENTPOSTURE "clientposture"
+ #define SER_RECONNECTONPOSTURE "reconnectonposture"
++#define SER_AUTOADAPTDISPLAY "autoadaptdisplay"
++#define SER_STREAMDISPLAY "streamdisplay"
++#define SER_STREAMDISPLAYNAME "streamdisplayname"
+ #define SER_STEAMCONTROLLERDRIVER "steamcontrollerdriver"
+ #define SER_STEAMCONTROLLERMOTION "steamcontrollermotion"
+ #define SER_STEAMCONTROLLERSPLITPADS "steamcontrollersplitpads"
+@@ -265,6 +268,13 @@ void StreamingPreferences::reload()
+         clientPostureMode = POSTURE_AUTO;
+     }
+     reconnectOnPosture = settings.value(SER_RECONNECTONPOSTURE, true).toBool();
++    autoAdaptDisplay = settings.value(SER_AUTOADAPTDISPLAY, true).toBool();
++    streamDisplay = static_cast<StreamDisplay>(settings.value(SER_STREAMDISPLAY,
++                                                              static_cast<int>(StreamDisplay::SD_PRIMARY)).toInt());
++    if (streamDisplay < SD_WINDOW || streamDisplay > SD_NAMED) {
++        streamDisplay = SD_PRIMARY;
++    }
++    streamDisplayName = settings.value(SER_STREAMDISPLAYNAME, QString()).toString();
+     steamControllerDriver = settings.value(SER_STEAMCONTROLLERDRIVER, true).toBool();
+     steamControllerMotion = settings.value(SER_STEAMCONTROLLERMOTION, true).toBool();
+     steamControllerSplitPads = settings.value(SER_STEAMCONTROLLERSPLITPADS, true).toBool();
+@@ -515,6 +525,9 @@ void StreamingPreferences::save()
+     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
+     settings.setValue(SER_CLIENTPOSTURE, clientPostureMode);
+     settings.setValue(SER_RECONNECTONPOSTURE, reconnectOnPosture);
++    settings.setValue(SER_AUTOADAPTDISPLAY, autoAdaptDisplay);
++    settings.setValue(SER_STREAMDISPLAY, streamDisplay);
++    settings.setValue(SER_STREAMDISPLAYNAME, streamDisplayName);
+     settings.setValue(SER_KEEPAWAKE, keepAwake);
+     settings.setValue(SER_STEAMCONTROLLERDRIVER, steamControllerDriver);
+     settings.setValue(SER_STEAMCONTROLLERMOTION, steamControllerMotion);
+diff --git a/app/settings/streamingpreferences.h b/app/settings/streamingpreferences.h
+index bfc01e70..5e7d873b 100644
+--- a/app/settings/streamingpreferences.h
++++ b/app/settings/streamingpreferences.h
+@@ -166,6 +166,19 @@ public:
+     };
+     Q_ENUM(PostureMode);
+ 
++    // Which display the stream is shown on and adapts to. Primary is the default;
++    // Window = the display Moonlight's own window is on (the long-standing
++    // behaviour). Only applies while autoAdaptDisplay is on.
++    enum StreamDisplay
++    {
++        SD_WINDOW,
++        SD_PRIMARY,
++        // A display chosen by its output name (streamDisplayName), appended so
++        // stored values keep their meaning
++        SD_NAMED,
++    };
++    Q_ENUM(StreamDisplay);
++
+     // What opens the touch-only stream menu. The default is the swipe alone:
+     // nothing is drawn over the stream. Off leaves only the keyboard and
+     // gamepad shortcuts.
+@@ -250,6 +263,9 @@ public:
+     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
+     Q_PROPERTY(PostureMode clientPostureMode MEMBER clientPostureMode NOTIFY clientPostureModeChanged)
+     Q_PROPERTY(bool reconnectOnPosture MEMBER reconnectOnPosture NOTIFY reconnectOnPostureChanged)
++    Q_PROPERTY(bool autoAdaptDisplay MEMBER autoAdaptDisplay NOTIFY autoAdaptDisplayChanged)
++    Q_PROPERTY(StreamDisplay streamDisplay MEMBER streamDisplay NOTIFY streamDisplayChanged)
++    Q_PROPERTY(QString streamDisplayName MEMBER streamDisplayName NOTIFY streamDisplayNameChanged)
+     Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
+     Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
+     Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
+@@ -332,6 +348,11 @@ public:
+     // boundary (see streaming/posturemonitor.h), so the host recreates its
+     // virtual display for the new posture.
+     bool reconnectOnPosture = true;
++    // Match resolution, frame rate and bitrate to the display the stream is shown
++    // on, at stream start and when that display changes (displayautoconfig.h).
++    bool autoAdaptDisplay = true;
++    StreamDisplay streamDisplay = SD_PRIMARY;
++    QString streamDisplayName;
+     RendererSelection rendererSelection;
+     // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
+     bool steamControllerDriver;
+@@ -398,6 +419,9 @@ signals:
+     void captureSysKeysModeChanged();
+     void clientPostureModeChanged();
+     void reconnectOnPostureChanged();
++    void autoAdaptDisplayChanged();
++    void streamDisplayChanged();
++    void streamDisplayNameChanged();
+     void steamControllerChanged();
+     void keepAwakeChanged();
+     void languageChanged();
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 32a1e062..decbfa57 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -12,6 +12,7 @@
+ #include "streaming/vrrratepolicy.h"
+ #include "backend/richpresencemanager.h"
+ #include "backend/posturedetector.h"
++#include "backend/displayadapt.h"
+ #include "streaming/posturemonitor.h"
+ #include "streaming/gpuperformancehold.h"
+ #include "backend/networkbuffers.h"
+@@ -820,6 +821,40 @@ bool Session::initialize(QQuickWindow* qtWindow)
+     LiInitializeStreamConfiguration(&m_StreamConfig);
+     m_StreamConfig.width = m_Preferences->width;
+     m_StreamConfig.height = m_Preferences->height;
++    m_StreamConfig.fps = m_Preferences->fps;
++    m_AdaptActiveMode = {m_Preferences->width, m_Preferences->height, m_Preferences->fps};
++
++    // Match the mode to the display the stream is shown on
++    m_AdaptEnabled = m_Preferences->autoAdaptDisplay;
++    if (m_AdaptEnabled) {
++        std::optional<displayadapt::Result> adapted;
++        displayauto::DisplayMode display;
++        if (readTargetDisplayMode(display)) {
++            adapted = displayadapt::compute(m_Preferences, display);
++        }
++
++        if (adapted) {
++            if (adapted->bitrateAdapted) {
++                m_AdaptBitrate = adapted->bitrateKbps;
++            }
++            m_StreamConfig.width = adapted->mode.width;
++            m_StreamConfig.height = adapted->mode.height;
++            m_StreamConfig.fps = adapted->mode.fps;
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Display auto-adapt: display %dx%d at %.0f Hz -> stream %dx%d at %d fps, bitrate %d kbps (saved %dx%d at %d fps, %d kbps)",
++                        display.width, display.height, display.refreshHz,
++                        adapted->mode.width, adapted->mode.height, adapted->mode.fps,
++                        adapted->bitrateKbps,
++                        m_AdaptActiveMode.width, m_AdaptActiveMode.height, m_AdaptActiveMode.fps,
++                        m_Preferences->bitrateKbps);
++            m_AdaptActiveMode = adapted->mode;
++        }
++        else {
++            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                        "Display auto-adapt: the display mode is not readable, using the saved video settings");
++            m_AdaptEnabled = false;
++        }
++    }
+ 
+     int x, y, width, height;
+     getWindowDimensions(x, y, width, height);
+@@ -846,9 +881,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
+     LiInitializeVideoCallbacks(&m_VideoCallbacks);
+     m_VideoCallbacks.setup = drSetup;
+ 
+-    m_StreamConfig.fps = m_Preferences->fps;
+     snapshotPresentationSettings(testWindow);
+-    m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
++    m_StreamConfig.bitrate = m_AdaptBitrate.value_or(m_Preferences->bitrateKbps);
+ 
+ #ifndef STEAM_LINK
+     // Opt-in to all encryption features if we detect that the platform
+@@ -1562,53 +1596,62 @@ private:
+     Session* m_Session;
+ };
+ 
+-void Session::getWindowDimensions(int& x, int& y,
+-                                  int& width, int& height)
++int Session::getTargetDisplayIndex()
+ {
+-    int displayIndex = 0;
++    // The primary or a chosen display (only while display auto-adapt is on)
++    if (m_Preferences->autoAdaptDisplay &&
++            m_Preferences->streamDisplay != StreamingPreferences::SD_WINDOW) {
++        QScreen* uiScreen = m_QtWindow != nullptr ? m_QtWindow->screen() : nullptr;
++        const int chosen = displayadapt::sdlDisplayForScreen(displayadapt::pickScreen(m_Preferences, uiScreen));
++        if (chosen >= 0) {
++            return chosen;
++        }
++        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                    "The chosen display was not found among the SDL displays, using the Moonlight window's display");
++    }
+ 
+     if (m_Window != nullptr) {
+-        displayIndex = SDL_GetWindowDisplayIndex(m_Window);
+-        SDL_assert(displayIndex >= 0);
++        const int index = SDL_GetWindowDisplayIndex(m_Window);
++        SDL_assert(index >= 0);
++        return index >= 0 ? index : 0;
+     }
++
+     // Create our window on the same display that Qt's UI
+     // was being displayed on.
+-    else {
+-        Q_ASSERT(m_QtWindow != nullptr);
+-        if (m_QtWindow != nullptr) {
+-            QScreen* screen = m_QtWindow->screen();
+-            if (screen != nullptr) {
+-                QRect displayRect = screen->geometry();
+-
++    Q_ASSERT(m_QtWindow != nullptr);
++    if (m_QtWindow != nullptr) {
++        QScreen* screen = m_QtWindow->screen();
++        if (screen != nullptr) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Qt UI screen is at (%d,%d)",
++                        screen->geometry().x(), screen->geometry().y());
++            const int index = displayadapt::sdlDisplayForScreen(screen);
++            if (index >= 0) {
+                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+-                            "Qt UI screen is at (%d,%d)",
+-                            displayRect.x(), displayRect.y());
+-                for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
+-                    SDL_Rect displayBounds;
+-
+-                    if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
+-                        if (displayBounds.x == displayRect.x() &&
+-                            displayBounds.y == displayRect.y()) {
+-                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+-                                        "SDL found matching display %d",
+-                                        i);
+-                            displayIndex = i;
+-                            break;
+-                        }
+-                    }
+-                    else {
+-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+-                                    "SDL_GetDisplayBounds(%d) failed: %s",
+-                                    i, SDL_GetError());
+-                    }
+-                }
+-            }
+-            else {
+-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+-                            "Qt window is not associated with a QScreen!");
++                            "SDL found matching display %d",
++                            index);
++                return index;
+             }
+         }
++        else {
++            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                        "Qt window is not associated with a QScreen!");
++        }
+     }
++    return 0;
++}
++
++// Resolution as Moonlight's own "native" choice (true panel pixels), refresh
++// rate of the mode the desktop runs in now.
++bool Session::readTargetDisplayMode(displayauto::DisplayMode& out)
++{
++    return displayadapt::readDisplayMode(getTargetDisplayIndex(), out);
++}
++
++void Session::getWindowDimensions(int& x, int& y,
++                                  int& width, int& height)
++{
++    const int displayIndex = getTargetDisplayIndex();
+ 
+     SDL_Rect usableBounds;
+     if (SDL_GetDisplayUsableBounds(displayIndex, &usableBounds) == 0) {
+@@ -1807,6 +1850,8 @@ void Session::notifyMouseEmulationMode(bool enabled)
+ 
+ // Time of the last automatic posture restart; the cooldown spans sessions.
+ static std::optional<std::chrono::steady_clock::time_point> s_LastPostureRestart;
++// Same for restarts that follow a display change (display auto-adapt).
++static std::optional<std::chrono::steady_clock::time_point> s_LastDisplayRestart;
+ 
+ static posture::Mode toPostureMode(StreamingPreferences::PostureMode mode)
+ {
+@@ -2401,7 +2446,37 @@ void Session::exec()
+                                                           s_LastPostureRestart);
+     }
+ 
++    // A changed display (monitor connected or removed, resolution or refresh rate
++    // changed, other display primary) wants another mode: resume the stream with it.
++    // Only for a host that rebuilds its display on resume, like the posture restart.
++    std::optional<displayauto::AdaptGate> adaptGate;
++    if (m_AdaptEnabled && !m_Computer->isNvidiaServerSoftware) {
++        adaptGate.emplace(std::chrono::seconds(3), std::chrono::seconds(20), s_LastDisplayRestart);
++    }
++    auto nextAdaptSample = std::chrono::steady_clock::now();
++
+     for (;;) {
++        if (adaptGate && std::chrono::steady_clock::now() >= nextAdaptSample) {
++            const auto now = std::chrono::steady_clock::now();
++            nextAdaptSample = now + std::chrono::seconds(1);
++
++            displayauto::DisplayMode display;
++            std::optional<displayauto::StreamMode> wanted;
++            if (readTargetDisplayMode(display)) {
++                wanted = displayauto::chooseMode(display);
++            }
++            if (wanted && adaptGate->update(*wanted, m_AdaptActiveMode, now) &&
++                    !m_ShouldExit && !m_UnexpectedTermination && !SDL_HasEvent(SDL_QUIT)) {
++                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                            "Display changed: restarting the stream from %dx%d at %d fps to %dx%d at %d fps",
++                            m_AdaptActiveMode.width, m_AdaptActiveMode.height, m_AdaptActiveMode.fps,
++                            wanted->width, wanted->height, wanted->fps);
++                s_LastDisplayRestart = now;
++                m_PostureRestartRequested = true;
++                goto DispatchDeferredCleanup;
++            }
++        }
++
+         if (postureMonitor) {
+             postureMonitor->tick();
+ 
+diff --git a/app/streaming/session.h b/app/streaming/session.h
+index 6d08f2a0..59f22481 100644
+--- a/app/streaming/session.h
++++ b/app/streaming/session.h
+@@ -13,6 +13,9 @@
+ #include "video/clientpacingwarning.h"
+ #include "diagnostics/diagnosticcapture.h"
+ #include "backend/postureclassifier.h"
++#include "backend/displayautoconfig.h"
++
++#include <optional>
+ #ifdef HAVE_KWIN_SCANOUT_GUARD
+ #include "streaming/kwinscanoutguard.h"
+ #endif
+@@ -198,6 +201,8 @@ private:
+ 
+     int getAudioRendererCapabilities(int audioConfiguration);
+ 
++    int getTargetDisplayIndex();
++    bool readTargetDisplayMode(displayauto::DisplayMode& out);
+     void getWindowDimensions(int& x, int& y,
+                              int& width, int& height);
+ 
+@@ -346,6 +351,12 @@ private:
+     // This session ends by an automatic posture restart (set on the SDL thread
+     // before cleanup is dispatched).
+     bool m_PostureRestartRequested = false;
++
++    // Display auto-adapt (displayautoconfig.h): the mode and bitrate applied at
++    // start, kept to detect that the display wants something else later.
++    bool m_AdaptEnabled = false;
++    displayauto::StreamMode m_AdaptActiveMode;
++    std::optional<int> m_AdaptBitrate;
+     int m_PortTestResults;
+ 
+     int m_ActiveVideoFormat;
+diff --git a/tests/posture/posture.pro b/tests/posture/posture.pro
+index 83eaa6ad..df8b34e9 100644
+--- a/tests/posture/posture.pro
++++ b/tests/posture/posture.pro
+@@ -5,5 +5,7 @@ CONFIG += console testcase c++17
+ CONFIG -= app_bundle
+ INCLUDEPATH += $$PWD/../../app
+ SOURCES += $$PWD/tst_posture.cpp \
+-    $$PWD/../../app/backend/postureclassifier.cpp
+-HEADERS += $$PWD/../../app/backend/postureclassifier.h
++    $$PWD/../../app/backend/postureclassifier.cpp \
++    $$PWD/../../app/backend/displayautoconfig.cpp
++HEADERS += $$PWD/../../app/backend/postureclassifier.h \
++    $$PWD/../../app/backend/displayautoconfig.h
+diff --git a/tests/posture/tst_posture.cpp b/tests/posture/tst_posture.cpp
+index 20462cfe..ceb26bdc 100644
+--- a/tests/posture/tst_posture.cpp
++++ b/tests/posture/tst_posture.cpp
+@@ -1,6 +1,7 @@
+ #include <QtTest>
+ 
+ #include "backend/postureclassifier.h"
++#include "backend/displayautoconfig.h"
+ 
+ using namespace posture;
+ using std::chrono::milliseconds;
+@@ -104,6 +105,123 @@ private slots:
+         QVERIFY(!isExternalConnectorName("Virtual-1"));
+     }
+ 
++    void displayFpsSnaps()
++    {
++        QCOMPARE(displayauto::snapFps(59.94), 60);
++        QCOMPARE(displayauto::snapFps(60.0), 60);
++        QCOMPARE(displayauto::snapFps(143.98), 144);
++        QCOMPARE(displayauto::snapFps(74.97), 75);
++        QCOMPARE(displayauto::snapFps(119.88), 120);
++        QCOMPARE(displayauto::snapFps(165.0), 144);   // capped
++        QCOMPARE(displayauto::snapFps(29.97), 30);
++        QCOMPARE(displayauto::snapFps(24.0), 30);     // floor
++        QCOMPARE(displayauto::snapFps(48.01), 48);    // far above 30: kept
++        QCOMPARE(displayauto::snapFps(56.0), 50);     // within 10 of a standard rate
++        QCOMPARE(displayauto::snapFps(98.0), 90);
++    }
++
++    void displayModeFollowsDisplay()
++    {
++        auto m = displayauto::chooseMode({2560, 1440, 59.94});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 2560);
++        QCOMPARE(m->height, 1440);
++        QCOMPARE(m->fps, 60);
++
++        m = displayauto::chooseMode({1920, 1280, 60.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 1920);
++        QCOMPARE(m->height, 1280);
++
++        // Unknown refresh rate falls back to 60
++        m = displayauto::chooseMode({1920, 1080, 0.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->fps, 60);
++    }
++
++    void displayModeCapsAndEvens()
++    {
++        // Bigger than 4K: fitted inside the cap, aspect kept
++        auto m = displayauto::chooseMode({5120, 2880, 60.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 3840);
++        QCOMPARE(m->height, 2160);
++
++        m = displayauto::chooseMode({3840, 2400, 60.0});
++        QVERIFY(m.has_value());
++        QVERIFY(m->width <= 3840 && m->height <= 2160);
++        QCOMPARE(m->width % 2, 0);
++        QCOMPARE(m->height % 2, 0);
++
++        m = displayauto::chooseMode({1367, 769, 60.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 1366);
++        QCOMPARE(m->height, 768);
++
++        QVERIFY(!displayauto::chooseMode({0, 0, 60.0}).has_value());
++    }
++
++    void displayModeIsAlwaysLandscape()
++    {
++        // The Dell panel turned to portrait by the accelerometer
++        auto m = displayauto::chooseMode({800, 1280, 60.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 1280);
++        QCOMPARE(m->height, 800);
++
++        m = displayauto::chooseMode({1280, 800, 60.0});
++        QVERIFY(m.has_value());
++        QCOMPARE(m->width, 1280);
++        QCOMPARE(m->height, 800);
++    }
++
++    void displayBitrateRules()
++    {
++        using displayauto::StreamMode;
++        const StreamMode p1080{1920, 1080, 60};
++        const StreamMode p1440{2560, 1440, 60};
++        const StreamMode p720{1280, 720, 60};
++
++        // Same mode: unchanged
++        QCOMPARE(displayauto::chooseBitrate(p1080, 12345, 10000, p1080, 10000), 12345);
++        // Never changed from the default: default of the new mode
++        QCOMPARE(displayauto::chooseBitrate(p1080, 10000, 10000, p1440, 20000), 20000);
++        QCOMPARE(displayauto::chooseBitrate(p1080, 10200, 10000, p720, 5000), 5000);
++        // User-set: scaled by the ratio of the defaults, 0.4x..1.0x (a ceiling)
++        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p1440, 20000), 20000);   // 2x -> 1.0x
++        QCOMPARE(displayauto::chooseBitrate(p1440, 25000, 20000, p1080, 10000), 12500);   // 0.5x
++        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 5000), 10000);     // 0.5x
++        QCOMPARE(displayauto::chooseBitrate(p1080, 20000, 10000, p720, 1000), 8000);      // floor 0.4x
++    }
++
++    void displayGateDebouncesAndCools()
++    {
++        using displayauto::StreamMode;
++        using Clock = displayauto::AdaptGate::Clock;
++        const StreamMode a{1920, 1080, 60};
++        const StreamMode b{2560, 1440, 60};
++        const StreamMode c{2560, 1440, 120};
++        const Clock::time_point t0 = Clock::now();
++        auto at = [&](int ms) { return t0 + milliseconds(ms); };
++
++        displayauto::AdaptGate gate(milliseconds(3000), milliseconds(20000));
++        QVERIFY(!gate.update(a, a, at(0)));              // nothing wanted
++        QVERIFY(!gate.update(b, a, at(1000)));           // difference seen
++        QVERIFY(!gate.update(b, a, at(3000)));           // 2 s: still debouncing
++        QVERIFY(gate.update(b, a, at(4000)));            // 3 s: restart once
++        QVERIFY(!gate.update(b, a, at(4500)));           // pending reset, new debounce
++
++        // The wanted mode keeps changing: the debounce restarts each time
++        QVERIFY(!gate.update(c, a, at(5000)));
++        QVERIFY(!gate.update(b, a, at(7000)));
++        QVERIFY(!gate.update(c, a, at(9000)));
++
++        // Stable again but inside the 20 s cooldown of the restart at 4 s
++        QVERIFY(!gate.update(c, a, at(12500)));
++        QVERIFY(!gate.update(c, a, at(23000)));          // 19 s after the restart
++        QVERIFY(gate.update(c, a, at(24500)));           // cooldown over
++    }
++
+     void noTouchIgnoresTabletMode()
+     {
+         Signals s;
+-- 
+2.56.1
+

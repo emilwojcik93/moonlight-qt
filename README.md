@@ -1,13 +1,13 @@
 # moonlight-qt posture patches (automation branch)
 
 This branch holds only automation files for `emilwojcik93/moonlight-qt`: the
-posture and touch-menu feature as an ordered patch series on top of
+posture, touch-menu and display-adapt features as an ordered patch series on top of
 `Nonary/moonlight-qt`, plus the tools to apply and test it. The fork's
 `feature/stream-posture-sync` is the reference the series is verified against.
 
 ```
 patches/series         ordered list; "# group: NAME" markers
-patches/0001..0007     git format-patch files (author, subject, rationale)
+patches/0001..0009     git format-patch files (author, subject, rationale)
 upstream.lock          upstream tag/commit the series was last verified against
 policy.yml             CONTRACT section 5 policy: owners, cooling-off, hold, deny
 tools/apply-series.sh  git am --3way into a temp worktree, optional tree verify
@@ -28,12 +28,25 @@ docs/                  rot matrix results, how to resolve rot
 | 0005 | touch-menu | settings: touch menu trigger |
 | 0006 | touch-menu | touch menu model, overlay rendering, tests |
 | 0007 | touch-menu | input handling + Quit session wiring |
+| 0008 | display | classifier: ignore the built-in touchscreen when only external displays are active |
+| 0009 | display | "Adapt to the display": stream mode (resolution, fps, bitrate) follows the display, live settings status, display list |
+
+The display group was made on top of posture-core and touch-menu and needs both
+(`--skip-group touch-menu` fails on 0009 with a conflict in `streamingpreferences.h`).
 
 Provenance: squashed from the 18 commits of `feature/stream-posture-sync`
 (`ea12abb4..6dfa16ee`): 12 posture commits become 0001-0004, 6 touch-menu
 commits become 0005-0007. Applied onto
 `ea12abb41914565db391a23e69cd7264b038edba` the result has the same git tree
 (`10ffc5ef98d0351c52b984d421a431469be6f04a`) as the fork branch.
+
+Patches 0008 and 0009 (2026-11-27) squash the 6 commits `6dfa16ee..520676d2` of the
+same branch (1 + 5) and are authored with the GitHub noreply identity. Applied onto
+`ea12abb4` the series reproduces the tree of `520676d2` (`tools/apply-series.sh ea12abb4
+--verify origin/feature/stream-posture-sync`, tree `bf3ee78c`); it applies cleanly onto
+`v6.2.0-daily.201` and `v6.2.0-daily.202`. Not built here: the Windows build of the new
+files (`backend/displayautoconfig.*`, `backend/displayadapt.*`) is checked by the CI wrapper;
+the unit tests passed in a Linux container (posture suite 48 tests).
 
 `ci/posture-windows` (the branch the installed Windows client was built from,
 head `8e1dc629`) differs from `feature/stream-posture-sync` only by
