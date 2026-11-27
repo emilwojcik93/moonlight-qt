@@ -166,12 +166,16 @@ public:
     };
     Q_ENUM(PostureMode);
 
-    // Which display the stream is shown on and adapts to. Window = the display
-    // Moonlight's own window is on (the long-standing behaviour).
+    // Which display the stream is shown on and adapts to. Primary is the default;
+    // Window = the display Moonlight's own window is on (the long-standing
+    // behaviour). Only applies while autoAdaptDisplay is on.
     enum StreamDisplay
     {
         SD_WINDOW,
         SD_PRIMARY,
+        // A display chosen by its output name (streamDisplayName), appended so
+        // stored values keep their meaning
+        SD_NAMED,
     };
     Q_ENUM(StreamDisplay);
 
@@ -261,6 +265,7 @@ public:
     Q_PROPERTY(bool reconnectOnPosture MEMBER reconnectOnPosture NOTIFY reconnectOnPostureChanged)
     Q_PROPERTY(bool autoAdaptDisplay MEMBER autoAdaptDisplay NOTIFY autoAdaptDisplayChanged)
     Q_PROPERTY(StreamDisplay streamDisplay MEMBER streamDisplay NOTIFY streamDisplayChanged)
+    Q_PROPERTY(QString streamDisplayName MEMBER streamDisplayName NOTIFY streamDisplayNameChanged)
     Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
@@ -346,7 +351,8 @@ public:
     // Match resolution, frame rate and bitrate to the display the stream is shown
     // on, at stream start and when that display changes (displayautoconfig.h).
     bool autoAdaptDisplay = true;
-    StreamDisplay streamDisplay = SD_WINDOW;
+    StreamDisplay streamDisplay = SD_PRIMARY;
+    QString streamDisplayName;
     RendererSelection rendererSelection;
     // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
     bool steamControllerDriver;
@@ -415,6 +421,7 @@ signals:
     void reconnectOnPostureChanged();
     void autoAdaptDisplayChanged();
     void streamDisplayChanged();
+    void streamDisplayNameChanged();
     void steamControllerChanged();
     void keepAwakeChanged();
     void languageChanged();

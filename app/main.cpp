@@ -55,6 +55,7 @@
 #include "backend/autoupdatechecker.h"
 #include "backend/computermanager.h"
 #include "backend/systemproperties.h"
+#include "backend/displayadapt.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/video/pyrowave/pyrowavecalibrator.h"
@@ -1026,6 +1027,11 @@ int main(int argc, char *argv[])
                                                 [](QQmlEngine*, QJSEngine*) -> QObject* {
                                                     return new AutoUpdateChecker();
                                                 });
+    qmlRegisterSingletonType<DisplayAdapt>("DisplayAdapt", 1, 0,
+                                           "DisplayAdapt",
+                                           [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                               return new DisplayAdapt();
+                                           });
     qmlRegisterSingletonType<SystemProperties>("SystemProperties", 1, 0,
                                                "SystemProperties",
                                                [](QQmlEngine*, QJSEngine*) -> QObject* {

@@ -9,6 +9,7 @@ import ComputerManager 1.0
 import ComputerModel 1.0
 import SdlGamepadKeyNavigation 1.0
 import SystemProperties 1.0
+import DisplayAdapt 1.0
 import PyroWaveCalibrator 1.0
 import NetworkBuffers 1.0
 import "ConsoleStyle.js" as Style
@@ -16,6 +17,23 @@ import QtQuick.Controls.Material 2.2
 
 FocusScope {
     id: settingsShell
+
+    function codecText() {
+        switch (StreamingPreferences.videoCodecConfig) {
+        case StreamingPreferences.VCC_FORCE_H264: return "H.264"
+        case StreamingPreferences.VCC_FORCE_HEVC:
+        case StreamingPreferences.VCC_FORCE_HEVC_HDR_DEPRECATED: return "HEVC (H.265)"
+        case StreamingPreferences.VCC_FORCE_AV1: return "AV1"
+        case StreamingPreferences.VCC_FORCE_PYROWAVE: return "PyroWave"
+        default: return qsTr("automatic codec")
+        }
+    }
+
+    // "Adapt to the display" is on and the display could be read
+    readonly property bool adaptShown: StreamingPreferences.autoAdaptDisplay && DisplayAdapt.valid
+
+    // The live display data is only refreshed while this page is visible
+    Binding { target: DisplayAdapt; property: "active"; value: settingsShell.visible }
     objectName: qsTr("Settings")
     property int category: 0
     readonly property real uiScale: Style.windowScale(Window.window)
@@ -465,6 +483,10 @@ FocusScope {
                         id: resolutionComboBox
                         maximumWidth: parent.width
                         textRole: "text"
+                        // With "Adapt to the display" the stream uses what the display wants; show it live
+                        displayText: settingsShell.adaptShown
+                                     ? qsTr("Auto (%1×%2)").arg(DisplayAdapt.streamSize.width).arg(DisplayAdapt.streamSize.height)
+                                     : (settingsRowHost ? currentText.replace(/\s*\(Recommended\)/, "") : currentText)
                         model: ListModel {
                             id: resolutionListModel
                             // Other elements may be added at runtime
@@ -864,6 +886,9 @@ FocusScope {
                         id: fpsComboBox
                         maximumWidth: parent.width
                         textRole: "text"
+                        displayText: settingsShell.adaptShown
+                                     ? qsTr("Auto (%1 FPS)").arg(DisplayAdapt.streamFps)
+                                     : (settingsRowHost ? currentText.replace(/\s*\(Recommended\)/, "") : currentText)
                         // ::onActivated must be used, as it only listens for when the index is changed by a human
                         onActivated : {
                             if (model.get(currentIndex).is_custom) {
@@ -982,22 +1007,68 @@ FocusScope {
                     objectName: "streamDisplayRow"
                     visible: StreamingPreferences.autoAdaptDisplay
                     labelItem: ConsoleText { text: qsTr("Stream display") }
-                    description: qsTr("Which display the stream opens on and adapts to. Moonlight window: the display this window is on. Primary display: the display your system marks as primary.")
+                    description: qsTr("Which display the stream opens on and adapts to. Primary display is the one your system marks as primary. Moonlight window: the display this window is on.")
                     editor: AutoResizingComboBox {
                         id: streamDisplayCombo
                         textRole: "text"
-                        model: ListModel {
-                            ListElement { text: qsTr("Moonlight window"); val: StreamingPreferences.SD_WINDOW }
-                            ListElement { text: qsTr("Primary display"); val: StreamingPreferences.SD_PRIMARY }
-                        }
-                        Component.onCompleted: {
-                            for (var i = 0; i < count; ++i) {
-                                if (model.get(i).val === StreamingPreferences.streamDisplay) { currentIndex = i; break }
+                        model: ListModel { id: streamDisplayModel }
+
+                        function rebuild() {
+                            streamDisplayModel.clear()
+                            streamDisplayModel.append({ text: qsTr("Primary display"), kind: StreamingPreferences.SD_PRIMARY, name: "" })
+                            streamDisplayModel.append({ text: qsTr("Moonlight window"), kind: StreamingPreferences.SD_WINDOW, name: "" })
+                            var displays = DisplayAdapt.displays
+                            var wanted = -1
+                            for (var i = 0; i < displays.length; i++) {
+                                var d = displays[i]
+                                streamDisplayModel.append({
+                                    text: d.label + " (" + d.width + "×" + d.height + " @ " + d.refresh + " Hz)" + (d.primary ? " ★" : ""),
+                                    kind: StreamingPreferences.SD_NAMED, name: d.id })
+                                if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_NAMED &&
+                                        StreamingPreferences.streamDisplayName === d.id) {
+                                    wanted = streamDisplayModel.count - 1
+                                }
                             }
+                            if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_NAMED && wanted < 0) {
+                                // The chosen display is not connected now; it is kept and used again when it returns
+                                streamDisplayModel.append({
+                                    text: StreamingPreferences.streamDisplayName + " (" + qsTr("not connected, primary display is used") + ")",
+                                    kind: StreamingPreferences.SD_NAMED, name: StreamingPreferences.streamDisplayName })
+                                wanted = streamDisplayModel.count - 1
+                            }
+                            if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_WINDOW) wanted = 1
+                            else if (StreamingPreferences.streamDisplay === StreamingPreferences.SD_PRIMARY) wanted = 0
+                            currentIndex = wanted
                             recalculateWidth()
                         }
-                        onActivated: StreamingPreferences.streamDisplay = model.get(currentIndex).val
+
+                        Component.onCompleted: rebuild()
+                        Connections {
+                            target: DisplayAdapt
+                            function onChanged() { streamDisplayCombo.rebuild() }
+                        }
+                        onActivated: {
+                            var entry = streamDisplayModel.get(currentIndex)
+                            StreamingPreferences.streamDisplayName = entry.name
+                            StreamingPreferences.streamDisplay = entry.kind
+                        }
                     }
+                }
+
+                ConsoleText {
+                    width: parent.width
+                    visible: settingsShell.adaptShown
+                    role: "secondary"
+                    wrapMode: Text.Wrap
+                    text: qsTr("Display %1: %2×%3 at %4 Hz").arg(DisplayAdapt.targetName)
+                              .arg(DisplayAdapt.displaySize.width).arg(DisplayAdapt.displaySize.height)
+                              .arg(DisplayAdapt.displayRefresh) + "\n" +
+                          qsTr("Stream now: %1×%2, %3 FPS, %4, %5 Mbps, %6")
+                              .arg(DisplayAdapt.streamSize.width).arg(DisplayAdapt.streamSize.height)
+                              .arg(DisplayAdapt.streamFps)
+                              .arg(settingsShell.codecText())
+                              .arg((DisplayAdapt.bitrateKbps / 1000).toFixed(1))
+                              .arg(StreamingPreferences.enableHdr ? qsTr("HDR on") : qsTr("HDR off"))
                 }
 
                 ConsoleCheckBox {
